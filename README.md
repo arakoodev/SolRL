@@ -57,7 +57,7 @@ Run the full lint gate inside Docker:
 docker compose run --rm lint
 ```
 
-This checks Rust format, clippy, Ruff, Terraform format/validate, schema parity between Rust and Python, signed-field validation in `settle_claim`, Token-2022 wiring, LocalStack honesty, and the no-Docker-in-Docker boundary.
+This checks Rust format, clippy, Ruff, Terraform format/validate, schema parity between Rust and Python, signed-field validation in `settle_claim`, PCR16 recomputation, Token-2022 `TransferGuard` wiring, LocalStack honesty, Cargo lockfile compatibility with the SBF builder, and the no-Docker-in-Docker boundary.
 
 For Marlin-style reproducible enclave work, use Nix in its own container:
 
@@ -89,9 +89,9 @@ anchor build --no-idl
 
 `--no-idl` is intentional right now. The SBF program builds, but Anchor `0.30.1` IDL generation currently trips on its `anchor-syn` / `proc-macro2` path under this Solana `1.18` toolchain. Do not pretend the IDL is done. The binary build is real; the IDL is the next tooling fix.
 
-One more honest gap: the Token-2022 path compiles, but there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. The Python mock e2e covers the protocol shape. The next engineering step is a real validator test.
+The current Anchor instruction test covers registry bootstrap, operator auth on leases, and on-chain PCR16 computation. The Python mock e2e covers the full off-chain protocol shape.
 
-The transfer hook is intentionally a mint-level guard in V1. Token-2022 hook execute data only carries `amount`, and the mint-wide extra account list cannot pass arbitrary per-job accounts unless the PDA graph is derivable from the transfer source/mint/destination/owner. Full hook-side claim verification needs that seed redesign.
+One honest remaining gap: there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. V1 verifies claims in `settle_claim`, arms a one-use `TransferGuard`, flushes it before the CPI, and requires the hook to consume that guard. Full hook-side claim verification still needs a PDA seed redesign so the hook can derive the job, lease, receipt, and policy graph from the transfer inputs.
 
 ## Real Nitro Smoke
 

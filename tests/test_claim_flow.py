@@ -5,11 +5,15 @@ from pathlib import Path
 import pytest
 
 from solrl_core.claim import (
+    ClaimError,
+    bytes32,
+    bytes48,
     claim_hash,
     claim_message,
     hex32,
     load_json,
     private_key_from_seed,
+    pubkey_bytes,
     sign_slash_claim,
     slash_claim_hash,
     sign_claim,
@@ -36,6 +40,17 @@ def test_claim_v1_golden_vector_matches_python_encoder():
 
     assert claim_hash(fixture["claim"]) == fixture["claim_hash"]
     assert claim_message(fixture["claim"]).hex() == fixture["claim_message_hex"]
+
+
+def test_fixed_bytes_rejects_silent_hash_fallback():
+    with pytest.raises(ClaimError, match="expected 32-byte hex"):
+        bytes32("not-a-hex-hash")
+
+    with pytest.raises(ClaimError, match="expected 48-byte hex"):
+        bytes48(hex32("only-32-bytes"))
+
+    with pytest.raises(ClaimError, match="invalid base58 pubkey"):
+        pubkey_bytes("not-a-valid-pubkey!!!")
 
 
 def test_claim_signature_roundtrip(tmp_path):

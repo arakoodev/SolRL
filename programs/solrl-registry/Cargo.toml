@@ -23,3 +23,8 @@ solrl-claim = { path = "../../crates/solrl-claim" }
 spl-token-2022 = { version = "3.0.5", features = ["no-entrypoint"] }
 spl-transfer-hook-interface = "0.6.5"
 spl-tlv-account-resolution = "0.6.5"
+
+[dev-dependencies]
+solana-program-test = "1.18.26"
+solana-sdk = "1.18.26"
+tokio = { version = "1", features = ["macros"] }

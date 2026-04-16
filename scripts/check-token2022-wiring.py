@@ -40,6 +40,7 @@ def main() -> int:
     source = REGISTRY.read_text(encoding="utf-8")
     settle = function_body(source, "settle_claim")
     hook = function_body(source, "transfer_hook")
+    slash = function_body(source, "slash_operator")
 
     if "transfer_escrow_to_operator" not in settle:
         fail("settle_claim must execute the escrow payout")
@@ -51,6 +52,18 @@ def main() -> int:
         fail("transfer hook must check pause state")
     if "ctx.accounts.config.token_mint" not in hook:
         fail("transfer hook must guard the configured mint")
+    if "consume_transfer_guard" not in hook:
+        fail("transfer hook must consume a TransferGuard")
+    if "arm_transfer_guard" not in settle:
+        fail("settle_claim must arm a TransferGuard before payout")
+    if "TransferGuard" not in source:
+        fail("registry must define a TransferGuard account")
+    if "ctx.accounts.transfer_guard.exit(ctx.program_id)" not in settle:
+        fail("settle_claim must flush the armed TransferGuard before Token-2022 CPI")
+    if "TRANSFER_GUARD_STATUS_CONSUMED" not in settle:
+        fail("settle_claim must fail unless the Token-2022 hook consumed the TransferGuard")
+    if "TRANSFER_GUARD_STATUS_CONSUMED" not in slash:
+        fail("slash_operator must fail unless the Token-2022 hook consumed the TransferGuard")
     if "ExtraAccountMetaList::init" not in source:
         fail("missing ExtraAccountMetaList initialization")
 

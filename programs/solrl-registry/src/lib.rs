@@ -8,10 +8,10 @@ use anchor_lang::solana_program::{
     sysvar::instructions::{load_instruction_at_checked, ID as INSTRUCTIONS_ID},
 };
 use solrl_claim::{
-    claim_hash, claim_message, slash_claim_hash, slash_claim_message, ClaimV1, SlashClaimV1,
-    CLAIM_PROTOCOL_VERSION, SLASH_REASON_FORGED_CONTEXT, SLASH_REASON_LEASE_ABUSE,
-    SLASH_REASON_MALICIOUS_DUPLICATE, SLASH_REASON_REPLAY, SLASH_REASON_WRONG_JOB,
-    SLASH_REASON_WRONG_POLICY,
+    claim_hash, claim_message, pcr16_digest, slash_claim_hash, slash_claim_message, ClaimV1,
+    Pcr16Components, SlashClaimV1, CLAIM_PROTOCOL_VERSION, SLASH_REASON_FORGED_CONTEXT,
+    SLASH_REASON_LEASE_ABUSE, SLASH_REASON_MALICIOUS_DUPLICATE, SLASH_REASON_REPLAY,
+    SLASH_REASON_WRONG_JOB, SLASH_REASON_WRONG_POLICY,
 };
 use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 use spl_token_2022::{
@@ -26,11 +26,15 @@ const OPERATOR_STATUS_ACTIVE: u8 = 1;
 const JOB_STATUS_OPEN: u8 = 1;
 const JOB_STATUS_LEASED: u8 = 2;
 const JOB_STATUS_SETTLED: u8 = 3;
+const JOB_STATUS_EXPIRED: u8 = 4;
 const LEASE_STATUS_ACTIVE: u8 = 1;
 const LEASE_STATUS_SETTLED: u8 = 2;
 const LEASE_STATUS_SLASHED: u8 = 3;
+const LEASE_STATUS_EXPIRED: u8 = 4;
 const RECEIPT_STATUS_PENDING: u8 = 1;
 const RECEIPT_STATUS_CONSUMED: u8 = 2;
+const TRANSFER_GUARD_STATUS_ARMED: u8 = 1;
+const TRANSFER_GUARD_STATUS_CONSUMED: u8 = 2;
 
 #[program]
 pub mod solrl_registry {
@@ -192,7 +196,6 @@ pub mod solrl_registry {
         policy.pcr0 = args.pcr0;
         policy.pcr1 = args.pcr1;
         policy.pcr2 = args.pcr2;
-        policy.pcr16 = args.pcr16;
         policy.active = args.active;
         policy.bump = ctx.bumps.image_policy;
 
@@ -252,6 +255,22 @@ pub mod solrl_registry {
             args.expires_at > Clock::get()?.unix_timestamp,
             SolrlError::Expired
         );
+        require!(
+            ctx.accounts.verifier_policy.active,
+            SolrlError::InactiveVerifierPolicy
+        );
+        require!(
+            ctx.accounts.verifier_policy.verifier_policy_id == args.verifier_policy_id,
+            SolrlError::InvalidVerifierPolicy
+        );
+        require!(
+            ctx.accounts.image_policy.active,
+            SolrlError::InactiveImagePolicy
+        );
+        require!(
+            ctx.accounts.image_policy.image_policy_id == args.image_policy_id,
+            SolrlError::InvalidImagePolicy
+        );
 
         let job = &mut ctx.accounts.job;
         job.config = config.key();
@@ -263,6 +282,9 @@ pub mod solrl_registry {
         job.verifier_policy_id = args.verifier_policy_id;
         job.image_policy_id = args.image_policy_id;
         job.task_hash = args.task_hash;
+        job.task_toml_hash = args.task_toml_hash;
+        job.instruction_hash = args.instruction_hash;
+        job.test_hash = args.test_hash;
         job.reward_script_hash = args.reward_script_hash;
         job.harbor_environment_hash = args.harbor_environment_hash;
         job.artifact_policy_hash = args.artifact_policy_hash;
@@ -306,11 +328,31 @@ pub mod solrl_registry {
             ctx.accounts.operator.stake_amount >= ctx.accounts.config.min_operator_stake,
             SolrlError::InsufficientStake
         );
+        require_keys_eq!(
+            ctx.accounts.operator.owner,
+            ctx.accounts.operator_owner.key(),
+            SolrlError::InvalidOperatorOwner
+        );
         require!(
             ctx.accounts.job.status == JOB_STATUS_OPEN,
             SolrlError::JobNotOpen
         );
+        require!(ctx.accounts.job.expires_at >= now, SolrlError::Expired);
         require!(args.expires_at > now, SolrlError::Expired);
+        require!(
+            args.expires_at <= ctx.accounts.job.expires_at,
+            SolrlError::Expired
+        );
+
+        let expected_pcr16 = compute_expected_pcr16(
+            &ctx.accounts.config,
+            ctx.accounts.job.key(),
+            &ctx.accounts.job,
+            ctx.accounts.lease.key(),
+            ctx.accounts.operator.key(),
+            &ctx.accounts.operator,
+            args.nonce,
+        )?;
 
         let lease = &mut ctx.accounts.lease;
         lease.config = ctx.accounts.config.key();
@@ -319,7 +361,7 @@ pub mod solrl_registry {
         lease.operator = ctx.accounts.operator.key();
         lease.payout_token_account = ctx.accounts.operator.payout_token_account;
         lease.nonce = args.nonce;
-        lease.expected_pcr16 = args.expected_pcr16;
+        lease.expected_pcr16 = expected_pcr16;
         lease.expected_worker_public_key_hash = args.expected_worker_public_key_hash;
         lease.expires_at = args.expires_at;
         lease.status = LEASE_STATUS_ACTIVE;
@@ -339,6 +381,51 @@ pub mod solrl_registry {
             job: lease.job,
             operator: lease.operator,
             nonce: lease.nonce,
+        });
+
+        Ok(())
+    }
+
+    pub fn expire_lease(ctx: Context<ExpireLease>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+
+        require!(
+            ctx.accounts.lease.status == LEASE_STATUS_ACTIVE,
+            SolrlError::LeaseNotActive
+        );
+        require!(
+            ctx.accounts.lease.expires_at < now || ctx.accounts.job.expires_at < now,
+            SolrlError::LeaseNotExpired
+        );
+        require_keys_eq!(
+            ctx.accounts.job.lease,
+            ctx.accounts.lease.key(),
+            SolrlError::InvalidLease
+        );
+        require_keys_eq!(
+            ctx.accounts.lease.operator,
+            ctx.accounts.operator.key(),
+            SolrlError::InvalidOperator
+        );
+
+        ctx.accounts.lease.status = LEASE_STATUS_EXPIRED;
+        ctx.accounts.job.lease = Pubkey::default();
+        ctx.accounts.job.status = if ctx.accounts.job.expires_at < now {
+            JOB_STATUS_EXPIRED
+        } else {
+            JOB_STATUS_OPEN
+        };
+        ctx.accounts.operator.active_lease_count = ctx
+            .accounts
+            .operator
+            .active_lease_count
+            .checked_sub(1)
+            .ok_or(SolrlError::MathOverflow)?;
+
+        emit!(LeaseExpired {
+            lease: ctx.accounts.lease.key(),
+            job: ctx.accounts.job.key(),
+            operator: ctx.accounts.operator.key(),
         });
 
         Ok(())
@@ -383,8 +470,23 @@ pub mod solrl_registry {
             nonce_receipt.bump = ctx.bumps.nonce_receipt;
         }
 
+        arm_transfer_guard(
+            &mut ctx.accounts.transfer_guard,
+            ctx.accounts.escrow_token_account.key(),
+            ctx.accounts.token_mint.key(),
+            ctx.accounts.payout_token_account.key(),
+            ctx.accounts.escrow_authority.key(),
+            claim.amount,
+            ctx.bumps.transfer_guard,
+        )?;
+        ctx.accounts.transfer_guard.exit(ctx.program_id)?;
         transfer_escrow_to_operator(&ctx, claim.amount)?;
-        mark_claim_paid(ctx.accounts);
+        ctx.accounts.transfer_guard.reload()?;
+        require!(
+            ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
+            SolrlError::InvalidTransferGuard
+        );
+        mark_claim_paid(ctx.accounts)?;
 
         emit!(ClaimSettled {
             claim_receipt: ctx.accounts.claim_receipt.key(),
@@ -396,7 +498,7 @@ pub mod solrl_registry {
         Ok(())
     }
 
-    pub fn transfer_hook(ctx: Context<TransferHook>, _amount: u64) -> Result<()> {
+    pub fn transfer_hook(ctx: Context<TransferHook>, amount: u64) -> Result<()> {
         assert_transferring(&ctx.accounts.source_token)?;
         ctx.accounts.config.require_not_paused()?;
         require_keys_eq!(
@@ -404,6 +506,14 @@ pub mod solrl_registry {
             ctx.accounts.config.token_mint,
             SolrlError::InvalidMint
         );
+        consume_transfer_guard(
+            &mut ctx.accounts.transfer_guard,
+            ctx.accounts.source_token.key(),
+            ctx.accounts.mint.key(),
+            ctx.accounts.destination_token.key(),
+            ctx.accounts.owner.key(),
+            amount,
+        )?;
         Ok(())
     }
 
@@ -435,7 +545,22 @@ pub mod solrl_registry {
             .ok_or(SolrlError::MathOverflow)?;
         ctx.accounts.lease.status = LEASE_STATUS_SLASHED;
 
+        arm_transfer_guard(
+            &mut ctx.accounts.transfer_guard,
+            ctx.accounts.stake_token_account.key(),
+            ctx.accounts.token_mint.key(),
+            ctx.accounts.treasury_token_account.key(),
+            ctx.accounts.stake_authority.key(),
+            slash_claim.slash_amount,
+            ctx.bumps.transfer_guard,
+        )?;
+        ctx.accounts.transfer_guard.exit(ctx.program_id)?;
         transfer_stake_to_treasury(&ctx, slash_claim.slash_amount)?;
+        ctx.accounts.transfer_guard.reload()?;
+        require!(
+            ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
+            SolrlError::InvalidTransferGuard
+        );
 
         emit!(OperatorSlashed {
             operator: ctx.accounts.operator.key(),
@@ -554,6 +679,16 @@ fn validate_claim(ctx: &Context<SettleClaim>, claim: &ClaimV1, signature_index: 
         ctx.accounts.lease.nonce == claim.nonce,
         SolrlError::InvalidNonce
     );
+    let expected_pcr16 = compute_expected_pcr16(
+        &ctx.accounts.config,
+        ctx.accounts.job.key(),
+        &ctx.accounts.job,
+        ctx.accounts.lease.key(),
+        ctx.accounts.operator.key(),
+        &ctx.accounts.operator,
+        claim.nonce,
+    )?;
+    require!(expected_pcr16 == claim.pcr16, SolrlError::InvalidPcr16);
     require!(
         ctx.accounts.lease.expected_pcr16 == claim.pcr16,
         SolrlError::InvalidPcr16
@@ -608,10 +743,6 @@ fn validate_claim(ctx: &Context<SettleClaim>, claim: &ClaimV1, signature_index: 
     require!(
         ctx.accounts.image_policy.image_policy_id == claim.image_policy_id,
         SolrlError::InvalidImagePolicy
-    );
-    require!(
-        ctx.accounts.image_policy.pcr16 == claim.pcr16,
-        SolrlError::InvalidPcr16
     );
     require_nonzero(
         &claim.attestation_document_hash,
@@ -718,12 +849,102 @@ fn validate_slash_claim(
     Ok(())
 }
 
-fn mark_claim_paid(ctx: &mut SettleClaim) {
+fn compute_expected_pcr16(
+    config: &Config,
+    job_account: Pubkey,
+    job: &Job,
+    lease_account: Pubkey,
+    operator_account: Pubkey,
+    operator: &Operator,
+    nonce: [u8; 32],
+) -> Result<[u8; 48]> {
+    pcr16_digest(&Pcr16Components {
+        job_account,
+        lease_account,
+        nonce,
+        task_hash: job.task_hash,
+        task_toml_hash: job.task_toml_hash,
+        instruction_hash: job.instruction_hash,
+        test_hash: job.test_hash,
+        reward_script_hash: job.reward_script_hash,
+        harbor_environment_hash: job.harbor_environment_hash,
+        resource_class_hash: job.resource_class_hash,
+        timeout_seconds: job.timeout_seconds,
+        network_policy_hash: job.network_policy_hash,
+        operator_account,
+        payout_token_account: operator.payout_token_account,
+        token_mint: config.token_mint,
+        artifact_policy_hash: job.artifact_policy_hash,
+        protocol_version: CLAIM_PROTOCOL_VERSION,
+    })
+    .map_err(|_| error!(SolrlError::InvalidClaimEncoding))
+}
+
+fn mark_claim_paid(ctx: &mut SettleClaim) -> Result<()> {
     ctx.claim_receipt.status = RECEIPT_STATUS_CONSUMED;
     ctx.nonce_receipt.consumed = true;
     ctx.lease.status = LEASE_STATUS_SETTLED;
     ctx.job.status = JOB_STATUS_SETTLED;
-    ctx.operator.active_lease_count = ctx.operator.active_lease_count.saturating_sub(1);
+    ctx.operator.active_lease_count = ctx
+        .operator
+        .active_lease_count
+        .checked_sub(1)
+        .ok_or(SolrlError::MathOverflow)?;
+    Ok(())
+}
+
+fn arm_transfer_guard(
+    guard: &mut Account<'_, TransferGuard>,
+    source_token: Pubkey,
+    mint: Pubkey,
+    destination_token: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+    bump: u8,
+) -> Result<()> {
+    let slot = Clock::get()?.slot;
+    guard.source_token = source_token;
+    guard.mint = mint;
+    guard.destination_token = destination_token;
+    guard.owner = owner;
+    guard.amount = amount;
+    guard.expires_slot = slot;
+    guard.status = TRANSFER_GUARD_STATUS_ARMED;
+    guard.bump = bump;
+    Ok(())
+}
+
+fn consume_transfer_guard(
+    guard: &mut Account<'_, TransferGuard>,
+    source_token: Pubkey,
+    mint: Pubkey,
+    destination_token: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) -> Result<()> {
+    require!(
+        guard.status == TRANSFER_GUARD_STATUS_ARMED,
+        SolrlError::InvalidTransferGuard
+    );
+    require_keys_eq!(
+        guard.source_token,
+        source_token,
+        SolrlError::InvalidTransferGuard
+    );
+    require_keys_eq!(guard.mint, mint, SolrlError::InvalidTransferGuard);
+    require_keys_eq!(
+        guard.destination_token,
+        destination_token,
+        SolrlError::InvalidTransferGuard
+    );
+    require_keys_eq!(guard.owner, owner, SolrlError::InvalidTransferGuard);
+    require!(guard.amount == amount, SolrlError::InvalidTransferGuard);
+    require!(
+        guard.expires_slot >= Clock::get()?.slot,
+        SolrlError::InvalidTransferGuard
+    );
+    guard.status = TRANSFER_GUARD_STATUS_CONSUMED;
+    Ok(())
 }
 
 fn transfer_escrow_to_operator(ctx: &Context<SettleClaim>, amount: u64) -> Result<()> {
@@ -744,6 +965,8 @@ fn transfer_escrow_to_operator(ctx: &Context<SettleClaim>, amount: u64) -> Resul
     ));
     ix.accounts
         .push(AccountMeta::new_readonly(ctx.accounts.config.key(), false));
+    ix.accounts
+        .push(AccountMeta::new(ctx.accounts.transfer_guard.key(), false));
 
     let job_key = ctx.accounts.job.key();
     let signer_seeds: &[&[&[u8]]] = &[&[
@@ -762,6 +985,7 @@ fn transfer_escrow_to_operator(ctx: &Context<SettleClaim>, amount: u64) -> Resul
             ctx.accounts.escrow_authority.to_account_info(),
             ctx.accounts.extra_account_meta_list.to_account_info(),
             ctx.accounts.config.to_account_info(),
+            ctx.accounts.transfer_guard.to_account_info(),
         ],
         signer_seeds,
     )?;
@@ -770,7 +994,7 @@ fn transfer_escrow_to_operator(ctx: &Context<SettleClaim>, amount: u64) -> Resul
 }
 
 fn transfer_stake_to_treasury(ctx: &Context<SlashOperator>, amount: u64) -> Result<()> {
-    let ix = spl_token_2022::instruction::transfer_checked(
+    let mut ix = spl_token_2022::instruction::transfer_checked(
         &ctx.accounts.token_program.key(),
         &ctx.accounts.stake_token_account.key(),
         &ctx.accounts.token_mint.key(),
@@ -780,6 +1004,14 @@ fn transfer_stake_to_treasury(ctx: &Context<SlashOperator>, amount: u64) -> Resu
         amount,
         ctx.accounts.config.token_decimals,
     )?;
+    ix.accounts.push(AccountMeta::new_readonly(
+        ctx.accounts.extra_account_meta_list.key(),
+        false,
+    ));
+    ix.accounts
+        .push(AccountMeta::new_readonly(ctx.accounts.config.key(), false));
+    ix.accounts
+        .push(AccountMeta::new(ctx.accounts.transfer_guard.key(), false));
     let operator_key = ctx.accounts.operator.key();
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"stake_authority",
@@ -795,6 +1027,9 @@ fn transfer_stake_to_treasury(ctx: &Context<SlashOperator>, amount: u64) -> Resu
             ctx.accounts.token_mint.to_account_info(),
             ctx.accounts.treasury_token_account.to_account_info(),
             ctx.accounts.stake_authority.to_account_info(),
+            ctx.accounts.extra_account_meta_list.to_account_info(),
+            ctx.accounts.config.to_account_info(),
+            ctx.accounts.transfer_guard.to_account_info(),
         ],
         signer_seeds,
     )?;
@@ -1034,10 +1269,14 @@ pub struct RegisterOperator<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(job_id: [u8; 32])]
+#[instruction(job_id: [u8; 32], args: CreateJobArgs)]
 pub struct CreateJob<'info> {
     #[account(mut, seeds = [b"config"], bump = config.bump)]
     pub config: Account<'info, Config>,
+    #[account(has_one = config)]
+    pub verifier_policy: Account<'info, VerifierPolicy>,
+    #[account(has_one = config)]
+    pub image_policy: Account<'info, ImagePolicy>,
     #[account(
         init,
         payer = owner,
@@ -1071,9 +1310,22 @@ pub struct CreateLease<'info> {
         bump
     )]
     pub lease: Box<Account<'info, Lease>>,
+    pub operator_owner: Signer<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExpireLease<'info> {
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, has_one = config)]
+    pub job: Account<'info, Job>,
+    #[account(mut, has_one = config, has_one = job)]
+    pub lease: Account<'info, Lease>,
+    #[account(mut, has_one = config)]
+    pub operator: Account<'info, Operator>,
 }
 
 #[derive(Accounts)]
@@ -1121,6 +1373,21 @@ pub struct SettleClaim<'info> {
     #[account(address = job.escrow_authority)]
     /// CHECK: PDA signer for escrow transfers.
     pub escrow_authority: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + TransferGuard::LEN,
+        seeds = [
+            b"transfer_guard",
+            escrow_token_account.key().as_ref(),
+            token_mint.key().as_ref(),
+            payout_token_account.key().as_ref(),
+            escrow_authority.key().as_ref(),
+            &claim.amount.to_le_bytes()
+        ],
+        bump
+    )]
+    pub transfer_guard: Account<'info, TransferGuard>,
     #[account(seeds = [b"extra-account-metas", token_mint.key().as_ref()], bump)]
     /// CHECK: SPL transfer hook validation account.
     pub extra_account_meta_list: UncheckedAccount<'info>,
@@ -1136,6 +1403,7 @@ pub struct SettleClaim<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(amount: u64)]
 pub struct TransferHook<'info> {
     /// CHECK: Token-2022 source token account.
     pub source_token: UncheckedAccount<'info>,
@@ -1150,6 +1418,19 @@ pub struct TransferHook<'info> {
     pub extra_account_meta_list: UncheckedAccount<'info>,
     #[account(seeds = [b"config"], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
+    #[account(
+        mut,
+        seeds = [
+            b"transfer_guard",
+            source_token.key().as_ref(),
+            mint.key().as_ref(),
+            destination_token.key().as_ref(),
+            owner.key().as_ref(),
+            &amount.to_le_bytes()
+        ],
+        bump = transfer_guard.bump
+    )]
+    pub transfer_guard: Account<'info, TransferGuard>,
 }
 
 #[derive(Accounts)]
@@ -1179,12 +1460,33 @@ pub struct SlashOperator<'info> {
     #[account(address = operator.stake_authority)]
     /// CHECK: PDA signer for stake vault transfers.
     pub stake_authority: UncheckedAccount<'info>,
+    #[account(seeds = [b"extra-account-metas", token_mint.key().as_ref()], bump)]
+    /// CHECK: SPL transfer hook validation account.
+    pub extra_account_meta_list: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + TransferGuard::LEN,
+        seeds = [
+            b"transfer_guard",
+            stake_token_account.key().as_ref(),
+            token_mint.key().as_ref(),
+            treasury_token_account.key().as_ref(),
+            stake_authority.key().as_ref(),
+            &slash_claim.slash_amount.to_le_bytes()
+        ],
+        bump
+    )]
+    pub transfer_guard: Account<'info, TransferGuard>,
     #[account(address = spl_token_2022::ID)]
     /// CHECK: Token-2022 program.
     pub token_program: UncheckedAccount<'info>,
     #[account(address = INSTRUCTIONS_ID)]
     /// CHECK: Solana instructions sysvar. The program only reads it.
     pub instructions: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[account]
@@ -1253,13 +1555,12 @@ pub struct ImagePolicy {
     pub pcr0: [u8; 48],
     pub pcr1: [u8; 48],
     pub pcr2: [u8; 48],
-    pub pcr16: [u8; 48],
     pub active: bool,
     pub bump: u8,
 }
 
 impl ImagePolicy {
-    pub const LEN: usize = 32 + 32 + 16 + 2 + 48 + 48 + 48 + 48 + 1 + 1;
+    pub const LEN: usize = 32 + 32 + 16 + 2 + 48 + 48 + 48 + 1 + 1;
 }
 
 #[account]
@@ -1293,6 +1594,9 @@ pub struct Job {
     pub verifier_policy_id: [u8; 32],
     pub image_policy_id: [u8; 32],
     pub task_hash: [u8; 32],
+    pub task_toml_hash: [u8; 32],
+    pub instruction_hash: [u8; 32],
+    pub test_hash: [u8; 32],
     pub reward_script_hash: [u8; 32],
     pub harbor_environment_hash: [u8; 32],
     pub artifact_policy_hash: [u8; 32],
@@ -1307,8 +1611,29 @@ pub struct Job {
 }
 
 impl Job {
-    pub const LEN: usize =
-        32 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 4 + 8 + 32 + 1 + 1 + 1;
+    pub const LEN: usize = 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 8
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 32
+        + 4
+        + 8
+        + 32
+        + 1
+        + 1
+        + 1;
 }
 
 #[account]
@@ -1370,6 +1695,22 @@ impl NonceReceipt {
     pub const LEN: usize = 32 + 32 + 32 + 1 + 1;
 }
 
+#[account]
+pub struct TransferGuard {
+    pub source_token: Pubkey,
+    pub mint: Pubkey,
+    pub destination_token: Pubkey,
+    pub owner: Pubkey,
+    pub amount: u64,
+    pub expires_slot: u64,
+    pub status: u8,
+    pub bump: u8,
+}
+
+impl TransferGuard {
+    pub const LEN: usize = 32 + 32 + 32 + 32 + 8 + 8 + 1 + 1;
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct InitializeConfigArgs {
     pub cluster_hash: [u8; 32],
@@ -1402,7 +1743,6 @@ pub struct RegisterImagePolicyArgs {
     pub pcr0: [u8; 48],
     pub pcr1: [u8; 48],
     pub pcr2: [u8; 48],
-    pub pcr16: [u8; 48],
     pub active: bool,
 }
 
@@ -1420,6 +1760,9 @@ pub struct CreateJobArgs {
     pub verifier_policy_id: [u8; 32],
     pub image_policy_id: [u8; 32],
     pub task_hash: [u8; 32],
+    pub task_toml_hash: [u8; 32],
+    pub instruction_hash: [u8; 32],
+    pub test_hash: [u8; 32],
     pub reward_script_hash: [u8; 32],
     pub harbor_environment_hash: [u8; 32],
     pub artifact_policy_hash: [u8; 32],
@@ -1432,7 +1775,6 @@ pub struct CreateJobArgs {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct CreateLeaseArgs {
     pub nonce: [u8; 32],
-    pub expected_pcr16: [u8; 48],
     pub expected_worker_public_key_hash: [u8; 32],
     pub expires_at: i64,
 }
@@ -1496,6 +1838,13 @@ pub struct LeaseCreated {
 }
 
 #[event]
+pub struct LeaseExpired {
+    pub lease: Pubkey,
+    pub job: Pubkey,
+    pub operator: Pubkey,
+}
+
+#[event]
 pub struct ClaimSettled {
     pub claim_receipt: Pubkey,
     pub job: Pubkey,
@@ -1543,6 +1892,8 @@ pub enum SolrlError {
     InvalidClaimReceipt,
     #[msg("operator mismatch")]
     InvalidOperator,
+    #[msg("operator owner signature is required")]
+    InvalidOperatorOwner,
     #[msg("operator is inactive")]
     InactiveOperator,
     #[msg("operator stake is below required threshold")]
@@ -1599,8 +1950,8 @@ pub enum SolrlError {
     InvalidSignaturePublicKey,
     #[msg("claim nonce mismatch")]
     InvalidNonce,
-    #[msg("claim was already consumed")]
-    Replay,
+    #[msg("lease is not expired")]
+    LeaseNotExpired,
     #[msg("escrow token account mismatch")]
     InvalidEscrow,
     #[msg("escrow authority mismatch")]
@@ -1609,6 +1960,8 @@ pub enum SolrlError {
     InvalidTokenAccount,
     #[msg("transfer hook was not called by Token-2022 transfer flow")]
     InvalidHookCaller,
+    #[msg("transfer guard is missing, stale, consumed, or mismatched")]
+    InvalidTransferGuard,
     #[msg("slash reason is reject-only or dispute-only")]
     RejectOnly,
     #[msg("slash evidence hash must be non-zero")]

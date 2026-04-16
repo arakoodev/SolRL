@@ -301,9 +301,9 @@ def fixed_bytes(value: Any, length: int) -> bytes:
     elif isinstance(value, bytearray):
         raw = bytes(value)
     elif isinstance(value, str):
-        raw = bytes.fromhex(value) if _is_hex(value, length) else hashlib.sha256(value.encode()).digest()
-        if length == 48 and len(raw) == 32:
-            raw = hashlib.sha384(value.encode()).digest()
+        if not _is_hex(value, length):
+            raise ClaimError(f"expected {length}-byte hex string, got {value!r}")
+        raw = bytes.fromhex(value)
     else:
         raise ClaimError(f"cannot encode {value!r} as {length} bytes")
 
@@ -319,8 +319,6 @@ def pubkey_bytes(value: Any) -> bytes:
         raw = bytes.fromhex(value)
     elif isinstance(value, str):
         raw = _base58_decode(value)
-        if len(raw) != 32:
-            raw = hashlib.sha256(value.encode()).digest()
     else:
         raise ClaimError(f"cannot encode {value!r} as pubkey")
     if len(raw) != 32:
@@ -343,7 +341,7 @@ def _base58_decode(value: str) -> bytes:
     acc = 0
     for char in value:
         if char not in alphabet:
-            return hashlib.sha256(value.encode()).digest()
+            raise ClaimError(f"invalid base58 pubkey: {value!r}")
         acc = acc * 58 + alphabet.index(char)
     raw = acc.to_bytes((acc.bit_length() + 7) // 8, "big") if acc else b""
     leading = len(value) - len(value.lstrip("1"))

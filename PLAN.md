@@ -260,17 +260,21 @@ Implemented now:
 - ClaimV1 golden vectors shared across Rust and Python tests
 - Signed-field validation lint for `settle_claim`
 - Token-2022 wiring lint for payout CPI and hook guard behavior
-- Docker boundary lint for no Docker-in-Docker and LocalStack honesty
+- Docker boundary lint for no Docker-in-Docker, Cargo lockfile/SBF compatibility, and LocalStack honesty
 - Ed25519 instruction-sysvar parser for verifier signatures
 - Token-2022 `ExtraAccountMetaList` initializer
-- Token-2022 transfer hook fallback router and mint-level guard
+- Token-2022 transfer hook fallback router and one-use `TransferGuard`
 - Token-2022 escrow payout CPI from `settle_claim`
 - Token-2022 stake slash CPI from `slash_operator`
 - Failure taxonomy for reject-only vs slashable claim failures
+- Program-test instruction coverage for registry bootstrap, lease owner auth, and on-chain PCR16 computation
+- On-chain PCR16 recomputation from `Job`, `Lease`, `Operator`, and claim nonce
+- Lease expiry cleanup instruction
+- Strict Python hash/pubkey parsing, no silent fallback hashing
 
 Not implemented yet:
 - Full local-validator instruction test that proves Token-2022 calls the hook end-to-end.
-- Full hook-as-verifier mode. Token-2022 hook execute data only carries `amount`, and the mint-wide `ExtraAccountMetaList` can only pass accounts resolvable from source, mint, destination, owner, instruction data, or prior resolved accounts. The current job PDA graph is not derivable from those values. V1 therefore verifies the claim in `settle_claim` and uses the hook as a mint-level guard.
+- Full hook-as-verifier mode. Token-2022 hook execute data only carries `amount`, and the mint-wide `ExtraAccountMetaList` can only pass accounts resolvable from source, mint, destination, owner, instruction data, or prior resolved accounts. The current job PDA graph is not derivable from those values. V1 therefore verifies the claim in `settle_claim`, arms a scoped `TransferGuard`, and requires the hook to consume it.
 - Anchor IDL generation. `anchor build --no-idl` passes; full IDL generation currently hits an Anchor `0.30.1` / `proc-macro2` compatibility problem.
 - Production Harbor Nitro environment plugin.
 - Real AWS Nitro EIF boot and NSM smoke.
@@ -490,8 +494,9 @@ Current SolRL jobs are keyed by `job_id`, not by the escrow token account. That 
 
 V1 chooses the boring path that works:
 - `settle_claim` verifies `ClaimV1` and owns the escrow transfer.
+- `settle_claim` arms a one-use `TransferGuard` PDA for the exact source, mint, destination, owner, and amount.
 - Token-2022 still moves the tokens.
-- The transfer hook is a mint-level guard, not the claim verifier.
+- The transfer hook rejects raw transfers unless it can consume the matching `TransferGuard`.
 
 To make the hook itself verify claims later, redesign PDA seeds so the whole graph is derivable from the transfer's source token account:
 
@@ -675,10 +680,10 @@ Use this for Marlin `verifier-enclave` and reproducible EIF work. Keeping it sep
 Runs local validator.
 
 Reserved for:
-- Full Anchor instruction tests.
+- Full local-validator Anchor instruction tests.
 - Token-2022 hook transaction tests.
 
-Current Docker tests compile the program and run mock e2e without a validator.
+Current Docker tests compile the program, run `solana-program-test` instruction coverage, and run mock e2e without a standalone validator.
 
 ### `localstack`
 

@@ -16,6 +16,23 @@ if grep -nE 'docker\\.io|docker-ce|docker-cli|docker-buildx|docker compose|docke
   exit 1
 fi
 
+for script in scripts/lint.sh scripts/test-anchor.sh; do
+  if ! grep -q 'SOLRL_IN_DOCKER' "$script"; then
+    echo "docker boundary lint failed: $script must refuse host execution" >&2
+    exit 1
+  fi
+done
+
+if ! grep -q 'SOLRL_IN_DOCKER: "1"' docker-compose.yml; then
+  echo "docker boundary lint failed: docker-compose.yml must mark Docker-only services" >&2
+  exit 1
+fi
+
+if ! sed -n '1,4p' Cargo.lock | grep -q '^version = 3$'; then
+  echo "docker boundary lint failed: Cargo.lock must stay at version 3 for Solana 1.18 SBF builds" >&2
+  exit 1
+fi
+
 python3 - <<'PY'
 from __future__ import annotations
 

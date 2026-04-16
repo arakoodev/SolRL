@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${SOLRL_IN_DOCKER:-}" != "1" ]; then
+  echo "lint.sh must run inside the SolRL Docker dev shell. Use: docker compose run --rm --no-deps lint" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-rustup toolchain install 1.85.1 >/dev/null
-rustup default 1.85.1 >/dev/null
+rustup toolchain install 1.88.0 >/dev/null
+rustup default 1.88.0 >/dev/null
 rustup component add rustfmt clippy >/dev/null
 
 cargo fmt --all -- --check

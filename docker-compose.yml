@@ -6,8 +6,8 @@ services:
     working_dir: /workspace
     volumes:
       - .:/workspace
-      - cargo-cache:/usr/local/cargo/registry
-      - cargo-git-cache:/usr/local/cargo/git
+      - cargo-cache:/root/.cargo/registry
+      - cargo-git-cache:/root/.cargo/git
       - target-cache:/workspace/target
       - npm-cache:/root/.npm
       - pip-cache:/root/.cache/pip
@@ -18,6 +18,7 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       LOCALSTACK_ENDPOINT: http://localstack:4566
       PYTHONPATH: /workspace/python
+      SOLRL_IN_DOCKER: "1"
     depends_on:
       localstack:
         condition: service_healthy
@@ -30,8 +31,8 @@ services:
     working_dir: /workspace
     volumes:
       - .:/workspace
-      - cargo-cache:/usr/local/cargo/registry
-      - cargo-git-cache:/usr/local/cargo/git
+      - cargo-cache:/root/.cargo/registry
+      - cargo-git-cache:/root/.cargo/git
       - target-cache:/workspace/target
       - pip-cache:/root/.cache/pip
       - terraform-cache:/root/.terraform.d
@@ -41,6 +42,7 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       LOCALSTACK_ENDPOINT: http://localstack:4566
       PYTHONPATH: /workspace/python
+      SOLRL_IN_DOCKER: "1"
     command: ./scripts/lint.sh
 
   nix-builder:

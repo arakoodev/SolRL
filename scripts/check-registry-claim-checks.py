@@ -75,6 +75,8 @@ def function_body(source: str, name: str) -> str:
 def main() -> int:
     source = REGISTRY.read_text(encoding="utf-8")
     validate_claim = function_body(source, "validate_claim")
+    create_lease = function_body(source, "create_lease")
+    transfer_hook = function_body(source, "transfer_hook")
 
     missing_accounts = [item for item in REQUIRED_ACCOUNTS if item not in source]
     if missing_accounts:
@@ -89,10 +91,21 @@ def main() -> int:
         "InvalidNetworkPolicyHash",
         "InvalidWorkerPublicKeyHash",
         "InvalidRewardValue",
-        "Replay",
+        "InvalidTransferGuard",
     ):
         if required_error not in source:
             fail(f"missing error taxonomy item {required_error}")
+
+    if "pub pcr16:" in source:
+        fail("ImagePolicy must not store PCR16; PCR16 is lease/task scoped")
+    if "pcr16_digest" not in source or "compute_expected_pcr16" not in validate_claim:
+        fail("validate_claim must recompute PCR16 from registry state")
+    if "expected_pcr16 = args.expected_pcr16" in source:
+        fail("create_lease must not trust caller-provided PCR16")
+    if "operator_owner" not in create_lease or "ctx.accounts.operator.owner" not in create_lease:
+        fail("create_lease must require operator owner consent")
+    if "consume_transfer_guard" not in transfer_hook:
+        fail("transfer hook must consume a registry-armed TransferGuard")
 
     print("registry claim lint OK")
     return 0
