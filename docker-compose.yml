@@ -1,0 +1,157 @@
+services:
+  dev-shell:
+    build:
+      context: .
+      dockerfile: docker/dev-shell.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git-cache:/usr/local/cargo/git
+      - target-cache:/workspace/target
+      - npm-cache:/root/.npm
+      - pip-cache:/root/.cache/pip
+      - terraform-cache:/root/.terraform.d
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_ENDPOINT: http://localstack:4566
+      PYTHONPATH: /workspace/python
+    depends_on:
+      localstack:
+        condition: service_healthy
+    command: bash
+
+  lint:
+    build:
+      context: .
+      dockerfile: docker/dev-shell.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git-cache:/usr/local/cargo/git
+      - target-cache:/workspace/target
+      - pip-cache:/root/.cache/pip
+      - terraform-cache:/root/.terraform.d
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_ENDPOINT: http://localstack:4566
+      PYTHONPATH: /workspace/python
+    command: ./scripts/lint.sh
+
+  nix-builder:
+    image: nixos/nix:latest
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      NIX_CONFIG: |
+        experimental-features = nix-command flakes
+        accept-flake-config = true
+    command: ["nix --version"]
+
+  solana-test-validator:
+    image: solanalabs/solana:v1.18.26
+    command:
+      - solana-test-validator
+      - --rpc-bind-address
+      - 0.0.0.0
+      - --rpc-port
+      - "8899"
+      - --ledger
+      - /ledger
+      - --reset
+    ports:
+      - "8899:8899"
+      - "8900:8900"
+    volumes:
+      - solana-ledger:/ledger
+
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,iam,sts
+      DEBUG: "0"
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aws-test-runner:
+    build:
+      context: .
+      dockerfile: docker/aws-test-runner.Dockerfile
+    working_dir: /workspace/infra/localstack
+    volumes:
+      - .:/workspace
+      - terraform-cache:/root/.terraform.d
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_ENDPOINT: http://localstack:4566
+    depends_on:
+      localstack:
+        condition: service_healthy
+    command: ["terraform init && terraform validate && terraform fmt -recursive -check && terraform test"]
+
+  harbor-runner:
+    build:
+      context: .
+      dockerfile: docker/python-runner.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - pip-cache:/root/.cache/pip
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_ENDPOINT: http://localstack:4566
+      PYTHONPATH: /workspace/python
+    depends_on:
+      localstack:
+        condition: service_healthy
+    command: pytest -q
+
+  verifier-mock:
+    build:
+      context: .
+      dockerfile: docker/python-runner.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      PYTHONPATH: /workspace/python
+    command: python -m solrl_core.mock_verifier --help
+
+  worker-mock:
+    build:
+      context: .
+      dockerfile: docker/python-runner.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      PYTHONPATH: /workspace/python
+    command: python -m solrl_core.mock_worker --help
+
+volumes:
+  cargo-cache:
+  cargo-git-cache:
+  target-cache:
+  npm-cache:
+  pip-cache:
+  terraform-cache:
+  solana-ledger:
+  localstack-data:

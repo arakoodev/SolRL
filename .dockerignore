@@ -1,0 +1,10 @@
+.git
+.gitignore
+artifacts/
+vendor/
+target/
+node_modules/
+.pytest_cache/
+__pycache__/
+*.pyc
+.DS_Store

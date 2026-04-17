@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUST = ROOT / "crates/solrl-claim/src/lib.rs"
+PYTHON = ROOT / "python/solrl_core/claim.py"
+
+
+def fail(message: str) -> None:
+    print(f"schema parity lint failed: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def rust_struct_fields(source: str, name: str) -> list[str]:
+    match = re.search(rf"pub struct {name} \{{(?P<body>.*?)\n\}}", source, re.S)
+    if not match:
+        fail(f"missing Rust struct {name}")
+    return re.findall(r"pub\s+([a-zA-Z0-9_]+)\s*:", match.group("body"))
+
+
+def rust_domain(source: str, name: str) -> str:
+    match = re.search(rf'pub const {name}: &\[u8\] = b"([^"]+)";', source)
+    if not match:
+        fail(f"missing Rust domain {name}")
+    return match.group(1)
+
+
+def python_tuple(source: str, name: str) -> list[str]:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    value = ast.literal_eval(node.value)
+                    return list(value)
+    fail(f"missing Python tuple {name}")
+
+
+def python_domain(source: str, name: str) -> str:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    value = ast.literal_eval(node.value)
+                    if not isinstance(value, bytes):
+                        fail(f"Python {name} must be bytes")
+                    return value.decode()
+    fail(f"missing Python domain {name}")
+
+
+def assert_same(label: str, left: list[str] | str, right: list[str] | str) -> None:
+    if left != right:
+        fail(f"{label} mismatch\nRust:   {left}\nPython: {right}")
+
+
+def main() -> int:
+    rust = RUST.read_text(encoding="utf-8")
+    python = PYTHON.read_text(encoding="utf-8")
+
+    assert_same("ClaimV1 fields", rust_struct_fields(rust, "ClaimV1"), python_tuple(python, "CLAIM_FIELDS"))
+    assert_same(
+        "SlashClaimV1 fields",
+        rust_struct_fields(rust, "SlashClaimV1"),
+        python_tuple(python, "SLASH_CLAIM_FIELDS"),
+    )
+    assert_same(
+        "Pcr16Components fields",
+        rust_struct_fields(rust, "Pcr16Components"),
+        python_tuple(python, "PCR16_FIELDS"),
+    )
+
+    for name in ("CLAIM_DOMAIN", "SLASH_CLAIM_DOMAIN", "PCR16_DOMAIN"):
+        assert_same(name, rust_domain(rust, name), python_domain(python, name))
+
+    print("schema parity lint OK")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

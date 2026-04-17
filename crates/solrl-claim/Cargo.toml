@@ -1,0 +1,9 @@
+[package]
+name = "solrl-claim"
+version = "0.1.0"
+edition = "2021"
+description = "Shared SolRL ClaimV1 schema"
+
+[dependencies]
+anchor-lang = { workspace = true }
+sha2 = "0.10"
