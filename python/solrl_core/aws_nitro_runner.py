@@ -27,7 +27,6 @@ AWS_ROOT_KEY_HEX = (
     "63012809664487c9796284304dc53ff4"
 )
 AWS_ROOT_KEY = bytes.fromhex(AWS_ROOT_KEY_HEX)
-DEFAULT_AMI_PARAMETER = "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2"
 DEFAULT_AMI_NAME_FILTER = "amzn2-ami-kernel-5.10-hvm-*-x86_64-gp2"
 DEFAULT_INSTANCE_TYPE = "m5.xlarge"
 DEFAULT_REGION = "us-east-1"
@@ -145,11 +144,56 @@ def sha256_hex(value: str) -> str:
 
 def parse_remote_markers(stdout: str) -> dict[str, str]:
     markers: dict[str, str] = {}
+    attestation_candidates: dict[int, list[str]] = {}
     for line in stdout.splitlines():
-        if line.startswith("SOLRL_") and "=" in line:
-            key, value = line.split("=", 1)
+        if "SOLRL_ATTESTATION_HEX_CHUNK=" in line:
+            chunk = line.split("SOLRL_ATTESTATION_HEX_CHUNK=", 1)[1].strip()
+            if ":" not in chunk:
+                continue
+            index, value = chunk.split(":", 1)
+            if not index.isdigit():
+                continue
+            attestation_candidates.setdefault(int(index), []).append(value)
+        elif "SOLRL_" in line and "=" in line:
+            marker = line.split("SOLRL_", 1)[1]
+            key_suffix, value = marker.split("=", 1)
+            key = f"SOLRL_{key_suffix}"
             markers[key] = value.strip()
+    if attestation_candidates:
+        try:
+            expected_chunks = int(markers.get("SOLRL_ATTESTATION_HEX_CHUNKS", "-1"))
+            chunk_width = int(markers.get("SOLRL_ATTESTATION_HEX_WIDTH", "-1"))
+        except ValueError as exc:
+            raise AwsNitroRunnerError("remote Nitro attestation chunk metadata is invalid") from exc
+        expected_indexes = set(range(expected_chunks))
+        actual_indexes = set(attestation_candidates)
+        if expected_chunks < 1 or actual_indexes != expected_indexes:
+            missing = sorted(expected_indexes - actual_indexes)
+            extra = sorted(actual_indexes - expected_indexes)
+            raise AwsNitroRunnerError(
+                f"remote Nitro attestation chunks incomplete; missing={missing}, extra={extra}"
+            )
+        if chunk_width < 2:
+            raise AwsNitroRunnerError("remote Nitro attestation chunk width is invalid")
+        accepted_chunks: list[str] = []
+        corrupt_indexes: list[int] = []
+        for index in range(expected_chunks):
+            valid_values = []
+            for value in attestation_candidates[index]:
+                is_hex = len(value) % 2 == 0 and all(char in "0123456789abcdefABCDEF" for char in value)
+                is_full_chunk = index < expected_chunks - 1 and len(value) == chunk_width
+                is_last_chunk = index == expected_chunks - 1 and 0 < len(value) <= chunk_width
+                if is_hex and (is_full_chunk or is_last_chunk):
+                    valid_values.append(value)
+            if not valid_values:
+                corrupt_indexes.append(index)
+                continue
+            accepted_chunks.append(valid_values[0])
+        if corrupt_indexes:
+            raise AwsNitroRunnerError(f"remote Nitro attestation chunks corrupt; indexes={corrupt_indexes}")
+        markers["SOLRL_ATTESTATION_HEX"] = "".join(accepted_chunks)
     required = {
+        "SOLRL_STATUS",
         "SOLRL_ATTESTATION_HEX",
         "SOLRL_EXPECTED_USER_DATA_HEX",
         "SOLRL_EXPECTED_PUBLIC_KEY_HEX",
@@ -158,6 +202,11 @@ def parse_remote_markers(stdout: str) -> dict[str, str]:
     missing = sorted(required - markers.keys())
     if missing:
         raise AwsNitroRunnerError(f"remote Nitro command did not return markers: {', '.join(missing)}")
+    if markers["SOLRL_STATUS"] != "OK":
+        raise AwsNitroRunnerError(f"remote Nitro command returned status {markers['SOLRL_STATUS']}")
+    attestation_hex = markers["SOLRL_ATTESTATION_HEX"]
+    if len(attestation_hex) % 2 != 0 or any(char not in "0123456789abcdefABCDEF" for char in attestation_hex):
+        raise AwsNitroRunnerError("remote Nitro attestation marker is not valid hex")
     return markers
 
 
@@ -257,6 +306,9 @@ def verify_attestation_document(
             raise AwsNitroRunnerError(f"PCR{index} must be 48 bytes")
         if pcrs[index] == bytes(48):
             raise AwsNitroRunnerError(f"PCR{index} is all zero; non-debug Nitro smoke required")
+    expected_pcr16 = hashlib.sha384(bytes(48) + expected_user_data).digest()
+    if pcrs[16] != expected_pcr16:
+        raise AwsNitroRunnerError("PCR16 does not match the expected ClaimV1 context extension")
 
     user_data = payload_map.get("user_data") or b""
     public_key = payload_map.get("public_key") or b""
@@ -278,16 +330,9 @@ class AwsNitroRunner:
     def __init__(self, config: RunnerConfig, session: boto3.Session) -> None:
         self.config = config
         self.ec2 = session.client("ec2")
-        self.iam = session.client("iam")
-        self.ssm = session.client("ssm")
         self.sts = session.client("sts")
         self.instance_id = ""
         self.security_group_id = ""
-        self.external_profile_name = os.environ.get("SOLRL_NITRO_INSTANCE_PROFILE_NAME", "")
-        self.role_name = f"{config.name}-role"
-        self.profile_name = self.external_profile_name or f"{config.name}-profile"
-        self.role_created = False
-        self.profile_created = False
 
     def log(self, message: str) -> None:
         line = f"[{dt.datetime.now(dt.timezone.utc).strftime('%H:%M:%S')}] {message}"
@@ -315,11 +360,10 @@ class AwsNitroRunner:
 
         vpc_id, subnet_id = self._default_network()
         ami_id = self._default_ami()
-        self._create_iam()
         self._create_security_group(vpc_id)
         self._launch_instance(ami_id, subnet_id)
         self._wait_for_instance()
-        stdout = self._run_remote_smoke()
+        stdout = self._wait_for_console_smoke()
         markers = parse_remote_markers(stdout)
         self._persist_remote_outputs(markers)
 
@@ -354,14 +398,6 @@ class AwsNitroRunner:
         if ami_id := os.environ.get("SOLRL_NITRO_AMI_ID"):
             self.log(f"using SOLRL_NITRO_AMI_ID: {ami_id}")
             return ami_id
-        try:
-            ami_id = self.ssm.get_parameter(Name=DEFAULT_AMI_PARAMETER)["Parameter"]["Value"]
-            self.log(f"Amazon Linux 2 Kernel 5.10 AMI from SSM: {ami_id}")
-            return ami_id
-        except botocore.exceptions.ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "Unknown")
-            self.log(f"SSM AMI parameter lookup failed with {code}; falling back to ec2:DescribeImages")
-
         images = self.ec2.describe_images(
             Owners=["amazon"],
             Filters=[
@@ -377,44 +413,6 @@ class AwsNitroRunner:
         self.log(f"Amazon Linux 2 Kernel 5.10 AMI from DescribeImages: {image['ImageId']}")
         return image["ImageId"]
 
-    def _create_iam(self) -> None:
-        if self.external_profile_name:
-            self.log(f"using existing instance profile {self.external_profile_name}; runner will not delete it")
-            return
-
-        trust_policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"Service": "ec2.amazonaws.com"},
-                    "Action": "sts:AssumeRole",
-                }
-            ],
-        }
-        self.log(f"creating tagged IAM role {self.role_name}")
-        role = self.iam.create_role(
-            RoleName=self.role_name,
-            AssumeRolePolicyDocument=json.dumps(trust_policy),
-            Tags=resource_tags(self.config),
-        )
-        self.role_created = True
-        self._write_json("create-role.json", role)
-        self.iam.attach_role_policy(
-            RoleName=self.role_name,
-            PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-        )
-
-        self.log(f"creating tagged instance profile {self.profile_name}")
-        profile = self.iam.create_instance_profile(
-            InstanceProfileName=self.profile_name,
-            Tags=resource_tags(self.config),
-        )
-        self.profile_created = True
-        self._write_json("create-instance-profile.json", profile)
-        self.iam.add_role_to_instance_profile(InstanceProfileName=self.profile_name, RoleName=self.role_name)
-        time.sleep(15)
-
     def _create_security_group(self, vpc_id: str) -> None:
         self.log("creating tagged security group with no ingress")
         response = self.ec2.create_security_group(
@@ -428,6 +426,13 @@ class AwsNitroRunner:
 
     def _launch_instance(self, ami_id: str, subnet_id: str) -> None:
         self.log(f"launching tagged enclave-enabled EC2 parent ({self.config.instance_type})")
+        user_data = remote_smoke_script(
+            self.config,
+            sha256_hex(f"{self.config.run_id}:solrl-claim-v1"),
+            sha256_hex(f"{self.config.run_id}:worker-public-key"),
+            sha256_hex(f"{self.config.run_id}:nonce"),
+        )
+        self._write_text("user-data.sh", user_data)
         response = self.ec2.run_instances(
             ImageId=ami_id,
             MinCount=1,
@@ -441,10 +446,10 @@ class AwsNitroRunner:
                     "AssociatePublicIpAddress": True,
                 }
             ],
-            IamInstanceProfile={"Name": self.profile_name},
             EnclaveOptions={"Enabled": True},
             MetadataOptions={"HttpTokens": "required", "HttpEndpoint": "enabled"},
             TagSpecifications=tag_specifications(self.config, ["instance", "volume", "network-interface"]),
+            UserData=user_data,
         )
         self._write_json("run-instances.json", response)
         self.instance_id = response["Instances"][0]["InstanceId"]
@@ -456,67 +461,25 @@ class AwsNitroRunner:
             InstanceIds=[self.instance_id],
             WaiterConfig={"Delay": 15, "MaxAttempts": 80},
         )
-        self.log("waiting for SSM online")
-        deadline = time.time() + 900
-        while time.time() < deadline:
-            status = self._ssm_ping_status()
-            if status == "Online":
-                self.log("SSM online")
-                return
-            time.sleep(10)
-        raise AwsNitroRunnerError(f"SSM did not become Online for {self.instance_id}")
+        self.log("EC2 status checks passed")
 
-    def _ssm_ping_status(self) -> str:
-        response = self.ssm.describe_instance_information(
-            Filters=[{"Key": "InstanceIds", "Values": [self.instance_id]}]
-        )
-        items = response.get("InstanceInformationList", [])
-        return items[0].get("PingStatus", "Missing") if items else "Missing"
-
-    def _run_remote_smoke(self) -> str:
-        user_data = sha256_hex(f"{self.config.run_id}:solrl-claim-v1")
-        public_key = sha256_hex(f"{self.config.run_id}:worker-public-key")
-        nonce = sha256_hex(f"{self.config.run_id}:nonce")
-        script = remote_smoke_script(self.config, user_data, public_key, nonce)
-        self._write_text("remote-smoke.sh", script)
-        self.log("running remote non-debug Nitro attestation smoke through SSM")
-        command = self.ssm.send_command(
-            InstanceIds=[self.instance_id],
-            DocumentName="AWS-RunShellScript",
-            Comment=f"SolRL Nitro smoke {self.config.run_id}",
-            Parameters={
-                "commands": [script],
-                "executionTimeout": [str(self.config.timeout_seconds)],
-            },
-            TimeoutSeconds=self.config.timeout_seconds,
-        )
-        command_id = command["Command"]["CommandId"]
-        self.log(f"SSM command: {command_id}")
-        return self._wait_for_command(command_id)
-
-    def _wait_for_command(self, command_id: str) -> str:
+    def _wait_for_console_smoke(self) -> str:
+        self.log("waiting for SolRL markers in EC2 console output")
         deadline = time.time() + self.config.timeout_seconds
-        last_status = "Pending"
+        last_output = ""
         while time.time() < deadline:
-            try:
-                invocation = self.ssm.get_command_invocation(CommandId=command_id, InstanceId=self.instance_id)
-            except botocore.exceptions.ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") == "InvocationDoesNotExist":
-                    time.sleep(5)
-                    continue
-                raise
-            last_status = invocation["Status"]
-            self._write_json("ssm-command-final.json", invocation)
-            if last_status == "Success":
-                self._write_text("remote-stdout.txt", invocation.get("StandardOutputContent", ""))
-                self._write_text("remote-stderr.txt", invocation.get("StandardErrorContent", ""))
-                return invocation.get("StandardOutputContent", "")
-            if last_status in {"Cancelled", "TimedOut", "Failed", "Cancelling"}:
-                self._write_text("remote-stdout.txt", invocation.get("StandardOutputContent", ""))
-                self._write_text("remote-stderr.txt", invocation.get("StandardErrorContent", ""))
-                raise AwsNitroRunnerError(f"remote Nitro smoke failed with SSM status {last_status}")
-            time.sleep(10)
-        raise AwsNitroRunnerError(f"remote Nitro smoke timed out; last SSM status {last_status}")
+            response = self.ec2.get_console_output(InstanceId=self.instance_id, Latest=True)
+            output = response.get("Output", "") or ""
+            if output and output != last_output:
+                last_output = output
+                self._write_text("console-output.txt", output)
+            if "SOLRL_REMOTE_FAILED=" in output:
+                raise AwsNitroRunnerError("remote Nitro smoke failed; see artifacts console-output.txt")
+            if "SOLRL_STATUS=OK" in output:
+                return output
+            time.sleep(15)
+        self._write_text("console-output.txt", last_output)
+        raise AwsNitroRunnerError("timed out waiting for SolRL markers in EC2 console output")
 
     def _persist_remote_outputs(self, markers: dict[str, str]) -> None:
         self._write_text("attestation.hex", markers["SOLRL_ATTESTATION_HEX"] + "\n")
@@ -545,30 +508,6 @@ class AwsNitroRunner:
                     self.log(f"security group delete failed: {exc}")
             else:
                 self.log(f"refusing to delete {self.security_group_id}; SolRL tags do not match")
-        if self.profile_created:
-            if self._profile_tags_match():
-                self.log(f"removing role from tagged instance profile {self.profile_name}")
-                self._ignore_aws_error(
-                    self.iam.remove_role_from_instance_profile,
-                    InstanceProfileName=self.profile_name,
-                    RoleName=self.role_name,
-                )
-                self.log(f"deleting tagged instance profile {self.profile_name}")
-                self._ignore_aws_error(self.iam.delete_instance_profile, InstanceProfileName=self.profile_name)
-            else:
-                self.log(f"refusing to delete profile {self.profile_name}; SolRL tags do not match")
-        if self.role_created:
-            if self._role_tags_match():
-                self.log(f"detaching SSM policy from tagged role {self.role_name}")
-                self._ignore_aws_error(
-                    self.iam.detach_role_policy,
-                    RoleName=self.role_name,
-                    PolicyArn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-                )
-                self.log(f"deleting tagged role {self.role_name}")
-                self._ignore_aws_error(self.iam.delete_role, RoleName=self.role_name)
-            else:
-                self.log(f"refusing to delete role {self.role_name}; SolRL tags do not match")
         self.log("cleanup finished")
 
     def _instance_tags_match(self) -> bool:
@@ -580,14 +519,6 @@ class AwsNitroRunner:
         response = self.ec2.describe_security_groups(GroupIds=[self.security_group_id])
         return tags_match(response["SecurityGroups"][0].get("Tags", []), self.config)
 
-    def _role_tags_match(self) -> bool:
-        response = self.iam.list_role_tags(RoleName=self.role_name)
-        return tags_match(response.get("Tags", []), self.config)
-
-    def _profile_tags_match(self) -> bool:
-        response = self.iam.list_instance_profile_tags(InstanceProfileName=self.profile_name)
-        return tags_match(response.get("Tags", []), self.config)
-
     def _write_json(self, name: str, value: Any) -> None:
         self.config.artifact_dir.mkdir(parents=True, exist_ok=True)
         path = self.config.artifact_dir / name
@@ -597,32 +528,39 @@ class AwsNitroRunner:
         self.config.artifact_dir.mkdir(parents=True, exist_ok=True)
         (self.config.artifact_dir / name).write_text(value, encoding="utf-8")
 
-    @staticmethod
-    def _ignore_aws_error(function: Any, **kwargs: Any) -> None:
-        try:
-            function(**kwargs)
-        except botocore.exceptions.ClientError:
-            return
-
 
 def remote_smoke_script(config: RunnerConfig, user_data_hex: str, public_key_hex: str, nonce_hex: str) -> str:
     return f"""#!/usr/bin/env bash
 set -euo pipefail
-exec > >(tee /var/log/solrl-nitro-smoke.log) 2>&1
-trap 'rc=$?; echo SOLRL_REMOTE_FAILED=$rc; tail -160 /tmp/solrl-docker-build.log 2>/dev/null || true; exit $rc' ERR
+exec > >(tee /var/log/solrl-nitro-smoke.log /dev/console) 2>&1
+on_err() {{
+  rc=$?
+  echo SOLRL_REMOTE_FAILED=$rc
+  systemctl status nitro-enclaves-allocator.service --no-pager -l || true
+  journalctl -u nitro-enclaves-allocator.service --no-pager -n 120 || true
+  tail -160 /tmp/solrl-docker-build.log 2>/dev/null || true
+  exit $rc
+}}
+trap on_err ERR
 
 yum update -y >/dev/null
 amazon-linux-extras install aws-nitro-enclaves-cli -y >/dev/null
 yum install -y aws-nitro-enclaves-cli-devel docker jq python3 >/dev/null
 systemctl enable --now docker
-systemctl enable --now nitro-enclaves-allocator.service
-systemctl enable --now amazon-ssm-agent || true
 
+install -d -m 0755 /etc/nitro_enclaves
 cat >/etc/nitro_enclaves/allocator.yaml <<'YAML'
+---
 memory_mib: 1024
 cpu_count: 2
 YAML
+systemctl enable nitro-enclaves-allocator.service >/dev/null
+systemctl daemon-reload
 systemctl restart nitro-enclaves-allocator.service
+export NITRO_CLI_ARTIFACTS=/var/lib/solrl/nitro-artifacts
+export NITRO_CLI_BLOBS=/usr/share/nitro_enclaves/blobs
+mkdir -p "$NITRO_CLI_ARTIFACTS"
+test -d "$NITRO_CLI_BLOBS"
 
 WORK=/opt/solrl-nitro-worker
 rm -rf "$WORK"
@@ -697,11 +635,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {{
     if nsm_fd < 0 {{
         return Err("failed to initialize NSM".into());
     }}
-    let extend = nsm_process_request(nsm_fd, Request::ExtendPCR {{ index: 16, data: user_data.clone() }});
-    if let Response::Error(err) = extend {{
-        nsm_exit(nsm_fd);
-        return Err(format!("failed to extend PCR16: {{err:?}}").into());
-    }}
+    let pcr16 = match nsm_process_request(nsm_fd, Request::ExtendPCR {{ index: 16, data: user_data.clone() }}) {{
+        Response::ExtendPCR {{ data }} => data,
+        Response::Error(err) => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("failed to extend PCR16: {{err:?}}").into());
+        }}
+        other => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("unexpected ExtendPCR response: {{other:?}}").into());
+        }}
+    }};
+    match nsm_process_request(nsm_fd, Request::LockPCR {{ index: 16 }}) {{
+        Response::LockPCR => {{}}
+        Response::Error(err) => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("failed to lock PCR16: {{err:?}}").into());
+        }}
+        other => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("unexpected LockPCR response: {{other:?}}").into());
+        }}
+    }};
+    match nsm_process_request(nsm_fd, Request::DescribePCR {{ index: 16 }}) {{
+        Response::DescribePCR {{ lock, data }} if lock && data == pcr16 => {{}}
+        Response::DescribePCR {{ lock, data }} => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("PCR16 lock check failed: lock={{lock}}, bytes={{}}", data.len()).into());
+        }}
+        Response::Error(err) => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("failed to describe PCR16: {{err:?}}").into());
+        }}
+        other => {{
+            nsm_exit(nsm_fd);
+            return Err(format!("unexpected DescribePCR response: {{other:?}}").into());
+        }}
+    }};
     let response = nsm_process_request(
         nsm_fd,
         Request::Attestation {{
@@ -781,7 +751,18 @@ nitro-cli terminate-enclave --enclave-id "$ENCLAVE_ID" >/tmp/solrl-terminate.jso
 echo SOLRL_EXPECTED_USER_DATA_HEX={user_data_hex}
 echo SOLRL_EXPECTED_PUBLIC_KEY_HEX={public_key_hex}
 echo SOLRL_BUILD_JSON_B64="$(base64 -w0 /tmp/solrl-build.json)"
-echo SOLRL_ATTESTATION_HEX="$(cat /tmp/solrl-attestation.hex)"
+sleep 3
+echo SOLRL_ATTESTATION_HEX_BEGIN
+ATTESTATION_CHUNK_WIDTH=96
+ATTESTATION_CHUNKS="$(fold -w "$ATTESTATION_CHUNK_WIDTH" /tmp/solrl-attestation.hex | wc -l)"
+echo SOLRL_ATTESTATION_HEX_WIDTH="$ATTESTATION_CHUNK_WIDTH"
+echo SOLRL_ATTESTATION_HEX_CHUNKS="$ATTESTATION_CHUNKS"
+for pass in 1 2; do
+    echo SOLRL_ATTESTATION_HEX_PASS="$pass"
+    fold -w "$ATTESTATION_CHUNK_WIDTH" /tmp/solrl-attestation.hex | awk '{{ printf "SOLRL_ATTESTATION_HEX_CHUNK=%04d:%s\\n", NR - 1, $0 }}'
+done
+echo SOLRL_ATTESTATION_HEX_END
+echo SOLRL_STATUS=OK
 """
 
 

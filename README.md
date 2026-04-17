@@ -104,8 +104,6 @@ Put AWS credentials in `.env`:
 AWS_ACCESS_KEY=...
 AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
-# Optional for locked-down AWS accounts that cannot create IAM roles:
-SOLRL_NITRO_INSTANCE_PROFILE_NAME=existing-ssm-instance-profile
 ```
 
 Then run:
@@ -114,14 +112,14 @@ Then run:
 docker compose run --rm aws-nitro-runner
 ```
 
-The runner creates one temporary Nitro-enabled EC2 parent with no SSH key and no inbound security group rules. If no
-instance profile override is set, it also creates a temporary tagged IAM role/profile for SSM. Every created AWS resource
-is tagged with `Project=SolRL` and `SolRLRunId=<run id>`, and cleanup refuses to delete anything whose tags do not match
-the current run. If `SOLRL_NITRO_INSTANCE_PROFILE_NAME` is set, that existing profile is used but never deleted.
+The runner creates one temporary Nitro-enabled EC2 parent with no SSH key, no instance profile, no SSM dependency, and
+no inbound security group rules. Every created AWS resource is tagged with `Project=SolRL` and `SolRLRunId=<run id>`,
+and cleanup refuses to delete anything whose tags do not match the current run.
 
-The smoke runs a non-debug Nitro enclave, extends PCR16, fetches a real NSM attestation over VSOCK, and verifies the
-COSE signature, AWS root public key, non-zero PCRs, `user_data`, and worker public key. LocalStack cannot emulate
-`/dev/nsm`, PCRs, EIF boot, VSOCK, or real Nitro attestations.
+The smoke runs a non-debug Nitro enclave, extends PCR16 with the ClaimV1 context, locks PCR16 so Nitro includes it in
+the attestation, fetches the document over VSOCK, and verifies the COSE signature, AWS root public key, non-zero PCRs,
+PCR16 digest, `user_data`, and worker public key. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF boot, VSOCK, or real
+Nitro attestations.
 
 ## Docker-in-Docker
 

@@ -35,19 +35,80 @@ def main() -> int:
     require(runner, "Project", "AWS runner must define Project tag")
     require(runner, "SolRLRunId", "AWS runner must define run-id tag")
     require(runner, "ManagedBy", "AWS runner must define ManagedBy tag")
-    require(runner, "Tags=resource_tags(self.config)", "IAM role/profile creation must include tags")
     require(runner, "TagSpecifications=tag_specifications", "EC2 resources must use tag specifications")
-    require(runner, "list_instance_profile_tags", "instance profile cleanup must verify tags")
     require(runner, "tags_match(", "cleanup must be gated on ownership tags")
     require(runner, "EnclaveOptions={\"Enabled\": True}", "EC2 parent must launch with Nitro Enclaves enabled")
     require(runner, "AssociatePublicIpAddress", "runner must make egress explicit for default subnets")
     require(runner, "SOLRL_NITRO_AMI_ID", "AWS runner must allow an explicit AMI override")
+    require(runner, "describe_images(", "AWS runner must resolve the AMI through ec2:DescribeImages")
+    require(runner, "UserData=user_data", "AWS runner must execute the remote smoke through EC2 user-data")
+    require(runner, "get_console_output(", "AWS runner must collect smoke markers through EC2 console output")
     require(
         runner,
-        "SOLRL_NITRO_INSTANCE_PROFILE_NAME",
-        "AWS runner must support existing instance profiles for locked-down accounts",
+        "cat >/etc/nitro_enclaves/allocator.yaml",
+        "AWS runner must write Nitro allocator config in the main user-data path",
     )
-    require(runner, "describe_images(", "AWS runner must fall back when SSM public AMI parameter access is denied")
+    require(
+        runner,
+        "systemctl daemon-reload",
+        "AWS runner must reload systemd before restarting the Nitro allocator",
+    )
+    require(
+        runner,
+        "journalctl -u nitro-enclaves-allocator.service",
+        "AWS runner must dump allocator journal on remote smoke failure",
+    )
+    require(
+        runner,
+        "NITRO_CLI_ARTIFACTS",
+        "AWS runner must set Nitro CLI artifacts path before build-enclave",
+    )
+    require(runner, "NITRO_CLI_BLOBS", "AWS runner must set Nitro CLI blobs path before build-enclave")
+    require(
+        runner,
+        "Request::ExtendPCR {{ index: 16",
+        "AWS runner must bind ClaimV1 context into PCR16 before attestation",
+    )
+    require(
+        runner,
+        "Request::LockPCR {{ index: 16",
+        "AWS runner must lock PCR16; unlocked PCRs are not included in Nitro attestations",
+    )
+    require(
+        runner,
+        "Request::DescribePCR {{ index: 16",
+        "AWS runner must verify PCR16 is locked before requesting attestation",
+    )
+    require(
+        runner,
+        "SOLRL_ATTESTATION_HEX_CHUNK",
+        "AWS runner must chunk attestation output; EC2 console corrupts long marker lines",
+    )
+    require(
+        runner,
+        "SOLRL_ATTESTATION_HEX_WIDTH",
+        "AWS runner must publish chunk width so corrupted console chunks can be rejected",
+    )
+    require(
+        runner,
+        "SOLRL_ATTESTATION_HEX_CHUNKS",
+        "AWS runner must count attestation chunks so console interleaving cannot silently truncate output",
+    )
+    require(
+        runner,
+        "SOLRL_ATTESTATION_HEX_PASS",
+        "AWS runner must repeat chunk output because EC2 console lines can interleave with cloud-init noise",
+    )
+    require(
+        runner,
+        'fold -w "$ATTESTATION_CHUNK_WIDTH"',
+        "AWS runner must use one configured attestation chunk width everywhere",
+    )
+    require(runner, "%04d:%s", "AWS runner must index attestation chunks")
+    if "systemctl enable --now nitro-enclaves-allocator.service" in runner:
+        fail("Nitro allocator must not be started before allocator.yaml exists")
+    if 'echo SOLRL_ATTESTATION_HEX="$(cat /tmp/solrl-attestation.hex)"' in runner:
+        fail("AWS runner must not emit the attestation as one long EC2 console line")
 
     if "authorize_security_group_ingress" in runner:
         fail("AWS runner must not add inbound security group rules")
@@ -55,8 +116,19 @@ def main() -> int:
         fail("AWS runner must not create or use SSH key pairs")
     if "--debug-mode" in runner:
         fail("AWS runner must not use debug-mode for attestation smoke")
-    if "delete_instance_profile" in runner and "_profile_tags_match()" not in runner:
-        fail("instance profile deletion must be behind _profile_tags_match")
+    for forbidden in (
+        "client(\"iam\")",
+        "client('iam')",
+        "create_role",
+        "create_instance_profile",
+        "IamInstanceProfile",
+        "PassRole",
+        "send_command",
+        "get_command_invocation",
+        "describe_instance_information",
+    ):
+        if forbidden in runner:
+            fail(f"AWS runner default path must not depend on IAM or SSM: found {forbidden}")
     if "env_file:" in compose and ".env" in compose:
         fail("docker-compose.yml must not load .env through env_file; the runner reads it without exposing secrets")
     if "dt.UTC" in runner:

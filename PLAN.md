@@ -199,11 +199,10 @@ Required AWS safety invariants:
 - Every created AWS resource has `Project=SolRL` and `SolRLRunId=<run id>`.
 - The runner creates no inbound security group rules and no SSH key pair.
 - Cleanup refuses to delete resources unless ownership tags match the active run.
-- Locked-down accounts may set `SOLRL_NITRO_INSTANCE_PROFILE_NAME` to an existing SSM-capable profile; the runner uses
-  it but never deletes it.
+- The default AWS smoke does not create IAM roles, pass roles, use an instance profile, or depend on SSM.
 - The smoke uses a non-debug Nitro enclave. Debug-mode PCRs are not acceptable for attestation.
-- The smoke verifies the COSE signature, AWS root public key, non-zero PCRs, `user_data`, and worker public key before
-  declaring success.
+- The smoke extends PCR16 with the ClaimV1 context, locks PCR16, verifies the locked PCR16 digest, and verifies the COSE
+  signature, AWS root public key, non-zero PCRs, `user_data`, and worker public key before declaring success.
 
 ## Protocol Architecture
 
