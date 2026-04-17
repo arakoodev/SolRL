@@ -72,11 +72,17 @@ def function_body(source: str, name: str) -> str:
     fail(f"could not parse function {name}")
 
 
+def compact(value: str) -> str:
+    return re.sub(r"\s+", "", value)
+
+
 def main() -> int:
     source = REGISTRY.read_text(encoding="utf-8")
     validate_claim = function_body(source, "validate_claim")
     create_lease = function_body(source, "create_lease")
     transfer_hook = function_body(source, "transfer_hook")
+    validate_claim_compact = compact(validate_claim)
+    create_lease_compact = compact(create_lease)
 
     missing_accounts = [item for item in REQUIRED_ACCOUNTS if item not in source]
     if missing_accounts:
@@ -100,9 +106,15 @@ def main() -> int:
         fail("ImagePolicy must not store PCR16; PCR16 is lease/task scoped")
     if "pcr16_digest" not in source or "compute_expected_pcr16" not in validate_claim:
         fail("validate_claim must recompute PCR16 from registry state")
+    if "expected_pcr16==claim.pcr16" not in validate_claim_compact:
+        fail("validate_claim must compare computed PCR16 directly against claim.pcr16")
     if "expected_pcr16 = args.expected_pcr16" in source:
         fail("create_lease must not trust caller-provided PCR16")
-    if "operator_owner" not in create_lease or "ctx.accounts.operator.owner" not in create_lease:
+    if (
+        "ctx.accounts.operator.owner" not in create_lease
+        or "ctx.accounts.operator_owner.key()" not in create_lease
+        or "require_keys_eq!(ctx.accounts.operator.owner,ctx.accounts.operator_owner.key()" not in create_lease_compact
+    ):
         fail("create_lease must require operator owner consent")
     if "consume_transfer_guard" not in transfer_hook:
         fail("transfer hook must consume a registry-armed TransferGuard")

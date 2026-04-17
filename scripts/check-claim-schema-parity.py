@@ -55,6 +55,13 @@ def python_domain(source: str, name: str) -> str:
     fail(f"missing Python domain {name}")
 
 
+def python_function_body(source: str, name: str) -> str:
+    match = re.search(rf"^def {name}\(.*?\)(?:\s*->\s*[^:]+)?:\n(?P<body>(?:    .*\n)+)", source, re.M)
+    if not match:
+        fail(f"missing Python function {name}")
+    return match.group("body")
+
+
 def assert_same(label: str, left: list[str] | str, right: list[str] | str) -> None:
     if left != right:
         fail(f"{label} mismatch\nRust:   {left}\nPython: {right}")
@@ -78,6 +85,11 @@ def main() -> int:
 
     for name in ("CLAIM_DOMAIN", "SLASH_CLAIM_DOMAIN", "PCR16_DOMAIN"):
         assert_same(name, rust_domain(rust, name), python_domain(python, name))
+
+    for name in ("fixed_bytes", "pubkey_bytes"):
+        body = python_function_body(python, name)
+        if "hashlib" in body or ".digest(" in body or "sha256" in body:
+            fail(f"Python {name} must reject invalid input, not hash/coerce it")
 
     print("schema parity lint OK")
     return 0
