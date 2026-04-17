@@ -9,7 +9,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bash curl ca-certificates jq \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir boto3 cryptography pytest requests ruff
+RUN pip install --no-cache-dir boto3 cbor2 cryptography pytest requests ruff
 
 WORKDIR /workspace
 

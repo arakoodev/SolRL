@@ -124,6 +124,11 @@ Host laptop
 |                                                            |
 |  worker-mock                                               |
 |    simulates Nitro runner with server-custom-mock          |
+|                                                            |
+|  aws-nitro-runner                                          |
+|    real AWS gate, reads repo .env inside container         |
+|    launches one tagged EC2 parent, boots non-debug Nitro   |
+|    enclave, verifies NSM attestation, cleans up by tag     |
 +------------------------------------------------------------+
 ```
 
@@ -187,6 +192,18 @@ Real AWS:
 ```
 
 The real AWS smoke test stays mandatory before demo/release.
+It runs through `python3 -m solrl_core.aws_nitro_runner`, which is the same path that owns AWS launch, tagging, and
+cleanup behavior. Do not add separate AWS smoke scripts.
+
+Required AWS safety invariants:
+- Every created AWS resource has `Project=SolRL` and `SolRLRunId=<run id>`.
+- The runner creates no inbound security group rules and no SSH key pair.
+- Cleanup refuses to delete resources unless ownership tags match the active run.
+- Locked-down accounts may set `SOLRL_NITRO_INSTANCE_PROFILE_NAME` to an existing SSM-capable profile; the runner uses
+  it but never deletes it.
+- The smoke uses a non-debug Nitro enclave. Debug-mode PCRs are not acceptable for attestation.
+- The smoke verifies the COSE signature, AWS root public key, non-zero PCRs, `user_data`, and worker public key before
+  declaring success.
 
 ## Protocol Architecture
 
@@ -277,7 +294,7 @@ Not implemented yet:
 - Full hook-as-verifier mode. Token-2022 hook execute data only carries `amount`, and the mint-wide `ExtraAccountMetaList` can only pass accounts resolvable from source, mint, destination, owner, instruction data, or prior resolved accounts. The current job PDA graph is not derivable from those values. V1 therefore verifies the claim in `settle_claim`, arms a scoped `TransferGuard`, and requires the hook to consume it.
 - Anchor IDL generation. `anchor build --no-idl` passes; full IDL generation currently hits an Anchor `0.30.1` / `proc-macro2` compatibility problem.
 - Production Harbor Nitro environment plugin.
-- Real AWS Nitro EIF boot and NSM smoke.
+- Production Harbor Nitro EIF. The current real AWS gate boots a minimal SolRL worker EIF for NSM attestation smoke.
 
 ### `Config`
 
@@ -742,7 +759,7 @@ docker compose run --rm --no-deps harbor-runner ./scripts/e2e-local-mock.sh
 docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 docker compose run --rm nix-builder nix --version
-docker compose run --rm harbor-runner ./scripts/e2e-aws-nitro.sh --cluster devnet
+docker compose run --rm aws-nitro-runner
 ```
 
 No `cargo`, `anchor`, `solana`, `npm`, `pip`, `nix`, `terraform`, or `aws` commands should be required on the host.
@@ -773,7 +790,7 @@ docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 docker compose run --rm nix-builder nix build .#gnu.attestation.verifier-enclave.default
 docker compose run --rm nix-builder nix build .#gnu.enclaves.solrl-worker.default
-docker compose run --rm harbor-runner ./scripts/e2e-aws-nitro.sh --cluster devnet
+docker compose run --rm aws-nitro-runner
 ```
 
 Current test reality:

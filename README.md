@@ -95,13 +95,33 @@ One honest remaining gap: there is not yet a full local-validator transaction te
 
 ## Real Nitro Smoke
 
-This is intentionally not runnable on a normal laptop:
+The real AWS gate runs through the same runner path that production will use. Do not add sidecar smoke scripts. A
+sidecar can pass while the real launcher still creates untagged resources. That is theater.
 
-```bash
-docker compose run --rm harbor-runner ./scripts/e2e-aws-nitro.sh --cluster devnet
+Put AWS credentials in `.env`:
+
+```text
+AWS_ACCESS_KEY=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_DEFAULT_REGION=us-east-1
+# Optional for locked-down AWS accounts that cannot create IAM roles:
+SOLRL_NITRO_INSTANCE_PROFILE_NAME=existing-ssm-instance-profile
 ```
 
-It exits with a clear message unless it is run on an AWS host with Nitro Enclaves tooling. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF boot, or real Nitro attestations.
+Then run:
+
+```bash
+docker compose run --rm aws-nitro-runner
+```
+
+The runner creates one temporary Nitro-enabled EC2 parent with no SSH key and no inbound security group rules. If no
+instance profile override is set, it also creates a temporary tagged IAM role/profile for SSM. Every created AWS resource
+is tagged with `Project=SolRL` and `SolRLRunId=<run id>`, and cleanup refuses to delete anything whose tags do not match
+the current run. If `SOLRL_NITRO_INSTANCE_PROFILE_NAME` is set, that existing profile is used but never deleted.
+
+The smoke runs a non-debug Nitro enclave, extends PCR16, fetches a real NSM attestation over VSOCK, and verifies the
+COSE signature, AWS root public key, non-zero PCRs, `user_data`, and worker public key. LocalStack cannot emulate
+`/dev/nsm`, PCRs, EIF boot, VSOCK, or real Nitro attestations.
 
 ## Docker-in-Docker
 

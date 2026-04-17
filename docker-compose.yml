@@ -107,6 +107,21 @@ services:
         condition: service_healthy
     command: ["terraform init && terraform validate && terraform fmt -recursive -check && terraform test"]
 
+  aws-nitro-runner:
+    profiles: ["aws"]
+    build:
+      context: .
+      dockerfile: docker/dev-shell.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - pip-cache:/root/.cache/pip
+    environment:
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      PYTHONPATH: /workspace/python
+      SOLRL_IN_DOCKER: "1"
+    command: ./scripts/e2e-aws-nitro.sh
+
   harbor-runner:
     build:
       context: .

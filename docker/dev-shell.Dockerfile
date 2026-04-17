@@ -39,7 +39,7 @@ RUN curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/te
     && unzip /tmp/terraform.zip -d /usr/local/bin \
     && rm /tmp/terraform.zip
 
-RUN pip3 install --no-cache-dir awscli awscli-local boto3 cryptography pytest requests ruff
+RUN pip3 install --no-cache-dir awscli awscli-local boto3 cbor2 cryptography pytest requests ruff
 
 WORKDIR /workspace
 

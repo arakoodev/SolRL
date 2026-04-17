@@ -22,10 +22,12 @@ cargo clippy --workspace --all-targets -- \
   -D clippy::todo
 
 ruff check --line-length 120 python tests \
+  scripts/check-aws-safety.py \
   scripts/check-claim-schema-parity.py \
   scripts/check-registry-claim-checks.py \
   scripts/check-token2022-wiring.py
 
+./scripts/check-aws-safety.py
 ./scripts/check-claim-schema-parity.py
 ./scripts/check-registry-claim-checks.py
 ./scripts/check-token2022-wiring.py

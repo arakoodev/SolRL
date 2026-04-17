@@ -16,7 +16,7 @@ if grep -nE 'docker\\.io|docker-ce|docker-cli|docker-buildx|docker compose|docke
   exit 1
 fi
 
-for script in scripts/lint.sh scripts/test-anchor.sh; do
+for script in scripts/lint.sh scripts/test-anchor.sh scripts/e2e-aws-nitro.sh; do
   if ! grep -q 'SOLRL_IN_DOCKER' "$script"; then
     echo "docker boundary lint failed: $script must refuse host execution" >&2
     exit 1
