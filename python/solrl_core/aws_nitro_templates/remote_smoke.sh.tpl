@@ -20,6 +20,22 @@ flush_console() {
   sleep 10
 }
 
+write_console_text() {
+  printf '%s\n' "$@" >"$CONSOLE" || true
+  if [ -e /dev/ttyS0 ]; then
+    printf '%s\n' "$@" >/dev/ttyS0 || true
+  fi
+}
+
+write_console_file() {
+  result_file="$1"
+  cat "$result_file" >"$CONSOLE" || true
+  if [ -e /dev/ttyS0 ]; then
+    cat "$result_file" >/dev/ttyS0 || true
+  fi
+  flush_console
+}
+
 emit_failure() {
   rc="${1:-$?}"
   trap - ERR
@@ -39,8 +55,8 @@ emit_failure() {
     fi
     echo SOLRL_ERROR_TAIL_END
     echo SOLRL_RESULT_END
-  } >"$CONSOLE" || true
-  flush_console
+  } >/run/solrl-result.txt
+  write_console_file /run/solrl-result.txt
   shutdown -h now || true
   exit "$rc"
 }
@@ -66,9 +82,8 @@ start_watchdog() {
         fi
         echo SOLRL_ERROR_TAIL_END
         echo SOLRL_RESULT_END
-      } >"$CONSOLE" || true
-      sync || true
-      sleep 10
+      } >/run/solrl-watchdog-result.txt
+      write_console_file /run/solrl-watchdog-result.txt
       shutdown -h now || true
     fi
   ) &
@@ -81,10 +96,7 @@ run_phase() {
   timeout_seconds="$2"
   shift 2
   echo "=== SOLRL phase: $PHASE ==="
-  {
-    echo "SOLRL_PHASE_START=$PHASE"
-    echo "SOLRL_PHASE_TIMEOUT_SECONDS=$timeout_seconds"
-  } >"$CONSOLE" || true
+  write_console_text "SOLRL_PHASE_START=$PHASE" "SOLRL_PHASE_TIMEOUT_SECONDS=$timeout_seconds"
   (
     set -euo pipefail
     "$@"
@@ -98,6 +110,14 @@ run_phase() {
       kill -TERM "$phase_pid" 2>/dev/null || true
       sleep 5
       kill -KILL "$phase_pid" 2>/dev/null || true
+      {
+        echo "SOLRL_PHASE_FAILED=$PHASE"
+        echo "SOLRL_PHASE_EXIT=124"
+        echo SOLRL_ERROR_TAIL_BEGIN
+        tail -80 "$LOG_DIR/${PHASE}.log" | sed 's/[^[:print:]	]//g' || true
+        echo SOLRL_ERROR_TAIL_END
+      } >/run/solrl-phase-failed.txt
+      write_console_file /run/solrl-phase-failed.txt
       return 124
     fi
     sleep 5
@@ -106,6 +126,18 @@ run_phase() {
   wait "$phase_pid"
   phase_rc="$?"
   set -e
+  if [ "$phase_rc" = 0 ]; then
+    write_console_text "SOLRL_PHASE_END=$PHASE"
+    return 0
+  fi
+  {
+    echo "SOLRL_PHASE_FAILED=$PHASE"
+    echo "SOLRL_PHASE_EXIT=$phase_rc"
+    echo SOLRL_ERROR_TAIL_BEGIN
+    tail -80 "$LOG_DIR/${PHASE}.log" | sed 's/[^[:print:]	]//g' || true
+    echo SOLRL_ERROR_TAIL_END
+  } >/run/solrl-phase-failed.txt
+  write_console_file /run/solrl-phase-failed.txt
   return "$phase_rc"
 }
 
@@ -262,7 +294,7 @@ fi
   echo SOLRL_PCR2="$pcr2"
   echo SOLRL_PCR16="$pcr16"
   echo SOLRL_RESULT_END
-} >"$CONSOLE"
+} >/run/solrl-result.txt
 
-flush_console
+write_console_file /run/solrl-result.txt
 shutdown -h now || true
