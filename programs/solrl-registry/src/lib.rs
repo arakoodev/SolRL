@@ -13,7 +13,9 @@ use solrl_claim::{
     SLASH_REASON_LEASE_ABUSE, SLASH_REASON_MALICIOUS_DUPLICATE, SLASH_REASON_REPLAY,
     SLASH_REASON_WRONG_JOB, SLASH_REASON_WRONG_POLICY,
 };
-use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
+use spl_tlv_account_resolution::{
+    account::ExtraAccountMeta, seeds::Seed, state::ExtraAccountMetaList,
+};
 use spl_token_2022::{
     extension::{transfer_hook::TransferHookAccount, BaseStateWithExtensions, StateWithExtensions},
     state::Account as Token2022Account,
@@ -23,6 +25,7 @@ use spl_transfer_hook_interface::instruction::{ExecuteInstruction, TransferHookI
 declare_id!("GUo5ybeouLfzNAG98F99xeARFYsGBosu7qrp8ddy2k2u");
 
 const OPERATOR_STATUS_ACTIVE: u8 = 1;
+const OPERATOR_STATUS_INACTIVE: u8 = 2;
 const JOB_STATUS_OPEN: u8 = 1;
 const JOB_STATUS_LEASED: u8 = 2;
 const JOB_STATUS_SETTLED: u8 = 3;
@@ -95,11 +98,26 @@ pub mod solrl_registry {
     ) -> Result<()> {
         ctx.accounts.config.require_admin(&ctx.accounts.admin)?;
 
-        let account_metas = vec![ExtraAccountMeta::new_with_pubkey(
-            &ctx.accounts.config.key(),
-            false,
-            false,
-        )?];
+        let account_metas = vec![
+            ExtraAccountMeta::new_with_pubkey(&ctx.accounts.config.key(), false, false)?,
+            ExtraAccountMeta::new_with_seeds(
+                &[
+                    Seed::Literal {
+                        bytes: b"transfer_guard".to_vec(),
+                    },
+                    Seed::AccountKey { index: 0 },
+                    Seed::AccountKey { index: 1 },
+                    Seed::AccountKey { index: 2 },
+                    Seed::AccountKey { index: 3 },
+                    Seed::InstructionData {
+                        index: 8,
+                        length: 8,
+                    },
+                ],
+                false,
+                true,
+            )?,
+        ];
         let account_size = ExtraAccountMetaList::size_of(account_metas.len())?;
         let lamports = Rent::get()?.minimum_balance(account_size);
         let mint_key = ctx.accounts.mint.key();
@@ -161,6 +179,24 @@ pub mod solrl_registry {
         args: RegisterVerifierArgs,
     ) -> Result<()> {
         ctx.accounts.config.require_admin(&ctx.accounts.admin)?;
+        require!(
+            ctx.accounts.verifier_policy.verifier_policy_id == args.policy_id,
+            SolrlError::InvalidVerifierPolicy
+        );
+        require!(
+            ctx.accounts.verifier_policy.family == args.family,
+            SolrlError::InvalidVerifierPolicy
+        );
+        require!(
+            args.version >= ctx.accounts.verifier_policy.min_version,
+            SolrlError::InvalidVerifierPolicy
+        );
+        if args.active {
+            require!(
+                ctx.accounts.verifier_policy.active,
+                SolrlError::InactiveVerifierPolicy
+            );
+        }
 
         let verifier = &mut ctx.accounts.verifier;
         verifier.config = ctx.accounts.config.key();
@@ -486,6 +522,10 @@ pub mod solrl_registry {
             ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
             SolrlError::InvalidTransferGuard
         );
+        close_transfer_guard(
+            ctx.accounts.transfer_guard.to_account_info(),
+            ctx.accounts.payer.to_account_info(),
+        )?;
         mark_claim_paid(ctx.accounts)?;
 
         emit!(ClaimSettled {
@@ -561,12 +601,85 @@ pub mod solrl_registry {
             ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
             SolrlError::InvalidTransferGuard
         );
+        close_transfer_guard(
+            ctx.accounts.transfer_guard.to_account_info(),
+            ctx.accounts.payer.to_account_info(),
+        )?;
 
         emit!(OperatorSlashed {
             operator: ctx.accounts.operator.key(),
             amount: slash_claim.slash_amount,
             reason_code: slash_claim.reason_code,
             claim_hash: slash_claim.claim_hash,
+        });
+
+        Ok(())
+    }
+
+    pub fn withdraw_stake(
+        ctx: Context<WithdrawStake>,
+        amount: u64,
+        deactivate: bool,
+    ) -> Result<()> {
+        ctx.accounts.config.require_not_paused()?;
+        require!(amount > 0, SolrlError::InvalidAmount);
+        require_keys_eq!(
+            ctx.accounts.operator.owner,
+            ctx.accounts.owner.key(),
+            SolrlError::InvalidOperatorOwner
+        );
+        require!(
+            ctx.accounts.operator.status == OPERATOR_STATUS_ACTIVE,
+            SolrlError::InactiveOperator
+        );
+        require!(
+            ctx.accounts.operator.active_lease_count == 0,
+            SolrlError::ActiveLeaseExists
+        );
+        let remaining = ctx
+            .accounts
+            .operator
+            .stake_amount
+            .checked_sub(amount)
+            .ok_or(SolrlError::InsufficientStake)?;
+        if deactivate {
+            require!(remaining == 0, SolrlError::InvalidAmount);
+            ctx.accounts.operator.status = OPERATOR_STATUS_INACTIVE;
+        } else {
+            require!(
+                remaining >= ctx.accounts.config.min_operator_stake,
+                SolrlError::InsufficientStake
+            );
+        }
+
+        ctx.accounts.operator.stake_amount = remaining;
+        arm_transfer_guard(
+            &mut ctx.accounts.transfer_guard,
+            ctx.accounts.stake_token_account.key(),
+            ctx.accounts.token_mint.key(),
+            ctx.accounts.destination_token_account.key(),
+            ctx.accounts.stake_authority.key(),
+            amount,
+            ctx.bumps.transfer_guard,
+        )?;
+        ctx.accounts.transfer_guard.exit(ctx.program_id)?;
+        transfer_stake_to_withdraw_destination(&ctx, amount)?;
+        ctx.accounts.transfer_guard.reload()?;
+        require!(
+            ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
+            SolrlError::InvalidTransferGuard
+        );
+        close_transfer_guard(
+            ctx.accounts.transfer_guard.to_account_info(),
+            ctx.accounts.owner.to_account_info(),
+        )?;
+
+        emit!(StakeWithdrawn {
+            operator: ctx.accounts.operator.key(),
+            destination_token_account: ctx.accounts.destination_token_account.key(),
+            amount,
+            remaining_stake: ctx.accounts.operator.stake_amount,
+            deactivated: deactivate,
         });
 
         Ok(())
@@ -908,7 +1021,7 @@ fn arm_transfer_guard(
     guard.destination_token = destination_token;
     guard.owner = owner;
     guard.amount = amount;
-    guard.expires_slot = slot;
+    guard.armed_slot = slot;
     guard.status = TRANSFER_GUARD_STATUS_ARMED;
     guard.bump = bump;
     Ok(())
@@ -940,7 +1053,7 @@ fn consume_transfer_guard(
     require_keys_eq!(guard.owner, owner, SolrlError::InvalidTransferGuard);
     require!(guard.amount == amount, SolrlError::InvalidTransferGuard);
     require!(
-        guard.expires_slot >= Clock::get()?.slot,
+        guard.armed_slot == Clock::get()?.slot,
         SolrlError::InvalidTransferGuard
     );
     guard.status = TRANSFER_GUARD_STATUS_CONSUMED;
@@ -948,44 +1061,115 @@ fn consume_transfer_guard(
 }
 
 fn transfer_escrow_to_operator(ctx: &Context<SettleClaim>, amount: u64) -> Result<()> {
-    let mut ix = spl_token_2022::instruction::transfer_checked(
-        &ctx.accounts.token_program.key(),
-        &ctx.accounts.escrow_token_account.key(),
-        &ctx.accounts.token_mint.key(),
-        &ctx.accounts.payout_token_account.key(),
-        &ctx.accounts.escrow_authority.key(),
-        &[],
-        amount,
-        ctx.accounts.config.token_decimals,
-    )?;
-
-    ix.accounts.push(AccountMeta::new_readonly(
-        ctx.accounts.extra_account_meta_list.key(),
-        false,
-    ));
-    ix.accounts
-        .push(AccountMeta::new_readonly(ctx.accounts.config.key(), false));
-    ix.accounts
-        .push(AccountMeta::new(ctx.accounts.transfer_guard.key(), false));
-
     let job_key = ctx.accounts.job.key();
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"escrow_authority",
         job_key.as_ref(),
         &[ctx.accounts.job.escrow_authority_bump],
     ]];
+    invoke_guarded_transfer_checked(
+        &ctx.accounts.token_program.to_account_info(),
+        &ctx.accounts.escrow_token_account.to_account_info(),
+        &ctx.accounts.token_mint.to_account_info(),
+        &ctx.accounts.payout_token_account.to_account_info(),
+        &ctx.accounts.escrow_authority.to_account_info(),
+        &ctx.accounts.extra_account_meta_list.to_account_info(),
+        &ctx.accounts.config.to_account_info(),
+        &ctx.accounts.transfer_guard.to_account_info(),
+        amount,
+        ctx.accounts.config.token_decimals,
+        signer_seeds,
+    )
+}
+
+fn transfer_stake_to_treasury(ctx: &Context<SlashOperator>, amount: u64) -> Result<()> {
+    let operator_key = ctx.accounts.operator.key();
+    let signer_seeds: &[&[&[u8]]] = &[&[
+        b"stake_authority",
+        operator_key.as_ref(),
+        &[ctx.accounts.operator.stake_authority_bump],
+    ]];
+    invoke_guarded_transfer_checked(
+        &ctx.accounts.token_program.to_account_info(),
+        &ctx.accounts.stake_token_account.to_account_info(),
+        &ctx.accounts.token_mint.to_account_info(),
+        &ctx.accounts.treasury_token_account.to_account_info(),
+        &ctx.accounts.stake_authority.to_account_info(),
+        &ctx.accounts.extra_account_meta_list.to_account_info(),
+        &ctx.accounts.config.to_account_info(),
+        &ctx.accounts.transfer_guard.to_account_info(),
+        amount,
+        ctx.accounts.config.token_decimals,
+        signer_seeds,
+    )
+}
+
+fn transfer_stake_to_withdraw_destination(ctx: &Context<WithdrawStake>, amount: u64) -> Result<()> {
+    let operator_key = ctx.accounts.operator.key();
+    let signer_seeds: &[&[&[u8]]] = &[&[
+        b"stake_authority",
+        operator_key.as_ref(),
+        &[ctx.accounts.operator.stake_authority_bump],
+    ]];
+    invoke_guarded_transfer_checked(
+        &ctx.accounts.token_program.to_account_info(),
+        &ctx.accounts.stake_token_account.to_account_info(),
+        &ctx.accounts.token_mint.to_account_info(),
+        &ctx.accounts.destination_token_account.to_account_info(),
+        &ctx.accounts.stake_authority.to_account_info(),
+        &ctx.accounts.extra_account_meta_list.to_account_info(),
+        &ctx.accounts.config.to_account_info(),
+        &ctx.accounts.transfer_guard.to_account_info(),
+        amount,
+        ctx.accounts.config.token_decimals,
+        signer_seeds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_guarded_transfer_checked<'info>(
+    token_program: &AccountInfo<'info>,
+    source_token: &AccountInfo<'info>,
+    token_mint: &AccountInfo<'info>,
+    destination_token: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    extra_account_meta_list: &AccountInfo<'info>,
+    config: &AccountInfo<'info>,
+    transfer_guard: &AccountInfo<'info>,
+    amount: u64,
+    decimals: u8,
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let mut ix = spl_token_2022::instruction::transfer_checked(
+        token_program.key,
+        source_token.key,
+        token_mint.key,
+        destination_token.key,
+        authority.key,
+        &[],
+        amount,
+        decimals,
+    )?;
+    ix.accounts.push(AccountMeta::new_readonly(
+        *extra_account_meta_list.key,
+        false,
+    ));
+    ix.accounts
+        .push(AccountMeta::new_readonly(*config.key, false));
+    ix.accounts
+        .push(AccountMeta::new(*transfer_guard.key, false));
 
     invoke_signed(
         &ix,
         &[
-            ctx.accounts.token_program.to_account_info(),
-            ctx.accounts.escrow_token_account.to_account_info(),
-            ctx.accounts.token_mint.to_account_info(),
-            ctx.accounts.payout_token_account.to_account_info(),
-            ctx.accounts.escrow_authority.to_account_info(),
-            ctx.accounts.extra_account_meta_list.to_account_info(),
-            ctx.accounts.config.to_account_info(),
-            ctx.accounts.transfer_guard.to_account_info(),
+            token_program.clone(),
+            source_token.clone(),
+            token_mint.clone(),
+            destination_token.clone(),
+            authority.clone(),
+            extra_account_meta_list.clone(),
+            config.clone(),
+            transfer_guard.clone(),
         ],
         signer_seeds,
     )?;
@@ -993,47 +1177,17 @@ fn transfer_escrow_to_operator(ctx: &Context<SettleClaim>, amount: u64) -> Resul
     Ok(())
 }
 
-fn transfer_stake_to_treasury(ctx: &Context<SlashOperator>, amount: u64) -> Result<()> {
-    let mut ix = spl_token_2022::instruction::transfer_checked(
-        &ctx.accounts.token_program.key(),
-        &ctx.accounts.stake_token_account.key(),
-        &ctx.accounts.token_mint.key(),
-        &ctx.accounts.treasury_token_account.key(),
-        &ctx.accounts.stake_authority.key(),
-        &[],
-        amount,
-        ctx.accounts.config.token_decimals,
-    )?;
-    ix.accounts.push(AccountMeta::new_readonly(
-        ctx.accounts.extra_account_meta_list.key(),
-        false,
-    ));
-    ix.accounts
-        .push(AccountMeta::new_readonly(ctx.accounts.config.key(), false));
-    ix.accounts
-        .push(AccountMeta::new(ctx.accounts.transfer_guard.key(), false));
-    let operator_key = ctx.accounts.operator.key();
-    let signer_seeds: &[&[&[u8]]] = &[&[
-        b"stake_authority",
-        operator_key.as_ref(),
-        &[ctx.accounts.operator.stake_authority_bump],
-    ]];
-
-    invoke_signed(
-        &ix,
-        &[
-            ctx.accounts.token_program.to_account_info(),
-            ctx.accounts.stake_token_account.to_account_info(),
-            ctx.accounts.token_mint.to_account_info(),
-            ctx.accounts.treasury_token_account.to_account_info(),
-            ctx.accounts.stake_authority.to_account_info(),
-            ctx.accounts.extra_account_meta_list.to_account_info(),
-            ctx.accounts.config.to_account_info(),
-            ctx.accounts.transfer_guard.to_account_info(),
-        ],
-        signer_seeds,
-    )?;
-
+fn close_transfer_guard<'info>(
+    transfer_guard: AccountInfo<'info>,
+    rent_recipient: AccountInfo<'info>,
+) -> Result<()> {
+    let guard_lamports = transfer_guard.lamports();
+    **rent_recipient.try_borrow_mut_lamports()? = rent_recipient
+        .lamports()
+        .checked_add(guard_lamports)
+        .ok_or(SolrlError::MathOverflow)?;
+    **transfer_guard.try_borrow_mut_lamports()? = 0;
+    transfer_guard.try_borrow_mut_data()?.fill(0);
     Ok(())
 }
 
@@ -1213,10 +1367,16 @@ pub struct RegisterVerifierPolicy<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(verifier_id: [u8; 32])]
+#[instruction(verifier_id: [u8; 32], args: RegisterVerifierArgs)]
 pub struct RegisterVerifier<'info> {
     #[account(seeds = [b"config"], bump = config.bump)]
     pub config: Account<'info, Config>,
+    #[account(
+        has_one = config,
+        seeds = [b"verifier_policy", config.key().as_ref(), args.policy_id.as_ref()],
+        bump = verifier_policy.bump
+    )]
+    pub verifier_policy: Account<'info, VerifierPolicy>,
     #[account(
         init,
         payer = admin,
@@ -1489,6 +1649,54 @@ pub struct SlashOperator<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+#[instruction(amount: u64)]
+pub struct WithdrawStake<'info> {
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(mut, has_one = config)]
+    pub operator: Box<Account<'info, Operator>>,
+    #[account(mut, address = operator.stake_token_account)]
+    /// CHECK: Token-2022 operator stake vault token account.
+    pub stake_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK: Token-2022 destination token account controlled by the operator.
+    pub destination_token_account: UncheckedAccount<'info>,
+    #[account(address = config.token_mint)]
+    /// CHECK: Token-2022 mint.
+    pub token_mint: UncheckedAccount<'info>,
+    #[account(address = operator.stake_authority)]
+    /// CHECK: PDA signer for stake vault transfers.
+    pub stake_authority: UncheckedAccount<'info>,
+    #[account(seeds = [b"extra-account-metas", token_mint.key().as_ref()], bump)]
+    /// CHECK: SPL transfer hook validation account.
+    pub extra_account_meta_list: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + TransferGuard::LEN,
+        seeds = [
+            b"transfer_guard",
+            stake_token_account.key().as_ref(),
+            token_mint.key().as_ref(),
+            destination_token_account.key().as_ref(),
+            stake_authority.key().as_ref(),
+            &amount.to_le_bytes()
+        ],
+        bump
+    )]
+    pub transfer_guard: Account<'info, TransferGuard>,
+    #[account(address = spl_token_2022::ID)]
+    /// CHECK: Token-2022 program.
+    pub token_program: UncheckedAccount<'info>,
+    #[account(address = INSTRUCTIONS_ID)]
+    /// CHECK: Solana instructions sysvar. The program only reads it.
+    pub instructions: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
 #[account]
 pub struct Config {
     pub admin: Pubkey,
@@ -1702,7 +1910,7 @@ pub struct TransferGuard {
     pub destination_token: Pubkey,
     pub owner: Pubkey,
     pub amount: u64,
-    pub expires_slot: u64,
+    pub armed_slot: u64,
     pub status: u8,
     pub bump: u8,
 }
@@ -1860,6 +2068,15 @@ pub struct OperatorSlashed {
     pub claim_hash: [u8; 32],
 }
 
+#[event]
+pub struct StakeWithdrawn {
+    pub operator: Pubkey,
+    pub destination_token_account: Pubkey,
+    pub amount: u64,
+    pub remaining_stake: u64,
+    pub deactivated: bool,
+}
+
 #[error_code]
 pub enum SolrlError {
     #[msg("admin authority is required")]
@@ -1962,6 +2179,8 @@ pub enum SolrlError {
     InvalidHookCaller,
     #[msg("transfer guard is missing, stale, consumed, or mismatched")]
     InvalidTransferGuard,
+    #[msg("operator still has an active lease")]
+    ActiveLeaseExists,
     #[msg("slash reason is reject-only or dispute-only")]
     RejectOnly,
     #[msg("slash evidence hash must be non-zero")]

@@ -80,9 +80,12 @@ def main() -> int:
     source = REGISTRY.read_text(encoding="utf-8")
     validate_claim = function_body(source, "validate_claim")
     create_lease = function_body(source, "create_lease")
+    register_verifier = function_body(source, "register_verifier")
     transfer_hook = function_body(source, "transfer_hook")
+    withdraw_stake = function_body(source, "withdraw_stake")
     validate_claim_compact = compact(validate_claim)
     create_lease_compact = compact(create_lease)
+    register_verifier_compact = compact(register_verifier)
 
     missing_accounts = [item for item in REQUIRED_ACCOUNTS if item not in source]
     if missing_accounts:
@@ -118,6 +121,23 @@ def main() -> int:
         fail("create_lease must require operator owner consent")
     if "consume_transfer_guard" not in transfer_hook:
         fail("transfer hook must consume a registry-armed TransferGuard")
+    if "pub verifier_policy: Account<'info, VerifierPolicy>" not in source:
+        fail("RegisterVerifier must require the verifier policy account")
+    for policy_check in (
+        "ctx.accounts.verifier_policy.verifier_policy_id==args.policy_id",
+        "ctx.accounts.verifier_policy.family==args.family",
+        "args.version>=ctx.accounts.verifier_policy.min_version",
+    ):
+        if policy_check not in register_verifier_compact:
+            fail(f"register_verifier must validate policy linkage: {policy_check}")
+    if "ctx.accounts.verifier_policy.active" not in register_verifier:
+        fail("register_verifier must reject active verifiers under inactive policies")
+    if "pub fn withdraw_stake" not in source:
+        fail("registry must expose withdraw_stake so operators can exit stake safely")
+    if "ctx.accounts.operator.active_lease_count == 0" not in withdraw_stake:
+        fail("withdraw_stake must reject operators with active leases")
+    if "transfer_stake_to_withdraw_destination" not in withdraw_stake:
+        fail("withdraw_stake must move stake through the guarded Token-2022 path")
 
     print("registry claim lint OK")
     return 0

@@ -754,7 +754,7 @@ docker compose up -d localstack
 docker compose run --rm lint
 docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
 docker compose run --rm --no-deps harbor-runner pytest -q
-docker compose run --rm --no-deps harbor-runner ./scripts/e2e-local-mock.sh
+docker compose run --rm --no-deps dev-shell ./scripts/e2e-local-mock.sh
 docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 docker compose run --rm nix-builder nix --version
@@ -783,7 +783,7 @@ Required test commands:
 docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
 docker compose run --rm lint
 docker compose run --rm --no-deps harbor-runner pytest -q
-docker compose run --rm --no-deps harbor-runner ./scripts/e2e-local-mock.sh
+docker compose run --rm --no-deps dev-shell ./scripts/e2e-local-mock.sh
 docker compose up -d localstack
 docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner

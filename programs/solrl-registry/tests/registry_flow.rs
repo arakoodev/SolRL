@@ -11,7 +11,8 @@ use solana_sdk::{
 use solrl_claim::{pcr16_digest, Pcr16Components, CLAIM_PROTOCOL_VERSION};
 use solrl_registry::{
     CreateJobArgs, CreateLeaseArgs, ImagePolicy, InitializeConfigArgs, Operator,
-    RegisterImagePolicyArgs, RegisterOperatorArgs, RegisterVerifierPolicyArgs, VerifierPolicy,
+    RegisterImagePolicyArgs, RegisterOperatorArgs, RegisterVerifierArgs,
+    RegisterVerifierPolicyArgs, Verifier, VerifierPolicy,
 };
 use std::{error::Error, io};
 
@@ -59,6 +60,10 @@ fn process_instruction<'slice, 'info>(
     // ProgramTest expects Solana's fully generic processor signature. Anchor's generated
     // entrypoint ties the account slice lifetime to AccountInfo's inner lifetime, so the
     // test adapter has to retie them for the duration of this synchronous call.
+    // SAFETY: ProgramTest calls this processor synchronously and does not retain the
+    // retied account slice. Anchor's generated entrypoint wants the slice lifetime to
+    // match AccountInfo's inner lifetime, while Solana's test processor keeps them
+    // separate.
     let accounts: &'info [AccountInfo<'info>] = unsafe { std::mem::transmute(accounts) };
     solrl_registry::entry(program_id, accounts, instruction_data)
 }
@@ -85,6 +90,9 @@ async fn send(
 struct RegistryFixture {
     config: Pubkey,
     verifier_policy: Pubkey,
+    verifier_id: [u8; 32],
+    verifier: Pubkey,
+    verifier_ed25519_pubkey: [u8; 32],
     image_policy: Pubkey,
     operator: Pubkey,
     stake_authority: Pubkey,
@@ -105,6 +113,7 @@ impl RegistryFixture {
     fn new() -> Self {
         let config = pda(&[b"config"]);
         let verifier_policy_id = hash32(10);
+        let verifier_id = hash32(40);
         let image_policy_id = hash32(11);
         let operator_owner = Keypair::new();
         let wrong_operator_owner = Keypair::new();
@@ -154,6 +163,9 @@ impl RegistryFixture {
                 config.as_ref(),
                 verifier_policy_id.as_ref(),
             ]),
+            verifier_id,
+            verifier: pda(&[b"verifier", config.as_ref(), verifier_id.as_ref()]),
+            verifier_ed25519_pubkey: hash32(41),
             image_policy: pda(&[b"image_policy", config.as_ref(), image_policy_id.as_ref()]),
             operator,
             stake_authority,
@@ -192,6 +204,104 @@ impl RegistryFixture {
             protocol_version: CLAIM_PROTOCOL_VERSION,
         })
     }
+}
+
+fn extra_account_meta_list(mint: Pubkey) -> Pubkey {
+    pda(&[b"extra-account-metas", mint.as_ref()])
+}
+
+fn transfer_guard(
+    source: Pubkey,
+    mint: Pubkey,
+    destination: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) -> Pubkey {
+    pda(&[
+        b"transfer_guard",
+        source.as_ref(),
+        mint.as_ref(),
+        destination.as_ref(),
+        owner.as_ref(),
+        &amount.to_le_bytes(),
+    ])
+}
+
+async fn create_lease(
+    banks_client: &mut solana_program_test::BanksClient,
+    payer: &Keypair,
+    fixture: &RegistryFixture,
+) -> Result<(), BanksClientError> {
+    send(
+        banks_client,
+        payer,
+        &[&fixture.operator_owner],
+        Instruction {
+            program_id: solrl_registry::ID,
+            accounts: vec![
+                AccountMeta::new_readonly(fixture.config, false),
+                AccountMeta::new(fixture.job, false),
+                AccountMeta::new(fixture.operator, false),
+                AccountMeta::new(fixture.lease, false),
+                AccountMeta::new_readonly(fixture.operator_owner.pubkey(), true),
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: instruction_data("create_lease", |data| {
+                fixture.lease_id.serialize(data)?;
+                fixture.create_lease_args.serialize(data)?;
+                Ok(())
+            })?,
+        },
+    )
+    .await
+}
+
+async fn withdraw_stake(
+    banks_client: &mut solana_program_test::BanksClient,
+    payer: &Keypair,
+    fixture: &RegistryFixture,
+    amount: u64,
+    destination_token_account: Pubkey,
+    deactivate: bool,
+) -> Result<(), BanksClientError> {
+    send(
+        banks_client,
+        payer,
+        &[&fixture.operator_owner],
+        Instruction {
+            program_id: solrl_registry::ID,
+            accounts: vec![
+                AccountMeta::new_readonly(fixture.config, false),
+                AccountMeta::new(fixture.operator, false),
+                AccountMeta::new(pubkey(22), false),
+                AccountMeta::new(destination_token_account, false),
+                AccountMeta::new_readonly(fixture.token_mint, false),
+                AccountMeta::new_readonly(fixture.stake_authority, false),
+                AccountMeta::new_readonly(extra_account_meta_list(fixture.token_mint), false),
+                AccountMeta::new(
+                    transfer_guard(
+                        pubkey(22),
+                        fixture.token_mint,
+                        destination_token_account,
+                        fixture.stake_authority,
+                        amount,
+                    ),
+                    false,
+                ),
+                AccountMeta::new_readonly(spl_token_2022::ID, false),
+                AccountMeta::new_readonly(solana_program::sysvar::instructions::ID, false),
+                AccountMeta::new(fixture.operator_owner.pubkey(), true),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: instruction_data("withdraw_stake", |data| {
+                amount.serialize(data)?;
+                deactivate.serialize(data)?;
+                Ok(())
+            })?,
+        },
+    )
+    .await
 }
 
 async fn bootstrap_registry(
@@ -378,29 +488,7 @@ async fn create_lease_requires_operator_owner_and_computes_pcr16() -> Result<(),
     .await;
     assert!(wrong_result.is_err());
 
-    send(
-        &mut context.banks_client,
-        &context.payer,
-        &[&fixture.operator_owner],
-        Instruction {
-            program_id: solrl_registry::ID,
-            accounts: vec![
-                AccountMeta::new_readonly(fixture.config, false),
-                AccountMeta::new(fixture.job, false),
-                AccountMeta::new(fixture.operator, false),
-                AccountMeta::new(fixture.lease, false),
-                AccountMeta::new_readonly(fixture.operator_owner.pubkey(), true),
-                AccountMeta::new(context.payer.pubkey(), true),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: instruction_data("create_lease", |data| {
-                fixture.lease_id.serialize(data)?;
-                fixture.create_lease_args.serialize(data)?;
-                Ok(())
-            })?,
-        },
-    )
-    .await?;
+    create_lease(&mut context.banks_client, &context.payer, &fixture).await?;
 
     let lease_account = context
         .banks_client
@@ -434,5 +522,196 @@ async fn create_lease_requires_operator_owner_and_computes_pcr16() -> Result<(),
     let verifier_policy =
         VerifierPolicy::try_deserialize(&mut verifier_policy_account.data.as_slice())?;
     assert!(verifier_policy.active);
+
+    let withdraw_result = withdraw_stake(
+        &mut context.banks_client,
+        &context.payer,
+        &fixture,
+        1,
+        pubkey(44),
+        false,
+    )
+    .await;
+    assert!(withdraw_result.is_err());
+    let operator_account = context
+        .banks_client
+        .get_account(fixture.operator)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operator account missing"))?;
+    let operator = Operator::try_deserialize(&mut operator_account.data.as_slice())?;
+    assert_eq!(operator.stake_amount, 1_000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn register_verifier_requires_matching_active_policy() -> Result<(), Box<dyn Error>> {
+    let program_test = ProgramTest::new(
+        "solrl_registry",
+        solrl_registry::ID,
+        processor!(process_instruction),
+    );
+    let fixture = RegistryFixture::new();
+    let mut context = program_test.start_with_context().await;
+
+    bootstrap_registry(&mut context.banks_client, &context.payer, &fixture).await?;
+
+    let too_old_verifier_id = hash32(98);
+    let too_old_result = send(
+        &mut context.banks_client,
+        &context.payer,
+        &[],
+        Instruction {
+            program_id: solrl_registry::ID,
+            accounts: vec![
+                AccountMeta::new_readonly(fixture.config, false),
+                AccountMeta::new_readonly(fixture.verifier_policy, false),
+                AccountMeta::new(
+                    pda(&[
+                        b"verifier",
+                        fixture.config.as_ref(),
+                        too_old_verifier_id.as_ref(),
+                    ]),
+                    false,
+                ),
+                AccountMeta::new(context.payer.pubkey(), true),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: instruction_data("register_verifier", |data| {
+                too_old_verifier_id.serialize(data)?;
+                RegisterVerifierArgs {
+                    ed25519_pubkey: fixture.verifier_ed25519_pubkey,
+                    family: family(3),
+                    version: 0,
+                    policy_id: fixture.create_job_args.verifier_policy_id,
+                    active: true,
+                }
+                .serialize(data)?;
+                Ok(())
+            })?,
+        },
+    )
+    .await;
+    assert!(too_old_result.is_err());
+
+    send(
+        &mut context.banks_client,
+        &context.payer,
+        &[],
+        Instruction {
+            program_id: solrl_registry::ID,
+            accounts: vec![
+                AccountMeta::new_readonly(fixture.config, false),
+                AccountMeta::new_readonly(fixture.verifier_policy, false),
+                AccountMeta::new(fixture.verifier, false),
+                AccountMeta::new(context.payer.pubkey(), true),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: instruction_data("register_verifier", |data| {
+                fixture.verifier_id.serialize(data)?;
+                RegisterVerifierArgs {
+                    ed25519_pubkey: fixture.verifier_ed25519_pubkey,
+                    family: family(3),
+                    version: 1,
+                    policy_id: fixture.create_job_args.verifier_policy_id,
+                    active: true,
+                }
+                .serialize(data)?;
+                Ok(())
+            })?,
+        },
+    )
+    .await?;
+
+    let verifier_account = context
+        .banks_client
+        .get_account(fixture.verifier)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "verifier account missing"))?;
+    let verifier = Verifier::try_deserialize(&mut verifier_account.data.as_slice())?;
+    assert_eq!(
+        verifier.policy_id,
+        fixture.create_job_args.verifier_policy_id
+    );
+    assert_eq!(verifier.ed25519_pubkey, fixture.verifier_ed25519_pubkey);
+    assert!(verifier.active);
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialize_extra_account_meta_list_creates_hook_validation_account(
+) -> Result<(), Box<dyn Error>> {
+    let program_test = ProgramTest::new(
+        "solrl_registry",
+        solrl_registry::ID,
+        processor!(process_instruction),
+    );
+    let fixture = RegistryFixture::new();
+    let mut context = program_test.start_with_context().await;
+
+    bootstrap_registry(&mut context.banks_client, &context.payer, &fixture).await?;
+
+    let validation = extra_account_meta_list(fixture.token_mint);
+    send(
+        &mut context.banks_client,
+        &context.payer,
+        &[],
+        Instruction {
+            program_id: solrl_registry::ID,
+            accounts: vec![
+                AccountMeta::new_readonly(fixture.config, false),
+                AccountMeta::new(validation, false),
+                AccountMeta::new_readonly(fixture.token_mint, false),
+                AccountMeta::new(context.payer.pubkey(), true),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: instruction_data("initialize_extra_account_meta_list", |_| Ok(()))?,
+        },
+    )
+    .await?;
+
+    let validation_account = context
+        .banks_client
+        .get_account(validation)
+        .await?
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "extra account meta list missing")
+        })?;
+    assert_eq!(validation_account.owner, solrl_registry::ID);
+    assert!(!validation_account.data.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn withdraw_stake_rejects_partial_exit_below_minimum_before_token_cpi(
+) -> Result<(), Box<dyn Error>> {
+    let program_test = ProgramTest::new(
+        "solrl_registry",
+        solrl_registry::ID,
+        processor!(process_instruction),
+    );
+    let fixture = RegistryFixture::new();
+    let mut context = program_test.start_with_context().await;
+
+    bootstrap_registry(&mut context.banks_client, &context.payer, &fixture).await?;
+
+    let result = withdraw_stake(
+        &mut context.banks_client,
+        &context.payer,
+        &fixture,
+        1,
+        pubkey(45),
+        false,
+    )
+    .await;
+    assert!(result.is_err());
+
+    let operator_account = context
+        .banks_client
+        .get_account(fixture.operator)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "operator account missing"))?;
+    let operator = Operator::try_deserialize(&mut operator_account.data.as_slice())?;
+    assert_eq!(operator.stake_amount, 1_000);
+    assert_eq!(operator.active_lease_count, 0);
     Ok(())
 }

@@ -29,11 +29,11 @@ Do not install Rust, Anchor, Solana CLI, Node, Python dependencies, Nix, Terrafo
 ## Quick Start
 
 ```bash
-docker compose build harbor-runner aws-test-runner
+docker compose build dev-shell harbor-runner aws-test-runner
 docker compose up -d localstack
 docker compose run --rm lint
 docker compose run --rm harbor-runner pytest -q
-docker compose run --rm harbor-runner ./scripts/e2e-local-mock.sh
+docker compose run --rm --no-deps dev-shell ./scripts/e2e-local-mock.sh
 docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 ```
@@ -89,7 +89,7 @@ anchor build --no-idl
 
 `--no-idl` is intentional right now. The SBF program builds, but Anchor `0.30.1` IDL generation currently trips on its `anchor-syn` / `proc-macro2` path under this Solana `1.18` toolchain. Do not pretend the IDL is done. The binary build is real; the IDL is the next tooling fix.
 
-The current Anchor instruction test covers registry bootstrap, operator auth on leases, and on-chain PCR16 computation. The Python mock e2e covers the full off-chain protocol shape.
+The current Anchor instruction tests cover registry bootstrap, verifier policy binding, operator auth on leases, on-chain PCR16 computation, Token-2022 extra-account metadata initialization, and stake-withdrawal guard rails. The Python mock e2e covers the full off-chain protocol shape, then runs the registry instruction tests in the same Docker entrypoint.
 
 One honest remaining gap: there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. V1 verifies claims in `settle_claim`, arms a one-use `TransferGuard`, flushes it before the CPI, and requires the hook to consume that guard. Full hook-side claim verification still needs a PDA seed redesign so the hook can derive the job, lease, receipt, and policy graph from the transfer inputs.
 

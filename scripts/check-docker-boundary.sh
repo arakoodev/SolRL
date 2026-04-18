@@ -16,12 +16,22 @@ if grep -nE 'docker\\.io|docker-ce|docker-cli|docker-buildx|docker compose|docke
   exit 1
 fi
 
-for script in scripts/lint.sh scripts/test-anchor.sh scripts/e2e-aws-nitro.sh; do
+for script in scripts/lint.sh scripts/test-anchor.sh scripts/e2e-local-mock.sh scripts/e2e-aws-nitro.sh; do
   if ! grep -q 'SOLRL_IN_DOCKER' "$script"; then
     echo "docker boundary lint failed: $script must refuse host execution" >&2
     exit 1
   fi
 done
+
+if grep -RIn 'harbor-runner ./scripts/e2e-local-mock.sh' README.md PLAN.md docker-compose.yml 2>/dev/null; then
+  echo "docker boundary lint failed: e2e-local-mock.sh must run in dev-shell because it exercises Rust registry tests" >&2
+  exit 1
+fi
+
+if ! grep -q 'tomli' docker/dev-shell.Dockerfile || ! grep -q 'except ModuleNotFoundError' python/solrl_core/config.py; then
+  echo "docker boundary lint failed: dev-shell is Python 3.10, so TOML loading needs tomli fallback" >&2
+  exit 1
+fi
 
 if ! grep -q 'SOLRL_IN_DOCKER: "1"' docker-compose.yml; then
   echo "docker boundary lint failed: docker-compose.yml must mark Docker-only services" >&2

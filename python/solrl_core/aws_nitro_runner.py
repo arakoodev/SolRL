@@ -529,241 +529,41 @@ class AwsNitroRunner:
         (self.config.artifact_dir / name).write_text(value, encoding="utf-8")
 
 
+TEMPLATE_DIR = Path(__file__).with_name("aws_nitro_templates")
+
+
+def template_text(name: str) -> str:
+    return (TEMPLATE_DIR / name).read_text(encoding="utf-8")
+
+
+def template_b64(name: str) -> str:
+    return base64.b64encode((TEMPLATE_DIR / name).read_bytes()).decode("ascii")
+
+
+def validate_remote_token(name: str, value: str) -> None:
+    if not value or not all(char.isalnum() or char in "._-" for char in value):
+        raise AwsNitroRunnerError(f"{name} must contain only letters, numbers, dot, underscore, or dash")
+
+
 def remote_smoke_script(config: RunnerConfig, user_data_hex: str, public_key_hex: str, nonce_hex: str) -> str:
-    return f"""#!/usr/bin/env bash
-set -euo pipefail
-exec > >(tee /var/log/solrl-nitro-smoke.log /dev/console) 2>&1
-on_err() {{
-  rc=$?
-  echo SOLRL_REMOTE_FAILED=$rc
-  systemctl status nitro-enclaves-allocator.service --no-pager -l || true
-  journalctl -u nitro-enclaves-allocator.service --no-pager -n 120 || true
-  tail -160 /tmp/solrl-docker-build.log 2>/dev/null || true
-  exit $rc
-}}
-trap on_err ERR
-
-yum update -y >/dev/null
-amazon-linux-extras install aws-nitro-enclaves-cli -y >/dev/null
-yum install -y aws-nitro-enclaves-cli-devel docker jq python3 >/dev/null
-systemctl enable --now docker
-
-install -d -m 0755 /etc/nitro_enclaves
-cat >/etc/nitro_enclaves/allocator.yaml <<'YAML'
----
-memory_mib: 1024
-cpu_count: 2
-YAML
-systemctl enable nitro-enclaves-allocator.service >/dev/null
-systemctl daemon-reload
-systemctl restart nitro-enclaves-allocator.service
-export NITRO_CLI_ARTIFACTS=/var/lib/solrl/nitro-artifacts
-export NITRO_CLI_BLOBS=/usr/share/nitro_enclaves/blobs
-mkdir -p "$NITRO_CLI_ARTIFACTS"
-test -d "$NITRO_CLI_BLOBS"
-
-WORK=/opt/solrl-nitro-worker
-rm -rf "$WORK"
-mkdir -p "$WORK/src"
-cat >"$WORK/Cargo.toml" <<'TOML'
-[package]
-name = "solrl-nitro-worker"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-aws-nitro-enclaves-nsm-api = "0.4.0"
-hex = "0.4.3"
-libc = "0.2"
-serde_bytes = "0.11"
-TOML
-
-cat >"$WORK/src/main.rs" <<'RS'
-use aws_nitro_enclaves_nsm_api::{{
-    api::{{Request, Response}},
-    driver::{{nsm_exit, nsm_init, nsm_process_request}},
-}};
-use serde_bytes::ByteBuf;
-use std::{{env, fs::File, io::Write, mem, os::fd::FromRawFd, ptr}};
-
-fn env_hex(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {{
-    Ok(hex::decode(env::var(name)?)?)
-}}
-
-fn serve_once(payload: &[u8], port: u32) -> Result<(), Box<dyn std::error::Error>> {{
-    let fd = unsafe {{ libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) }};
-    if fd < 0 {{
-        return Err("failed to create vsock socket".into());
-    }}
-    let addr = libc::sockaddr_vm {{
-        svm_family: libc::AF_VSOCK as libc::sa_family_t,
-        svm_reserved1: 0,
-        svm_port: port,
-        svm_cid: u32::MAX,
-        svm_zero: [0; 4],
-    }};
-    let rc = unsafe {{
-        libc::bind(
-            fd,
-            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
-            mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-        )
-    }};
-    if rc != 0 {{
-        return Err("failed to bind vsock listener".into());
-    }}
-    if unsafe {{ libc::listen(fd, 1) }} != 0 {{
-        return Err("failed to listen on vsock".into());
-    }}
-    let client = unsafe {{ libc::accept(fd, ptr::null_mut(), ptr::null_mut()) }};
-    if client < 0 {{
-        return Err("failed to accept vsock client".into());
-    }}
-    let mut stream = unsafe {{ File::from_raw_fd(client) }};
-    stream.write_all(payload)?;
-    stream.write_all(b"\\n")?;
-    unsafe {{ libc::close(fd) }};
-    Ok(())
-}}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {{
-    let user_data = env_hex("SOLRL_USER_DATA_HEX")?;
-    let public_key = env_hex("SOLRL_PUBLIC_KEY_HEX")?;
-    let nonce = env_hex("SOLRL_NONCE_HEX")?;
-    let port: u32 = env::var("SOLRL_VSOCK_PORT")?.parse()?;
-    let nsm_fd = nsm_init();
-    if nsm_fd < 0 {{
-        return Err("failed to initialize NSM".into());
-    }}
-    let pcr16 = match nsm_process_request(nsm_fd, Request::ExtendPCR {{ index: 16, data: user_data.clone() }}) {{
-        Response::ExtendPCR {{ data }} => data,
-        Response::Error(err) => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("failed to extend PCR16: {{err:?}}").into());
-        }}
-        other => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("unexpected ExtendPCR response: {{other:?}}").into());
-        }}
-    }};
-    match nsm_process_request(nsm_fd, Request::LockPCR {{ index: 16 }}) {{
-        Response::LockPCR => {{}}
-        Response::Error(err) => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("failed to lock PCR16: {{err:?}}").into());
-        }}
-        other => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("unexpected LockPCR response: {{other:?}}").into());
-        }}
-    }};
-    match nsm_process_request(nsm_fd, Request::DescribePCR {{ index: 16 }}) {{
-        Response::DescribePCR {{ lock, data }} if lock && data == pcr16 => {{}}
-        Response::DescribePCR {{ lock, data }} => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("PCR16 lock check failed: lock={{lock}}, bytes={{}}", data.len()).into());
-        }}
-        Response::Error(err) => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("failed to describe PCR16: {{err:?}}").into());
-        }}
-        other => {{
-            nsm_exit(nsm_fd);
-            return Err(format!("unexpected DescribePCR response: {{other:?}}").into());
-        }}
-    }};
-    let response = nsm_process_request(
-        nsm_fd,
-        Request::Attestation {{
-            public_key: Some(ByteBuf::from(public_key)),
-            user_data: Some(ByteBuf::from(user_data)),
-            nonce: Some(ByteBuf::from(nonce)),
-        }},
-    );
-    nsm_exit(nsm_fd);
-    let document = match response {{
-        Response::Attestation {{ document }} => document,
-        other => return Err(format!("unexpected NSM response: {{other:?}}").into()),
-    }};
-    serve_once(hex::encode(document).as_bytes(), port)
-}}
-RS
-
-cat >"$WORK/Dockerfile" <<'DOCKER'
-FROM rust:1.88-bookworm AS build
-WORKDIR /src
-COPY Cargo.toml .
-COPY src ./src
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-ARG SOLRL_USER_DATA_HEX
-ARG SOLRL_PUBLIC_KEY_HEX
-ARG SOLRL_NONCE_HEX
-ARG SOLRL_VSOCK_PORT
-ENV SOLRL_USER_DATA_HEX=$SOLRL_USER_DATA_HEX
-ENV SOLRL_PUBLIC_KEY_HEX=$SOLRL_PUBLIC_KEY_HEX
-ENV SOLRL_NONCE_HEX=$SOLRL_NONCE_HEX
-ENV SOLRL_VSOCK_PORT=$SOLRL_VSOCK_PORT
-COPY --from=build /src/target/release/solrl-nitro-worker /solrl-nitro-worker
-CMD ["/solrl-nitro-worker"]
-DOCKER
-
-docker build "$WORK" \\
-  --build-arg SOLRL_USER_DATA_HEX={user_data_hex} \\
-  --build-arg SOLRL_PUBLIC_KEY_HEX={public_key_hex} \\
-  --build-arg SOLRL_NONCE_HEX={nonce_hex} \\
-  --build-arg SOLRL_VSOCK_PORT={config.vsock_port} \\
-  -t solrl-nitro-worker:{config.run_id} >/tmp/solrl-docker-build.log 2>&1
-
-nitro-cli build-enclave --docker-uri solrl-nitro-worker:{config.run_id} --output-file /tmp/solrl-worker.eif \\
-  >/tmp/solrl-build.json
-nitro-cli run-enclave --cpu-count 2 --memory 512 --enclave-cid 16 --eif-path /tmp/solrl-worker.eif \\
-  >/tmp/solrl-run.json
-sleep 5
-python3 - <<'PY' > /tmp/solrl-attestation.hex
-import socket
-import time
-
-sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-for _ in range(90):
-    try:
-        sock.connect((16, {config.vsock_port}))
-        break
-    except OSError:
-        time.sleep(1)
-else:
-    raise SystemExit("could not connect to SolRL worker enclave over VSOCK")
-
-chunks = []
-while True:
-    data = sock.recv(65536)
-    if not data:
-        break
-    chunks.append(data)
-print(b"".join(chunks).decode("ascii").strip())
-PY
-nitro-cli describe-enclaves >/tmp/solrl-describe.json
-ENCLAVE_ID="$(jq -r '.[0].EnclaveID // empty' /tmp/solrl-describe.json)"
-test -n "$ENCLAVE_ID"
-nitro-cli terminate-enclave --enclave-id "$ENCLAVE_ID" >/tmp/solrl-terminate.json
-
-echo SOLRL_EXPECTED_USER_DATA_HEX={user_data_hex}
-echo SOLRL_EXPECTED_PUBLIC_KEY_HEX={public_key_hex}
-echo SOLRL_BUILD_JSON_B64="$(base64 -w0 /tmp/solrl-build.json)"
-sleep 3
-echo SOLRL_ATTESTATION_HEX_BEGIN
-ATTESTATION_CHUNK_WIDTH=96
-ATTESTATION_CHUNKS="$(fold -w "$ATTESTATION_CHUNK_WIDTH" /tmp/solrl-attestation.hex | wc -l)"
-echo SOLRL_ATTESTATION_HEX_WIDTH="$ATTESTATION_CHUNK_WIDTH"
-echo SOLRL_ATTESTATION_HEX_CHUNKS="$ATTESTATION_CHUNKS"
-for pass in 1 2; do
-    echo SOLRL_ATTESTATION_HEX_PASS="$pass"
-    fold -w "$ATTESTATION_CHUNK_WIDTH" /tmp/solrl-attestation.hex | awk '{{ printf "SOLRL_ATTESTATION_HEX_CHUNK=%04d:%s\\n", NR - 1, $0 }}'
-done
-echo SOLRL_ATTESTATION_HEX_END
-echo SOLRL_STATUS=OK
-"""
+    validate_remote_token("run_id", config.run_id)
+    replacements = {
+        "__CARGO_TOML_B64__": template_b64("worker-Cargo.toml"),
+        "__MAIN_RS_B64__": template_b64("worker-main.rs"),
+        "__DOCKERFILE_B64__": template_b64("worker-Dockerfile"),
+        "__USER_DATA_HEX__": user_data_hex,
+        "__PUBLIC_KEY_HEX__": public_key_hex,
+        "__NONCE_HEX__": nonce_hex,
+        "__VSOCK_PORT__": str(config.vsock_port),
+        "__RUN_ID__": config.run_id,
+    }
+    script = template_text("remote_smoke.sh.tpl")
+    for token, value in replacements.items():
+        script = script.replace(token, value)
+    unresolved = [token for token in replacements if token in script]
+    if unresolved:
+        raise AwsNitroRunnerError(f"remote Nitro template has unresolved tokens: {', '.join(unresolved)}")
+    return script
 
 
 def run_smoke(args: argparse.Namespace) -> int:

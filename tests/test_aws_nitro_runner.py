@@ -7,6 +7,7 @@ import pytest
 
 from solrl_core.aws_nitro_runner import (
     AwsNitroRunnerError,
+    TEMPLATE_DIR,
     make_config,
     normalise_aws_env,
     parse_remote_markers,
@@ -150,6 +151,7 @@ def test_remote_script_configures_allocator_before_start() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
 
     script = remote_smoke_script(config, "aa", "bb", "cc")
+    worker_source = (TEMPLATE_DIR / "worker-main.rs").read_text(encoding="utf-8")
 
     assert "systemctl enable --now nitro-enclaves-allocator.service" not in script
     assert "systemctl status nitro-enclaves-allocator.service --no-pager -l" in script
@@ -157,9 +159,13 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "systemctl daemon-reload" in script
     assert "export NITRO_CLI_ARTIFACTS=/var/lib/solrl/nitro-artifacts" in script
     assert "export NITRO_CLI_BLOBS=/usr/share/nitro_enclaves/blobs" in script
-    assert "Request::ExtendPCR { index: 16" in script
-    assert "Request::LockPCR { index: 16" in script
-    assert "Request::DescribePCR { index: 16" in script
+    assert 'base64 -d > "$WORK/Cargo.toml"' in script
+    assert 'base64 -d > "$WORK/src/main.rs"' in script
+    assert 'base64 -d > "$WORK/Dockerfile"' in script
+    assert 'cat >"$WORK/src/main.rs"' not in script
+    assert "Request::ExtendPCR { index: 16" in worker_source
+    assert "Request::LockPCR { index: 16" in worker_source
+    assert "Request::DescribePCR { index: 16" in worker_source
     assert "SOLRL_ATTESTATION_HEX_CHUNK=" in script
     assert "SOLRL_ATTESTATION_HEX_WIDTH=" in script
     assert "SOLRL_ATTESTATION_HEX_CHUNKS=" in script
@@ -171,3 +177,10 @@ def test_remote_script_configures_allocator_before_start() -> None:
         "systemctl restart nitro-enclaves-allocator.service"
     )
     assert script.index("export NITRO_CLI_ARTIFACTS") < script.index("nitro-cli build-enclave")
+
+
+def test_remote_script_rejects_shell_unsafe_run_id() -> None:
+    config = make_config("solrl-test;rm", Path("artifacts/test"))
+
+    with pytest.raises(AwsNitroRunnerError, match="run_id"):
+        remote_smoke_script(config, "aa", "bb", "cc")

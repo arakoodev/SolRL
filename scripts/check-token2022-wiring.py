@@ -38,9 +38,11 @@ def function_body(source: str, name: str) -> str:
 
 def main() -> int:
     source = REGISTRY.read_text(encoding="utf-8")
+    source_compact = re.sub(r"\s+", "", source)
     settle = function_body(source, "settle_claim")
     hook = function_body(source, "transfer_hook")
     slash = function_body(source, "slash_operator")
+    withdraw = function_body(source, "withdraw_stake")
 
     if "transfer_escrow_to_operator" not in settle:
         fail("settle_claim must execute the escrow payout")
@@ -64,8 +66,34 @@ def main() -> int:
         fail("settle_claim must fail unless the Token-2022 hook consumed the TransferGuard")
     if "TRANSFER_GUARD_STATUS_CONSUMED" not in slash:
         fail("slash_operator must fail unless the Token-2022 hook consumed the TransferGuard")
+    if "TRANSFER_GUARD_STATUS_CONSUMED" not in withdraw:
+        fail("withdraw_stake must fail unless the Token-2022 hook consumed the TransferGuard")
+    if "close_transfer_guard" not in settle:
+        fail("settle_claim must close the TransferGuard after the hook consumes it")
+    if "close_transfer_guard" not in slash:
+        fail("slash_operator must close the TransferGuard after the hook consumes it")
+    if "close_transfer_guard" not in withdraw:
+        fail("withdraw_stake must close the TransferGuard after the hook consumes it")
+    if "transfer_stake_to_withdraw_destination" not in withdraw:
+        fail("withdraw_stake must transfer operator stake through Token-2022")
     if "ExtraAccountMetaList::init" not in source:
         fail("missing ExtraAccountMetaList initialization")
+    if "ExtraAccountMeta::new_with_seeds" not in source:
+        fail("ExtraAccountMetaList must dynamically resolve the TransferGuard PDA")
+    for required_seed in (
+        'Seed::Literal{bytes:b"transfer_guard".to_vec(),}',
+        "Seed::AccountKey{index:0}",
+        "Seed::AccountKey{index:1}",
+        "Seed::AccountKey{index:2}",
+        "Seed::AccountKey{index:3}",
+        "Seed::InstructionData{index:8,length:8,}",
+    ):
+        if required_seed not in source_compact:
+            fail(f"TransferGuard ExtraAccountMetaList is missing seed: {required_seed}")
+    if "expires_slot" in source:
+        fail("TransferGuard must not use expires_slot; hook guards are single-slot armed transfers")
+    if "armed_slot" not in source:
+        fail("TransferGuard must store the slot it was armed in")
 
     combined_docs = README.read_text(encoding="utf-8") + "\n" + PLAN.read_text(encoding="utf-8")
     forbidden = (

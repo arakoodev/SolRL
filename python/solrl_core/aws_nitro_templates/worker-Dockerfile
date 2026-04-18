@@ -1,0 +1,17 @@
+FROM rust:1.88-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml .
+COPY src ./src
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+ARG SOLRL_USER_DATA_HEX
+ARG SOLRL_PUBLIC_KEY_HEX
+ARG SOLRL_NONCE_HEX
+ARG SOLRL_VSOCK_PORT
+ENV SOLRL_USER_DATA_HEX=$SOLRL_USER_DATA_HEX
+ENV SOLRL_PUBLIC_KEY_HEX=$SOLRL_PUBLIC_KEY_HEX
+ENV SOLRL_NONCE_HEX=$SOLRL_NONCE_HEX
+ENV SOLRL_VSOCK_PORT=$SOLRL_VSOCK_PORT
+COPY --from=build /src/target/release/solrl-nitro-worker /solrl-nitro-worker
+CMD ["/solrl-nitro-worker"]
