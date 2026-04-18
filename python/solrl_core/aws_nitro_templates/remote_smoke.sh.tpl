@@ -15,6 +15,11 @@ WATCHDOG_PID=
 mkdir -p "$LOG_DIR"
 exec >"$LOG_DIR/user-data.log" 2>&1
 
+flush_console() {
+  sync || true
+  sleep 10
+}
+
 emit_failure() {
   rc="${1:-$?}"
   trap - ERR
@@ -35,6 +40,7 @@ emit_failure() {
     echo SOLRL_ERROR_TAIL_END
     echo SOLRL_RESULT_END
   } >"$CONSOLE" || true
+  flush_console
   shutdown -h now || true
   exit "$rc"
 }
@@ -61,6 +67,8 @@ start_watchdog() {
         echo SOLRL_ERROR_TAIL_END
         echo SOLRL_RESULT_END
       } >"$CONSOLE" || true
+      sync || true
+      sleep 10
       shutdown -h now || true
     fi
   ) &
@@ -256,4 +264,5 @@ fi
   echo SOLRL_RESULT_END
 } >"$CONSOLE"
 
+flush_console
 shutdown -h now || true

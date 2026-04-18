@@ -291,6 +291,8 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "SOLRL_PHASE_TIMEOUT_SECONDS=$timeout_seconds" in script
     assert "tail -80" in script
     assert "shutdown -h now" in script
+    assert "flush_console" in script
+    assert "sleep 10" in script
     assert "OVERALL_TIMEOUT_SECONDS=5400" in script
     assert "start_watchdog" in script
     assert "SOLRL_PHASE=overall_timeout" in script

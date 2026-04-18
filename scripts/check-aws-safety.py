@@ -102,6 +102,8 @@ def main() -> int:
     require(remote, "SOLRL_STATUS=FAILED", "AWS remote smoke must print compact failure markers")
     require(remote, "tail -80", "AWS remote smoke failure output must be capped")
     require(remote, "shutdown -h now", "AWS remote smoke must stop the instance after final result emission")
+    require(remote, "flush_console", "AWS remote smoke must flush console output before shutdown")
+    require(remote, "sleep 10", "AWS remote smoke must give EC2 console output time to persist before shutdown")
     require(remote, "OVERALL_TIMEOUT_SECONDS=5400", "AWS remote smoke must have a hard overall watchdog")
     require(remote, "start_watchdog", "AWS remote smoke must start the hard watchdog")
     require(remote, "SOLRL_PHASE=overall_timeout", "AWS remote watchdog must emit a typed timeout failure")
