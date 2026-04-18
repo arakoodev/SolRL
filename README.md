@@ -131,7 +131,8 @@ The smoke has the EC2 parent clone the configured public Git ref, install Nix on
 real NSM attestation over VSOCK, and verify the COSE signature, AWS root public key, non-zero PCRs, PCR16 digest,
 `user_data`, and worker public key on the EC2 parent before printing success. The local runner reads only the final
 `SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` console block after the instance stops. Build logs stay on the EC2 root volume
-under `/var/log/solrl`; EC2 console is not used as an artifact transport. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
+under `/var/log/solrl`; EC2 console is not used as an artifact transport. It only gets small phase-start markers plus the
+final result block. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
 boot, VSOCK, or real Nitro attestations.
 
 The EC2 cloud-init script has bounded phases and a hard overall watchdog. A stuck package install, Nix build, VSOCK

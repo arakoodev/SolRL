@@ -287,6 +287,8 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "tee /var/log" not in script
     assert "SOLRL_RESULT_BEGIN" in script
     assert "SOLRL_RESULT_END" in script
+    assert "SOLRL_PHASE_START=$PHASE" in script
+    assert "SOLRL_PHASE_TIMEOUT_SECONDS=$timeout_seconds" in script
     assert "tail -80" in script
     assert "shutdown -h now" in script
     assert "OVERALL_TIMEOUT_SECONDS=5400" in script
@@ -296,7 +298,8 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "/run/solrl.phase" in script
     assert "kill -TERM \"$phase_pid\"" in script
     assert "kill -KILL \"$phase_pid\"" in script
-    assert "run_phase packages 1800 phase_packages" in script
+    assert "yum update -y" not in script
+    assert "run_phase packages 900 phase_packages" in script
     assert "run_phase build_eif 5400 phase_build_eif" in script
     assert "run_phase attestation 300 phase_attestation" in script
     assert "systemctl daemon-reload" in script

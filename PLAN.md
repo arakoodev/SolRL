@@ -201,8 +201,9 @@ Required AWS safety invariants:
 - Every created AWS resource has `Project=SolRL` and `SolRLRunId=<run id>`.
 - The EC2 parent clones the configured public Git ref, installs Nix on EC2, rebuilds the EIF there, and verifies the
   SHA-384 before booting it.
-- EC2 console output is final-only: no attestation blobs, build JSON, or chunked artifact transport. The local runner
-  waits for the instance to stop, then parses one `SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` block.
+- EC2 console output is bounded: small phase-start diagnostics and one final result block. No attestation blobs, build
+  JSON, or chunked artifact transport. The local runner waits for the instance to stop, then parses one
+  `SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` block.
 - EC2 cloud-init has per-phase timeouts plus an overall watchdog. A hung package install, Nix build, VSOCK request, or
   verifier call emits `SOLRL_STATUS=FAILED`, includes the stuck phase and a capped log tail, then shuts the instance down.
 - The runner creates no inbound security group rules and no SSH key pair.

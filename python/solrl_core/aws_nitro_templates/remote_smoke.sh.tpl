@@ -73,6 +73,10 @@ run_phase() {
   timeout_seconds="$2"
   shift 2
   echo "=== SOLRL phase: $PHASE ==="
+  {
+    echo "SOLRL_PHASE_START=$PHASE"
+    echo "SOLRL_PHASE_TIMEOUT_SECONDS=$timeout_seconds"
+  } >"$CONSOLE" || true
   (
     set -euo pipefail
     "$@"
@@ -100,7 +104,6 @@ run_phase() {
 start_watchdog
 
 phase_packages() {
-  yum update -y
   amazon-linux-extras install aws-nitro-enclaves-cli -y
   yum install -y aws-nitro-enclaves-cli-devel curl git jq python3 python3-pip xz
   python3 -m pip install --upgrade pip
@@ -216,8 +219,8 @@ phase_terminate_enclave() {
   nitro-cli terminate-enclave --enclave-id "$enclave_id" >/tmp/solrl-terminate.json
 }
 
-run_phase packages 1800 phase_packages
-run_phase nix 1200 phase_nix
+run_phase packages 900 phase_packages
+run_phase nix 900 phase_nix
 run_phase clone 300 phase_clone
 run_phase build_eif 5400 phase_build_eif
 run_phase allocator 300 phase_allocator
