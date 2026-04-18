@@ -7,13 +7,18 @@ CONSOLE=/dev/console
 SRC_DIR=/opt/solrl
 RESULT_LINK=/opt/solrl-eif-result
 PHASE=init
+DONE_FILE=/run/solrl.done
+PHASE_FILE=/run/solrl.phase
+OVERALL_TIMEOUT_SECONDS=5400
+WATCHDOG_PID=
 
 mkdir -p "$LOG_DIR"
 exec >"$LOG_DIR/user-data.log" 2>&1
 
 emit_failure() {
-  rc=$?
+  rc="${1:-$?}"
   trap - ERR
+  touch "$DONE_FILE" || true
   log_path="$LOG_DIR/${PHASE}.log"
   {
     echo SOLRL_RESULT_BEGIN
@@ -33,14 +38,66 @@ emit_failure() {
   shutdown -h now || true
   exit "$rc"
 }
-trap emit_failure ERR
+trap 'emit_failure "$?"' ERR
+
+start_watchdog() {
+  (
+    sleep "$OVERALL_TIMEOUT_SECONDS"
+    if [ ! -f "$DONE_FILE" ]; then
+      current_phase="$(cat "$PHASE_FILE" 2>/dev/null || printf unknown)"
+      {
+        echo SOLRL_RESULT_BEGIN
+        echo SOLRL_STATUS=FAILED
+        echo SOLRL_RUN_ID=__RUN_ID__
+        echo SOLRL_GIT_REF=__GIT_REF__
+        echo SOLRL_PHASE=overall_timeout
+        echo SOLRL_ERROR_TAIL_BEGIN
+        echo "remote smoke exceeded ${OVERALL_TIMEOUT_SECONDS}s while phase was ${current_phase}"
+        if [ -f "$LOG_DIR/${current_phase}.log" ]; then
+          tail -80 "$LOG_DIR/${current_phase}.log" | sed 's/[^[:print:]	]//g' || true
+        else
+          tail -80 "$LOG_DIR/user-data.log" | sed 's/[^[:print:]	]//g' || true
+        fi
+        echo SOLRL_ERROR_TAIL_END
+        echo SOLRL_RESULT_END
+      } >"$CONSOLE" || true
+      shutdown -h now || true
+    fi
+  ) &
+  WATCHDOG_PID="$!"
+}
 
 run_phase() {
   PHASE="$1"
-  shift
+  printf '%s\n' "$PHASE" >"$PHASE_FILE"
+  timeout_seconds="$2"
+  shift 2
   echo "=== SOLRL phase: $PHASE ==="
-  "$@" >"$LOG_DIR/${PHASE}.log" 2>&1
+  (
+    set -euo pipefail
+    "$@"
+  ) >"$LOG_DIR/${PHASE}.log" 2>&1 &
+  phase_pid="$!"
+  phase_start="$(date +%s)"
+  while kill -0 "$phase_pid" 2>/dev/null; do
+    now="$(date +%s)"
+    if [ $((now - phase_start)) -ge "$timeout_seconds" ]; then
+      echo "phase ${PHASE} exceeded ${timeout_seconds}s; terminating" >>"$LOG_DIR/${PHASE}.log"
+      kill -TERM "$phase_pid" 2>/dev/null || true
+      sleep 5
+      kill -KILL "$phase_pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 5
+  done
+  set +e
+  wait "$phase_pid"
+  phase_rc="$?"
+  set -e
+  return "$phase_rc"
 }
+
+start_watchdog
 
 phase_packages() {
   yum update -y
@@ -159,15 +216,15 @@ phase_terminate_enclave() {
   nitro-cli terminate-enclave --enclave-id "$enclave_id" >/tmp/solrl-terminate.json
 }
 
-run_phase packages phase_packages
-run_phase nix phase_nix
-run_phase clone phase_clone
-run_phase build_eif phase_build_eif
-run_phase allocator phase_allocator
-run_phase run_enclave phase_run_enclave
-run_phase attestation phase_attestation
-run_phase verify_attestation phase_verify_attestation
-run_phase terminate_enclave phase_terminate_enclave
+run_phase packages 1800 phase_packages
+run_phase nix 1200 phase_nix
+run_phase clone 300 phase_clone
+run_phase build_eif 5400 phase_build_eif
+run_phase allocator 300 phase_allocator
+run_phase run_enclave 300 phase_run_enclave
+run_phase attestation 300 phase_attestation
+run_phase verify_attestation 300 phase_verify_attestation
+run_phase terminate_enclave 300 phase_terminate_enclave
 
 summary=/tmp/solrl-attestation-summary.json
 eif_sha384="$(awk '{ print $1 }' /tmp/solrl-eif-sha384.txt)"
@@ -176,6 +233,11 @@ pcr1="$(jq -r '.pcrs["1"]' "$summary")"
 pcr2="$(jq -r '.pcrs["2"]' "$summary")"
 pcr16="$(jq -r '.pcrs["16"]' "$summary")"
 root_sha="$(jq -r '.root_public_key_sha256' "$summary")"
+
+touch "$DONE_FILE"
+if [ -n "$WATCHDOG_PID" ]; then
+  kill "$WATCHDOG_PID" 2>/dev/null || true
+fi
 
 {
   echo SOLRL_RESULT_BEGIN

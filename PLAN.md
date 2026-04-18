@@ -203,6 +203,8 @@ Required AWS safety invariants:
   SHA-384 before booting it.
 - EC2 console output is final-only: no attestation blobs, build JSON, or chunked artifact transport. The local runner
   waits for the instance to stop, then parses one `SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` block.
+- EC2 cloud-init has per-phase timeouts plus an overall watchdog. A hung package install, Nix build, VSOCK request, or
+  verifier call emits `SOLRL_STATUS=FAILED`, includes the stuck phase and a capped log tail, then shuts the instance down.
 - The runner creates no inbound security group rules and no SSH key pair.
 - Cleanup refuses to delete resources unless ownership tags match the active run.
 - The default AWS smoke does not create IAM roles, pass roles, use an instance profile, or depend on SSM.

@@ -289,6 +289,16 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "SOLRL_RESULT_END" in script
     assert "tail -80" in script
     assert "shutdown -h now" in script
+    assert "OVERALL_TIMEOUT_SECONDS=5400" in script
+    assert "start_watchdog" in script
+    assert "SOLRL_PHASE=overall_timeout" in script
+    assert "/run/solrl.done" in script
+    assert "/run/solrl.phase" in script
+    assert "kill -TERM \"$phase_pid\"" in script
+    assert "kill -KILL \"$phase_pid\"" in script
+    assert "run_phase packages 1800 phase_packages" in script
+    assert "run_phase build_eif 5400 phase_build_eif" in script
+    assert "run_phase attestation 300 phase_attestation" in script
     assert "systemctl daemon-reload" in script
     assert "docker build" not in script
     assert "nitro-cli build-enclave" not in script

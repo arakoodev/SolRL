@@ -134,6 +134,10 @@ real NSM attestation over VSOCK, and verify the COSE signature, AWS root public 
 under `/var/log/solrl`; EC2 console is not used as an artifact transport. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
 boot, VSOCK, or real Nitro attestations.
 
+The EC2 cloud-init script has bounded phases and a hard overall watchdog. A stuck package install, Nix build, VSOCK
+connect, or verifier call emits a typed failed result block with the current phase and a capped log tail, then shuts the
+instance down. The local runner should never wait on a silently wedged EC2 parent.
+
 ## Docker-in-Docker
 
 Default services avoid privileged Docker-in-Docker.
