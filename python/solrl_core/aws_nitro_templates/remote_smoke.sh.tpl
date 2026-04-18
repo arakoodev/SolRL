@@ -1,61 +1,118 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec > >(tee /var/log/solrl-nitro-smoke.log /dev/console) 2>&1
-on_err() {
+
+export HOME=/root
+LOG_DIR=/var/log/solrl
+CONSOLE=/dev/console
+SRC_DIR=/opt/solrl
+RESULT_LINK=/opt/solrl-eif-result
+PHASE=init
+
+mkdir -p "$LOG_DIR"
+exec >"$LOG_DIR/user-data.log" 2>&1
+
+emit_failure() {
   rc=$?
-  echo SOLRL_REMOTE_FAILED=$rc
-  systemctl status nitro-enclaves-allocator.service --no-pager -l || true
-  journalctl -u nitro-enclaves-allocator.service --no-pager -n 120 || true
-  tail -160 /tmp/solrl-docker-build.log 2>/dev/null || true
-  exit $rc
+  trap - ERR
+  log_path="$LOG_DIR/${PHASE}.log"
+  {
+    echo SOLRL_RESULT_BEGIN
+    echo SOLRL_STATUS=FAILED
+    echo SOLRL_RUN_ID=__RUN_ID__
+    echo SOLRL_GIT_REF=__GIT_REF__
+    echo SOLRL_PHASE="$PHASE"
+    echo SOLRL_ERROR_TAIL_BEGIN
+    if [ -f "$log_path" ]; then
+      tail -80 "$log_path" | sed 's/[^[:print:]	]//g' || true
+    else
+      tail -80 "$LOG_DIR/user-data.log" | sed 's/[^[:print:]	]//g' || true
+    fi
+    echo SOLRL_ERROR_TAIL_END
+    echo SOLRL_RESULT_END
+  } >"$CONSOLE" || true
+  shutdown -h now || true
+  exit "$rc"
 }
-trap on_err ERR
+trap emit_failure ERR
 
-yum update -y >/dev/null
-amazon-linux-extras install aws-nitro-enclaves-cli -y >/dev/null
-yum install -y aws-nitro-enclaves-cli-devel docker jq python3 >/dev/null
-systemctl enable --now docker
+run_phase() {
+  PHASE="$1"
+  shift
+  echo "=== SOLRL phase: $PHASE ==="
+  "$@" >"$LOG_DIR/${PHASE}.log" 2>&1
+}
 
-install -d -m 0755 /etc/nitro_enclaves
-cat >/etc/nitro_enclaves/allocator.yaml <<'YAML'
+phase_packages() {
+  yum update -y
+  amazon-linux-extras install aws-nitro-enclaves-cli -y
+  yum install -y aws-nitro-enclaves-cli-devel curl git jq python3 python3-pip xz
+  python3 -m pip install --upgrade pip
+  python3 -m pip install 'boto3<1.34' 'botocore<1.34' 'cbor2<6' 'cryptography<42'
+}
+
+phase_nix() {
+  if ! command -v nix >/dev/null 2>&1; then
+    curl -fsSL https://nixos.org/nix/install -o /tmp/solrl-install-nix.sh
+    sh /tmp/solrl-install-nix.sh --daemon --yes --no-channel-add
+  fi
+  mkdir -p /etc/nix
+  cat >/etc/nix/nix.conf <<'NIXCONF'
+experimental-features = nix-command flakes
+accept-flake-config = true
+sandbox = true
+sandbox-fallback = false
+NIXCONF
+  systemctl restart nix-daemon.service
+}
+
+phase_clone() {
+  git_url="$(printf '%s' '__GIT_URL_B64__' | base64 -d)"
+  rm -rf "$SRC_DIR"
+  git clone "$git_url" "$SRC_DIR"
+  cd "$SRC_DIR"
+  git checkout --detach "__GIT_REF__"
+}
+
+phase_build_eif() {
+  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+  cd "$SRC_DIR"
+  rm -f "$RESULT_LINK"
+  for attempt in 1 2 3; do
+    if nix build .#solrl-nitro-worker-eif --no-write-lock-file --out-link "$RESULT_LINK"; then
+      break
+    fi
+    if [ "$attempt" = 3 ]; then
+      return 1
+    fi
+    sleep $((attempt * 20))
+  done
+  find -L "$RESULT_LINK" -type f -name '*.eif' -print -quit >/tmp/solrl-eif-path
+  test -s /tmp/solrl-eif-path
+  eif_path="$(cat /tmp/solrl-eif-path)"
+  sha384sum "$eif_path" >/tmp/solrl-eif-sha384.txt
+  nitro-cli describe-eif --eif-path "$eif_path" >/tmp/solrl-build.json
+}
+
+phase_allocator() {
+  install -d -m 0755 /etc/nitro_enclaves
+  cat >/etc/nitro_enclaves/allocator.yaml <<'YAML'
 ---
 memory_mib: 1024
 cpu_count: 2
 YAML
-systemctl enable nitro-enclaves-allocator.service >/dev/null
-systemctl daemon-reload
-systemctl restart nitro-enclaves-allocator.service
-export NITRO_CLI_ARTIFACTS=/var/lib/solrl/nitro-artifacts
-export NITRO_CLI_BLOBS=/usr/share/nitro_enclaves/blobs
-mkdir -p "$NITRO_CLI_ARTIFACTS"
-test -d "$NITRO_CLI_BLOBS"
+  systemctl enable nitro-enclaves-allocator.service
+  systemctl daemon-reload
+  systemctl restart nitro-enclaves-allocator.service
+}
 
-WORK=/opt/solrl-nitro-worker
-rm -rf "$WORK"
-mkdir -p "$WORK/src"
-base64 -d > "$WORK/Cargo.toml" <<'B64'
-__CARGO_TOML_B64__
-B64
-base64 -d > "$WORK/src/main.rs" <<'B64'
-__MAIN_RS_B64__
-B64
-base64 -d > "$WORK/Dockerfile" <<'B64'
-__DOCKERFILE_B64__
-B64
+phase_run_enclave() {
+  eif_path="$(cat /tmp/solrl-eif-path)"
+  nitro-cli run-enclave --cpu-count 2 --memory 512 --enclave-cid 16 --eif-path "$eif_path" \
+    >/tmp/solrl-run.json
+}
 
-docker build "$WORK" \
-  --build-arg SOLRL_USER_DATA_HEX=__USER_DATA_HEX__ \
-  --build-arg SOLRL_PUBLIC_KEY_HEX=__PUBLIC_KEY_HEX__ \
-  --build-arg SOLRL_NONCE_HEX=__NONCE_HEX__ \
-  --build-arg SOLRL_VSOCK_PORT=__VSOCK_PORT__ \
-  -t solrl-nitro-worker:__RUN_ID__ >/tmp/solrl-docker-build.log 2>&1
-
-nitro-cli build-enclave --docker-uri solrl-nitro-worker:__RUN_ID__ --output-file /tmp/solrl-worker.eif \
-  >/tmp/solrl-build.json
-nitro-cli run-enclave --cpu-count 2 --memory 512 --enclave-cid 16 --eif-path /tmp/solrl-worker.eif \
-  >/tmp/solrl-run.json
-sleep 5
-python3 - <<'PY' > /tmp/solrl-attestation.hex
+phase_attestation() {
+  python3 - <<'PY' > /tmp/solrl-attestation.hex
 import socket
 import time
 
@@ -69,6 +126,14 @@ for _ in range(90):
 else:
     raise SystemExit("could not connect to SolRL worker enclave over VSOCK")
 
+payload = "\n".join([
+    "USER_DATA_HEX=__USER_DATA_HEX__",
+    "PUBLIC_KEY_HEX=__PUBLIC_KEY_HEX__",
+    "NONCE_HEX=__NONCE_HEX__",
+    "",
+])
+sock.sendall(payload.encode("ascii"))
+sock.shutdown(socket.SHUT_WR)
 chunks = []
 while True:
     data = sock.recv(65536)
@@ -77,23 +142,53 @@ while True:
     chunks.append(data)
 print(b"".join(chunks).decode("ascii").strip())
 PY
-nitro-cli describe-enclaves >/tmp/solrl-describe.json
-ENCLAVE_ID="$(jq -r '.[0].EnclaveID // empty' /tmp/solrl-describe.json)"
-test -n "$ENCLAVE_ID"
-nitro-cli terminate-enclave --enclave-id "$ENCLAVE_ID" >/tmp/solrl-terminate.json
+}
 
-echo SOLRL_EXPECTED_USER_DATA_HEX=__USER_DATA_HEX__
-echo SOLRL_EXPECTED_PUBLIC_KEY_HEX=__PUBLIC_KEY_HEX__
-echo SOLRL_BUILD_JSON_B64="$(base64 -w0 /tmp/solrl-build.json)"
-sleep 3
-echo SOLRL_ATTESTATION_HEX_BEGIN
-ATTESTATION_CHUNK_WIDTH=96
-ATTESTATION_CHUNKS="$(fold -w "$ATTESTATION_CHUNK_WIDTH" /tmp/solrl-attestation.hex | wc -l)"
-echo SOLRL_ATTESTATION_HEX_WIDTH="$ATTESTATION_CHUNK_WIDTH"
-echo SOLRL_ATTESTATION_HEX_CHUNKS="$ATTESTATION_CHUNKS"
-for pass in 1 2; do
-    echo SOLRL_ATTESTATION_HEX_PASS="$pass"
-    fold -w "$ATTESTATION_CHUNK_WIDTH" /tmp/solrl-attestation.hex | awk '{ printf "SOLRL_ATTESTATION_HEX_CHUNK=%04d:%s\n", NR - 1, $0 }'
-done
-echo SOLRL_ATTESTATION_HEX_END
-echo SOLRL_STATUS=OK
+phase_verify_attestation() {
+  PYTHONPATH="$SRC_DIR/python" python3 -m solrl_core.aws_nitro_runner verify-attestation \
+    --attestation-hex-path /tmp/solrl-attestation.hex \
+    --expected-user-data-hex __USER_DATA_HEX__ \
+    --expected-public-key-hex __PUBLIC_KEY_HEX__ \
+    --summary-json /tmp/solrl-attestation-summary.json
+}
+
+phase_terminate_enclave() {
+  nitro-cli describe-enclaves >/tmp/solrl-describe.json
+  enclave_id="$(jq -r '.[0].EnclaveID // empty' /tmp/solrl-describe.json)"
+  test -n "$enclave_id"
+  nitro-cli terminate-enclave --enclave-id "$enclave_id" >/tmp/solrl-terminate.json
+}
+
+run_phase packages phase_packages
+run_phase nix phase_nix
+run_phase clone phase_clone
+run_phase build_eif phase_build_eif
+run_phase allocator phase_allocator
+run_phase run_enclave phase_run_enclave
+run_phase attestation phase_attestation
+run_phase verify_attestation phase_verify_attestation
+run_phase terminate_enclave phase_terminate_enclave
+
+summary=/tmp/solrl-attestation-summary.json
+eif_sha384="$(awk '{ print $1 }' /tmp/solrl-eif-sha384.txt)"
+pcr0="$(jq -r '.pcrs["0"]' "$summary")"
+pcr1="$(jq -r '.pcrs["1"]' "$summary")"
+pcr2="$(jq -r '.pcrs["2"]' "$summary")"
+pcr16="$(jq -r '.pcrs["16"]' "$summary")"
+root_sha="$(jq -r '.root_public_key_sha256' "$summary")"
+
+{
+  echo SOLRL_RESULT_BEGIN
+  echo SOLRL_STATUS=OK
+  echo SOLRL_RUN_ID=__RUN_ID__
+  echo SOLRL_GIT_REF=__GIT_REF__
+  echo SOLRL_EIF_SHA384="$eif_sha384"
+  echo SOLRL_NITRO_ROOT_SHA256="$root_sha"
+  echo SOLRL_PCR0="$pcr0"
+  echo SOLRL_PCR1="$pcr1"
+  echo SOLRL_PCR2="$pcr2"
+  echo SOLRL_PCR16="$pcr16"
+  echo SOLRL_RESULT_END
+} >"$CONSOLE"
+
+shutdown -h now || true

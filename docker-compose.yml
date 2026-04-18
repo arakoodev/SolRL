@@ -46,7 +46,9 @@ services:
     command: ./scripts/lint.sh
 
   nix-builder:
-    image: nixos/nix:latest
+    build:
+      context: .
+      dockerfile: docker/nix-builder.Dockerfile
     working_dir: /workspace
     volumes:
       - .:/workspace
@@ -78,7 +80,7 @@ services:
     ports:
       - "4566:4566"
     environment:
-      SERVICES: s3,iam,sts
+      SERVICES: s3,sts
       DEBUG: "0"
       AWS_DEFAULT_REGION: us-east-1
     volumes:
@@ -111,7 +113,7 @@ services:
     profiles: ["aws"]
     build:
       context: .
-      dockerfile: docker/dev-shell.Dockerfile
+      dockerfile: docker/aws-nitro-runner.Dockerfile
     working_dir: /workspace
     volumes:
       - .:/workspace

@@ -48,6 +48,8 @@ docker compose run --rm dev-shell bash
 That image is intentionally heavier. It contains the toolchain needed later for Rust, Anchor, Solana, Node, Python, Terraform, and AWS CLI work.
 
 It does not install the Docker CLI. No default service runs privileged Docker-in-Docker.
+The real AWS Nitro runner does not need local build privileges. Nix runs on the temporary EC2 parent, not in a privileged
+local container. It is not Docker-in-Docker and it does not mount the host Docker socket.
 
 ## Guardrails
 
@@ -63,9 +65,11 @@ For Marlin-style reproducible enclave work, use Nix in its own container:
 
 ```bash
 docker compose run --rm nix-builder nix --version
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
 ```
 
-Keeping Nix separate avoids mixing the Anchor/Solana toolchain with Nix store behavior.
+Keeping Nix separate avoids mixing the Anchor/Solana toolchain with Nix store behavior. The real AWS smoke does not
+build the EIF on the laptop. The EC2 parent clones the configured Git ref and rebuilds the EIF there before booting it.
 
 ## Anchor Program
 
@@ -109,20 +113,33 @@ AWS_DEFAULT_REGION=us-east-1
 Then run:
 
 ```bash
+docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner audit --scope project
 docker compose run --rm aws-nitro-runner
 ```
 
+The runner does a read-only preflight audit before launch. By default it refuses to start if active/stopped
+`Project=SolRL` EC2 resources already exist in the account. Use `--allow-existing-solrl` only when you intentionally
+want overlapping SolRL runs.
+
 The runner creates one temporary Nitro-enabled EC2 parent with no SSH key, no instance profile, no SSM dependency, and
 no inbound security group rules. Every created AWS resource is tagged with `Project=SolRL` and `SolRLRunId=<run id>`,
-and cleanup refuses to delete anything whose tags do not match the current run.
+and cleanup refuses to delete anything whose tags do not match the current run. Post-audit fails the run if exact
+run-id resources remain.
 
-The smoke runs a non-debug Nitro enclave, extends PCR16 with the ClaimV1 context, locks PCR16 so Nitro includes it in
-the attestation, fetches the document over VSOCK, and verifies the COSE signature, AWS root public key, non-zero PCRs,
-PCR16 digest, `user_data`, and worker public key. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF boot, VSOCK, or real
-Nitro attestations.
+The smoke has the EC2 parent clone the configured public Git ref, install Nix on the EC2 parent, rebuild the
+`solrl-nitro-worker-eif` through `monzo/aws-nitro-util` and the pinned Marlin/Oyster kernel path, boot the EIF, request a
+real NSM attestation over VSOCK, and verify the COSE signature, AWS root public key, non-zero PCRs, PCR16 digest,
+`user_data`, and worker public key on the EC2 parent before printing success. The local runner reads only the final
+`SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` console block after the instance stops. Build logs stay on the EC2 root volume
+under `/var/log/solrl`; EC2 console is not used as an artifact transport. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
+boot, VSOCK, or real Nitro attestations.
 
 ## Docker-in-Docker
 
 Default services avoid privileged Docker-in-Docker.
 
 The current `dev-shell` image does not include the Docker CLI. If a future step needs a container to build or run other containers, prefer mounting the host Docker socket into a dedicated service and document the trust cost. Do not silently add privileged `docker:dind`.
+
+The `aws-nitro-runner` service does not need local Linux build privileges now. Nix runs on the temporary EC2 parent for
+the real smoke. The local Docker service does not run Docker, does not mount the Docker socket, and does not run with
+`privileged: true`.

@@ -20,7 +20,6 @@ provider "aws" {
 
   endpoints {
     s3  = "http://localstack:4566"
-    iam = "http://localstack:4566"
     sts = "http://localstack:4566"
   }
 }

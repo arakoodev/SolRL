@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -10,6 +11,10 @@ RUNNER = ROOT / "python/solrl_core/aws_nitro_runner.py"
 TEMPLATE_DIR = ROOT / "python/solrl_core/aws_nitro_templates"
 E2E = ROOT / "scripts/e2e-aws-nitro.sh"
 SIDECAR = ROOT / "scripts/aws-nitro-smoke.sh"
+PREFLIGHT_SIDECAR = ROOT / "scripts/_preflight_readonly.py"
+POSTAUDIT_SIDECAR = ROOT / "scripts/_postaudit_readonly.py"
+WORKER = ROOT / "crates/solrl-nitro-worker/src/main.rs"
+FLAKE = ROOT / "flake.nix"
 
 
 def fail(message: str) -> None:
@@ -25,16 +30,19 @@ def require(text: str, needle: str, message: str) -> None:
 def main() -> int:
     if SIDECAR.exists():
         fail("scripts/aws-nitro-smoke.sh must not exist; AWS smoke must use the main runner path")
+    if PREFLIGHT_SIDECAR.exists() or POSTAUDIT_SIDECAR.exists():
+        fail("AWS audits must be first-class aws_nitro_runner subcommands, not sidecar scripts")
 
     runner = RUNNER.read_text(encoding="utf-8")
     templates = "\n".join(path.read_text(encoding="utf-8") for path in sorted(TEMPLATE_DIR.glob("*")))
     remote_path = TEMPLATE_DIR / "remote_smoke.sh.tpl"
-    worker_path = TEMPLATE_DIR / "worker-main.rs"
-    if not remote_path.exists() or not worker_path.exists():
-        fail("AWS Nitro runner must keep the remote script and worker source in aws_nitro_templates/")
+    if not remote_path.exists() or not WORKER.exists() or not FLAKE.exists():
+        fail("AWS Nitro runner must keep remote template, worker crate, and flake source")
     e2e = E2E.read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     remote = remote_path.read_text(encoding="utf-8")
+    worker = WORKER.read_text(encoding="utf-8")
+    flake = FLAKE.read_text(encoding="utf-8")
     combined_runner = runner + "\n" + templates
 
     require(e2e, "python3 -m solrl_core.aws_nitro_runner smoke", "e2e-aws-nitro.sh must call the main runner module")
@@ -47,10 +55,26 @@ def main() -> int:
     require(runner, "tags_match(", "cleanup must be gated on ownership tags")
     require(runner, "EnclaveOptions={\"Enabled\": True}", "EC2 parent must launch with Nitro Enclaves enabled")
     require(runner, "AssociatePublicIpAddress", "runner must make egress explicit for default subnets")
+    require(runner, "BlockDeviceMappings=", "AWS runner must size the temporary root volume explicitly for Nix builds")
+    require(runner, "\"DeleteOnTermination\": True", "AWS runner root volume must be deleted with the instance")
+    require(runner, "SOLRL_NITRO_ROOT_VOLUME_GIB", "AWS runner must allow explicit root volume override")
     require(runner, "SOLRL_NITRO_AMI_ID", "AWS runner must allow an explicit AMI override")
     require(runner, "describe_images(", "AWS runner must resolve the AMI through ec2:DescribeImages")
     require(runner, "UserData=user_data", "AWS runner must execute the remote smoke through EC2 user-data")
-    require(runner, "get_console_output(", "AWS runner must collect smoke markers through EC2 console output")
+    require(runner, "get_console_output(", "AWS runner must collect the final smoke result through EC2 console output")
+    require(runner, "audit_resources(", "AWS runner must include read-only resource audits")
+    require(runner, "_preflight_audit(", "smoke must run a first-class preflight audit")
+    require(runner, "_post_audit(", "smoke must run a first-class post-run audit")
+    require(runner, "def run_cleanup(", "main AWS runner must expose exact-run cleanup")
+    require(runner, "cleanup_run_resources(", "cleanup must use the shared tag-gated cleanup path")
+    require(runner, "cleanup requires --run-id", "cleanup must require an explicit run id")
+    require(runner, "allow_existing_solrl", "preflight blocking must require an explicit override")
+    require(runner, "Preflight found existing active/stopped Project=SolRL resources", "preflight must block by default")
+    require(runner, "Post-audit found resources left over", "post-audit must fail on exact run leftovers")
+    require(runner, "MAX_EC2_USER_DATA_BYTES", "runner must guard EC2 user-data size")
+    require(runner, "resolve_git_source(", "AWS runner must resolve the public git source for the EC2 rebuild")
+    require(runner, "public_clone_url(", "AWS runner must convert GitHub SSH remotes to public HTTPS clone URLs")
+    require(runner, "verify-attestation", "EC2 parent must verify the Nitro attestation before printing OK")
     require(
         combined_runner,
         "cat >/etc/nitro_enclaves/allocator.yaml",
@@ -61,66 +85,59 @@ def main() -> int:
         "systemctl daemon-reload",
         "AWS runner must reload systemd before restarting the Nitro allocator",
     )
+    if remote.index("systemctl restart nitro-enclaves-allocator.service") > remote.index("nitro-cli run-enclave"):
+        fail("AWS remote smoke must start the Nitro allocator before run-enclave")
     require(
-        combined_runner,
-        "journalctl -u nitro-enclaves-allocator.service",
-        "AWS runner must dump allocator journal on remote smoke failure",
+        remote,
+        "exec >\"$LOG_DIR/user-data.log\" 2>&1",
+        "AWS remote smoke must keep noisy logs out of EC2 console output",
     )
-    require(
-        combined_runner,
-        "NITRO_CLI_ARTIFACTS",
-        "AWS runner must set Nitro CLI artifacts path before build-enclave",
-    )
-    require(combined_runner, "NITRO_CLI_BLOBS", "AWS runner must set Nitro CLI blobs path before build-enclave")
-    require(
-        combined_runner,
-        "Request::ExtendPCR { index: 16",
-        "AWS runner must bind ClaimV1 context into PCR16 before attestation",
-    )
-    require(
-        combined_runner,
-        "Request::LockPCR { index: 16",
-        "AWS runner must lock PCR16; unlocked PCRs are not included in Nitro attestations",
-    )
-    require(
-        combined_runner,
-        "Request::DescribePCR { index: 16",
-        "AWS runner must verify PCR16 is locked before requesting attestation",
-    )
-    require(
-        combined_runner,
-        "SOLRL_ATTESTATION_HEX_CHUNK",
-        "AWS runner must chunk attestation output; EC2 console corrupts long marker lines",
-    )
-    require(
-        combined_runner,
-        "SOLRL_ATTESTATION_HEX_WIDTH",
-        "AWS runner must publish chunk width so corrupted console chunks can be rejected",
-    )
-    require(
-        combined_runner,
-        "SOLRL_ATTESTATION_HEX_CHUNKS",
-        "AWS runner must count attestation chunks so console interleaving cannot silently truncate output",
-    )
-    require(
-        combined_runner,
-        "SOLRL_ATTESTATION_HEX_PASS",
-        "AWS runner must repeat chunk output because EC2 console lines can interleave with cloud-init noise",
-    )
-    require(
-        combined_runner,
-        'fold -w "$ATTESTATION_CHUNK_WIDTH"',
-        "AWS runner must use one configured attestation chunk width everywhere",
-    )
-    require(combined_runner, "%04d:%s", "AWS runner must index attestation chunks")
+    if "tee /var/log" in remote or "/dev/console) 2>&1" in remote:
+        fail("AWS remote smoke must not tee the whole user-data stream to the EC2 console")
+    require(remote, "SOLRL_RESULT_BEGIN", "AWS remote smoke must print one final result block")
+    require(remote, "SOLRL_RESULT_END", "AWS remote smoke must close the final result block")
+    require(remote, "SOLRL_STATUS=OK", "AWS remote smoke must print OK only in the final result block")
+    require(remote, "SOLRL_STATUS=FAILED", "AWS remote smoke must print compact failure markers")
+    require(remote, "tail -80", "AWS remote smoke failure output must be capped")
+    require(remote, "shutdown -h now", "AWS remote smoke must stop the instance after final result emission")
+    require(remote, "export HOME=/root", "AWS remote smoke must set HOME under cloud-init")
+    require(remote, "git clone \"$git_url\" \"$SRC_DIR\"", "AWS remote smoke must clone the public repo on EC2")
+    require(remote, "git checkout --detach", "AWS remote smoke must checkout an explicit immutable git ref")
+    require(remote, "nixos.org/nix/install", "AWS remote smoke must install Nix on the EC2 parent that rebuilds the EIF")
+    require(remote, "nix build .#solrl-nitro-worker-eif", "AWS remote smoke must rebuild the EIF on EC2")
+    require(remote, "'cryptography<42'", "AWS remote smoke must pin Python deps for Amazon Linux 2 Python compatibility")
+    require(remote, "nitro-cli describe-eif", "AWS remote smoke must persist EIF measurements")
+    require(remote, "sha384sum", "AWS remote smoke must persist EIF hash evidence")
+    require(remote, "sock.sendall(payload.encode(\"ascii\"))", "attestation inputs must arrive over VSOCK at runtime")
+    require(flake, "nitro.buildEif", "SolRL flake must build an EIF through aws-nitro-util")
+    require(flake, "oysterPkgs.kernels.vanilla", "SolRL EIF must use the pinned Marlin/Oyster kernel path")
+    for request in ("ExtendPCR", "LockPCR", "DescribePCR"):
+        if not re.search(rf"Request::{request}\s*\{{[^}}]*\bindex:\s*16\b", worker, re.DOTALL):
+            fail(f"AWS worker must issue Request::{request} against PCR16")
+    require(remote, "verify-attestation", "AWS remote smoke must run the EC2-side attestation verifier")
+    if remote.index("verify-attestation") > remote.index("SOLRL_STATUS=OK"):
+        fail("AWS remote smoke must verify attestation before printing OK")
     require(runner, "aws_nitro_templates", "AWS runner must render the remote smoke from source templates")
-    require(remote, 'base64 -d > "$WORK/src/main.rs"', "AWS remote smoke must materialize worker source from template")
-    if 'cat >"$WORK/src/main.rs"' in runner or 'cat >"$WORK/src/main.rs"' in remote:
-        fail("AWS worker source must not be embedded as a shell heredoc")
+    if "__SOURCE_TARBALL_B64__" in remote:
+        fail("AWS remote smoke must not ship a source tarball to the EC2 parent")
+    if "create_bucket(" in combined_runner or "generate_presigned_url" in combined_runner or "upload_file(" in combined_runner:
+        fail("AWS Nitro smoke must not use S3 or presigned URLs for this no-S3 path")
+    if "docker build" in remote:
+        fail("AWS Nitro smoke must not build the EIF through Docker")
+    if "nitro-cli build-enclave" in remote:
+        fail("AWS Nitro smoke must not use non-reproducible nitro-cli build-enclave")
+    if "--build-arg SOLRL_USER_DATA_HEX" in combined_runner:
+        fail("run-specific attestation inputs must not be baked into the EIF image")
     if "systemctl enable --now nitro-enclaves-allocator.service" in combined_runner:
         fail("Nitro allocator must not be started before allocator.yaml exists")
-    if 'echo SOLRL_ATTESTATION_HEX="$(cat /tmp/solrl-attestation.hex)"' in combined_runner:
-        fail("AWS runner must not emit the attestation as one long EC2 console line")
+    for forbidden_marker in (
+        "SOLRL_ATTESTATION_HEX",
+        "SOLRL_BUILD_JSON_B64",
+        "SOLRL_ATTESTATION_HEX_CHUNK",
+        "SOLRL_BUILD_JSON_B64_CHUNK",
+    ):
+        if forbidden_marker in remote:
+            fail(f"AWS runner must not move bulk artifacts through EC2 console output: found {forbidden_marker}")
 
     if "authorize_security_group_ingress" in combined_runner:
         fail("AWS runner must not add inbound security group rules")
@@ -147,7 +164,10 @@ def main() -> int:
     for forbidden_env in ("AWS_ACCESS_KEY_ID: test", "AWS_SECRET_ACCESS_KEY: test", "LOCALSTACK_ENDPOINT:"):
         if forbidden_env in aws_runner_block:
             fail(f"aws-nitro-runner must not inherit LocalStack dummy AWS config: found {forbidden_env}")
-    for required_validation in ("validate_remote_hex", "validate_vsock_port", "validate_remote_token"):
+    for forbidden_compose in ("SYS_ADMIN", "seccomp=unconfined", "privileged: true", "nix-cache:/nix"):
+        if forbidden_compose in aws_runner_block:
+            fail(f"aws-nitro-runner Docker service should not need local build privileges: found {forbidden_compose}")
+    for required_validation in ("validate_remote_hex", "validate_vsock_port", "validate_remote_token", "validate_git_source"):
         require(runner, required_validation, f"AWS runner template renderer must validate {required_validation}")
     if "dt.UTC" in runner:
         fail("AWS runner must stay Python 3.10-compatible inside dev-shell; use dt.timezone.utc")

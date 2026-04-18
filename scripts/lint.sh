@@ -14,7 +14,14 @@ rustup default 1.88.0 >/dev/null
 rustup component add rustfmt clippy >/dev/null
 
 cargo fmt --all -- --check
+cargo fmt --manifest-path crates/solrl-nitro-worker/Cargo.toml -- --check
 cargo clippy --workspace --all-targets -- \
+  -D clippy::all \
+  -D clippy::unwrap_used \
+  -D clippy::expect_used \
+  -D clippy::panic \
+  -D clippy::todo
+cargo clippy --manifest-path crates/solrl-nitro-worker/Cargo.toml --all-targets -- \
   -D clippy::all \
   -D clippy::unwrap_used \
   -D clippy::expect_used \

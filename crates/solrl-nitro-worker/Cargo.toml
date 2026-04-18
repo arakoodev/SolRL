@@ -2,6 +2,9 @@
 name = "solrl-nitro-worker"
 version = "0.1.0"
 edition = "2021"
+description = "Minimal SolRL AWS Nitro NSM attestation worker"
+
+[workspace]
 
 [dependencies]
 aws-nitro-enclaves-nsm-api = "0.4.0"

@@ -111,7 +111,7 @@ Host laptop
 |    local chain for Anchor + Token-2022 tests               |
 |                                                            |
 |  localstack                                                |
-|    S3/IAM/Lambda/Dynamo-style AWS API tests where useful   |
+|    S3/Lambda/Dynamo-style AWS API tests where useful       |
 |                                                            |
 |  aws-test-runner                                           |
 |    runs Terraform tests against LocalStack                 |
@@ -127,8 +127,10 @@ Host laptop
 |                                                            |
 |  aws-nitro-runner                                          |
 |    real AWS gate, reads repo .env inside container         |
-|    launches one tagged EC2 parent, boots non-debug Nitro   |
-|    enclave, verifies NSM attestation, cleans up by tag     |
+|    launches one tagged EC2 parent, clones public Git ref   |
+|    on EC2, rebuilds EIF there, boots non-debug Nitro,      |
+|    verifies NSM attestation on EC2, prints one final       |
+|    console result, cleans up by exact run tags             |
 +------------------------------------------------------------+
 ```
 
@@ -142,6 +144,9 @@ Implemented approach:
 - `dev-shell` does not install the Docker CLI.
 - No service is privileged.
 - No `docker:dind` service exists in the default compose file.
+- `aws-nitro-runner` no longer needs local build privileges. The real smoke installs/runs Nix on the temporary EC2
+  parent, not inside the local Docker container. It still does not run Docker, mount the Docker socket, or use
+  `privileged: true`.
 
 This keeps the laptop rule clean: Docker and Docker Compose on the host, everything else inside containers.
 
@@ -155,9 +160,7 @@ Do not hide this. If implementation reaches a true DinD requirement, stop and as
 ## LocalStack Role
 
 Use LocalStack for local AWS API workflows:
-- S3-compatible artifact storage tests.
 - Terraform/IaC validation.
-- IAM-style config shape where LocalStack supports it.
 - Lambda/Step Functions/Dynamo only if the operator flow later needs them.
 
 AWS Prescriptive Guidance says LocalStack runs as a Docker container and helps test Terraform/IaC without provisioning real AWS resources. It also calls out that service feature coverage varies by service.
@@ -174,7 +177,6 @@ So the test split is:
 
 ```text
 LocalStack:
-  artifact bucket
   Terraform tests
   local AWS-like API integration
 
@@ -197,6 +199,10 @@ cleanup behavior. Do not add separate AWS smoke scripts.
 
 Required AWS safety invariants:
 - Every created AWS resource has `Project=SolRL` and `SolRLRunId=<run id>`.
+- The EC2 parent clones the configured public Git ref, installs Nix on EC2, rebuilds the EIF there, and verifies the
+  SHA-384 before booting it.
+- EC2 console output is final-only: no attestation blobs, build JSON, or chunked artifact transport. The local runner
+  waits for the instance to stop, then parses one `SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` block.
 - The runner creates no inbound security group rules and no SSH key pair.
 - Cleanup refuses to delete resources unless ownership tags match the active run.
 - The default AWS smoke does not create IAM roles, pass roles, use an instance profile, or depend on SSM.
@@ -704,13 +710,12 @@ Current Docker tests compile the program, run `solana-program-test` instruction 
 ### `localstack`
 
 Runs:
-- S3-compatible artifact tests.
 - Terraform tests.
 
 Default services:
 
 ```text
-SERVICES=s3,iam,sts
+SERVICES=s3,sts
 ```
 
 Only add more services when code needs them.
@@ -831,7 +836,6 @@ LocalStack tests should cover:
 - Content-addressed object key.
 - Retention metadata.
 - Terraform validation.
-- IAM policy shape where supported.
 
 LocalStack tests should not claim to cover:
 - Nitro enclave launch.

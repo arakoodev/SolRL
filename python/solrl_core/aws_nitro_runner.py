@@ -7,8 +7,10 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,7 +32,22 @@ AWS_ROOT_KEY = bytes.fromhex(AWS_ROOT_KEY_HEX)
 DEFAULT_AMI_NAME_FILTER = "amzn2-ami-kernel-5.10-hvm-*-x86_64-gp2"
 DEFAULT_INSTANCE_TYPE = "m5.xlarge"
 DEFAULT_REGION = "us-east-1"
+DEFAULT_ROOT_VOLUME_GIB = 64
 DEFAULT_VSOCK_PORT = 5005
+MAX_EC2_USER_DATA_BYTES = 16_384
+ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
+ROOT = Path(__file__).resolve().parents[2]
+FINAL_RESULT_REQUIRED_FIELDS = {
+    "SOLRL_STATUS",
+    "SOLRL_RUN_ID",
+    "SOLRL_GIT_REF",
+    "SOLRL_EIF_SHA384",
+    "SOLRL_NITRO_ROOT_SHA256",
+    "SOLRL_PCR0",
+    "SOLRL_PCR1",
+    "SOLRL_PCR2",
+    "SOLRL_PCR16",
+}
 
 
 class AwsNitroRunnerError(RuntimeError):
@@ -44,8 +61,10 @@ class RunnerConfig:
     name: str
     instance_type: str
     artifact_dir: Path
+    root_volume_gib: int = DEFAULT_ROOT_VOLUME_GIB
     vsock_port: int = DEFAULT_VSOCK_PORT
-    timeout_seconds: int = 3600
+    timeout_seconds: int = 7200
+    allow_existing_solrl: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,13 +76,21 @@ class DecodedAttestation:
     root_public_key: bytes
 
     def to_summary(self) -> dict[str, Any]:
+        root_sha256 = hashlib.sha256(self.root_public_key).hexdigest()
         return {
             "timestamp_ms": self.timestamp_ms,
             "pcrs": {str(k): v.hex() for k, v in sorted(self.pcrs.items())},
             "public_key": self.public_key.hex(),
             "user_data": self.user_data.hex(),
             "root_public_key": self.root_public_key.hex(),
+            "root_public_key_sha256": root_sha256,
         }
+
+
+@dataclass(frozen=True)
+class GitSource:
+    url: str
+    ref: str
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -104,7 +131,11 @@ def require_docker() -> None:
         )
 
 
-def make_config(run_id: str | None = None, artifact_root: Path = Path("artifacts/aws-nitro")) -> RunnerConfig:
+def make_config(
+    run_id: str | None = None,
+    artifact_root: Path = Path("artifacts/aws-nitro"),
+    allow_existing_solrl: bool = False,
+) -> RunnerConfig:
     generated_run_id = run_id or f"solrl-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
     name = f"SolRL-{generated_run_id}"
     return RunnerConfig(
@@ -113,7 +144,16 @@ def make_config(run_id: str | None = None, artifact_root: Path = Path("artifacts
         name=name,
         instance_type=os.environ.get("SOLRL_NITRO_INSTANCE_TYPE", DEFAULT_INSTANCE_TYPE),
         artifact_dir=artifact_root / generated_run_id,
+        root_volume_gib=int(os.environ.get("SOLRL_NITRO_ROOT_VOLUME_GIB", str(DEFAULT_ROOT_VOLUME_GIB))),
+        allow_existing_solrl=allow_existing_solrl,
     )
+
+
+def tag_value(tags: list[dict[str, str]], key: str) -> str:
+    for tag in tags:
+        if tag.get("Key") == key:
+            return tag.get("Value", "")
+    return ""
 
 
 def resource_tags(config: RunnerConfig, purpose: str = "nitro-smoke") -> list[dict[str, str]]:
@@ -142,71 +182,199 @@ def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def audit_resources(ec2: Any, run_id: str | None = None) -> dict[str, Any]:
+    tag_filter = (
+        {"Name": "tag:SolRLRunId", "Values": [run_id]}
+        if run_id
+        else {"Name": "tag:Project", "Values": ["SolRL"]}
+    )
+    reservations = ec2.describe_instances(
+        Filters=[tag_filter, {"Name": "instance-state-name", "Values": ACTIVE_INSTANCE_STATES}]
+    ).get("Reservations", [])
+    instances = [
+        {
+            "id": instance["InstanceId"],
+            "state": instance["State"]["Name"],
+            "run_id": tag_value(instance.get("Tags", []), "SolRLRunId"),
+            "name": tag_value(instance.get("Tags", []), "Name"),
+        }
+        for reservation in reservations
+        for instance in reservation.get("Instances", [])
+    ]
+    security_groups = [
+        {
+            "id": group["GroupId"],
+            "run_id": tag_value(group.get("Tags", []), "SolRLRunId"),
+            "name": tag_value(group.get("Tags", []), "Name"),
+        }
+        for group in ec2.describe_security_groups(Filters=[tag_filter]).get("SecurityGroups", [])
+    ]
+    volumes = [
+        {
+            "id": volume["VolumeId"],
+            "state": volume["State"],
+            "run_id": tag_value(volume.get("Tags", []), "SolRLRunId"),
+            "name": tag_value(volume.get("Tags", []), "Name"),
+        }
+        for volume in ec2.describe_volumes(Filters=[tag_filter]).get("Volumes", [])
+    ]
+    return {
+        "scope": {"run_id": run_id} if run_id else {"project": "SolRL"},
+        "instances": instances,
+        "security_groups": security_groups,
+        "volumes": volumes,
+    }
+
+
+def audit_counts(audit: dict[str, Any]) -> dict[str, int]:
+    return {
+        "instances": len(audit["instances"]),
+        "security_groups": len(audit["security_groups"]),
+        "volumes": len(audit["volumes"]),
+    }
+
+
+def audit_has_resources(audit: dict[str, Any]) -> bool:
+    return any(audit_counts(audit).values())
+
+
+def audit_lines(audit: dict[str, Any]) -> list[str]:
+    counts = audit_counts(audit)
+    scope = audit["scope"]
+    prefix = f"RUN[{scope['run_id']}]" if "run_id" in scope else "PROJECT[SolRL]"
+    lines = [
+        f"{prefix}_ACTIVE_OR_STOPPED_INSTANCES={counts['instances']}",
+        f"{prefix}_SECURITY_GROUPS={counts['security_groups']}",
+        f"{prefix}_VOLUMES={counts['volumes']}",
+    ]
+    for instance in audit["instances"]:
+        lines.append(
+            f"INSTANCE id={instance['id']} state={instance['state']} "
+            f"run_id={instance['run_id']} name={instance['name']}"
+        )
+    for group in audit["security_groups"]:
+        lines.append(f"SECURITY_GROUP id={group['id']} run_id={group['run_id']} name={group['name']}")
+    for volume in audit["volumes"]:
+        lines.append(
+            f"VOLUME id={volume['id']} state={volume['state']} "
+            f"run_id={volume['run_id']} name={volume['name']}"
+        )
+    return lines
+
+
+def _resource_tags_by_id(ec2: Any, resource_type: str, resource_id: str) -> list[dict[str, str]]:
+    if resource_type == "instance":
+        response = ec2.describe_instances(InstanceIds=[resource_id])
+        reservations = response.get("Reservations", [])
+        if not reservations or not reservations[0].get("Instances"):
+            return []
+        return reservations[0]["Instances"][0].get("Tags", [])
+    if resource_type == "security-group":
+        response = ec2.describe_security_groups(GroupIds=[resource_id])
+        groups = response.get("SecurityGroups", [])
+        return groups[0].get("Tags", []) if groups else []
+    if resource_type == "volume":
+        response = ec2.describe_volumes(VolumeIds=[resource_id])
+        volumes = response.get("Volumes", [])
+        return volumes[0].get("Tags", []) if volumes else []
+    raise AwsNitroRunnerError(f"unsupported cleanup resource type: {resource_type}")
+
+
+def cleanup_run_resources(ec2: Any, config: RunnerConfig, log: Any = print) -> dict[str, Any]:
+    audit = audit_resources(ec2, config.run_id)
+    terminated_instances: list[str] = []
+    deleted_security_groups: list[str] = []
+    deleted_volumes: list[str] = []
+
+    for instance in audit["instances"]:
+        instance_id = instance["id"]
+        tags = _resource_tags_by_id(ec2, "instance", instance_id)
+        if not tags_match(tags, config):
+            log(f"cleanup refusing instance {instance_id}; SolRL tags do not match")
+            continue
+        log(f"cleanup terminating tagged instance {instance_id}")
+        ec2.terminate_instances(InstanceIds=[instance_id])
+        terminated_instances.append(instance_id)
+    if terminated_instances:
+        ec2.get_waiter("instance_terminated").wait(
+            InstanceIds=terminated_instances,
+            WaiterConfig={"Delay": 15, "MaxAttempts": 80},
+        )
+
+    for group in audit["security_groups"]:
+        group_id = group["id"]
+        tags = _resource_tags_by_id(ec2, "security-group", group_id)
+        if not tags_match(tags, config):
+            log(f"cleanup refusing security group {group_id}; SolRL tags do not match")
+            continue
+        log(f"cleanup deleting tagged security group {group_id}")
+        for attempt in range(12):
+            try:
+                ec2.delete_security_group(GroupId=group_id)
+                deleted_security_groups.append(group_id)
+                break
+            except botocore.exceptions.ClientError as exc:
+                error = exc.response.get("Error", {})
+                if error.get("Code") != "DependencyViolation" or attempt == 11:
+                    raise
+                time.sleep(5)
+
+    refreshed = audit_resources(ec2, config.run_id)
+    for volume in refreshed["volumes"]:
+        volume_id = volume["id"]
+        if volume["state"] != "available":
+            log(f"cleanup leaving volume {volume_id}; state is {volume['state']}")
+            continue
+        tags = _resource_tags_by_id(ec2, "volume", volume_id)
+        if not tags_match(tags, config):
+            log(f"cleanup refusing volume {volume_id}; SolRL tags do not match")
+            continue
+        log(f"cleanup deleting tagged available volume {volume_id}")
+        ec2.delete_volume(VolumeId=volume_id)
+        deleted_volumes.append(volume_id)
+
+    return {
+        "terminated_instances": terminated_instances,
+        "deleted_security_groups": deleted_security_groups,
+        "deleted_volumes": deleted_volumes,
+        "remaining": audit_resources(ec2, config.run_id),
+    }
+
+
 def parse_remote_markers(stdout: str) -> dict[str, str]:
+    begin = stdout.rfind("SOLRL_RESULT_BEGIN")
+    end = stdout.rfind("SOLRL_RESULT_END")
+    if begin < 0 or end < 0 or end < begin:
+        raise AwsNitroRunnerError("remote Nitro command did not return a final SOLRL_RESULT block")
+
     markers: dict[str, str] = {}
-    attestation_candidates: dict[int, list[str]] = {}
-    for line in stdout.splitlines():
-        if "SOLRL_ATTESTATION_HEX_CHUNK=" in line:
-            chunk = line.split("SOLRL_ATTESTATION_HEX_CHUNK=", 1)[1].strip()
-            if ":" not in chunk:
-                continue
-            index, value = chunk.split(":", 1)
-            if not index.isdigit():
-                continue
-            attestation_candidates.setdefault(int(index), []).append(value)
-        elif "SOLRL_" in line and "=" in line:
+    block = stdout[begin:end].splitlines()
+    for line in block:
+        if line.startswith("SOLRL_") and "=" in line:
             marker = line.split("SOLRL_", 1)[1]
             key_suffix, value = marker.split("=", 1)
             key = f"SOLRL_{key_suffix}"
             markers[key] = value.strip()
-    if attestation_candidates:
-        try:
-            expected_chunks = int(markers.get("SOLRL_ATTESTATION_HEX_CHUNKS", "-1"))
-            chunk_width = int(markers.get("SOLRL_ATTESTATION_HEX_WIDTH", "-1"))
-        except ValueError as exc:
-            raise AwsNitroRunnerError("remote Nitro attestation chunk metadata is invalid") from exc
-        expected_indexes = set(range(expected_chunks))
-        actual_indexes = set(attestation_candidates)
-        if expected_chunks < 1 or actual_indexes != expected_indexes:
-            missing = sorted(expected_indexes - actual_indexes)
-            extra = sorted(actual_indexes - expected_indexes)
-            raise AwsNitroRunnerError(
-                f"remote Nitro attestation chunks incomplete; missing={missing}, extra={extra}"
-            )
-        if chunk_width < 2:
-            raise AwsNitroRunnerError("remote Nitro attestation chunk width is invalid")
-        accepted_chunks: list[str] = []
-        corrupt_indexes: list[int] = []
-        for index in range(expected_chunks):
-            valid_values = []
-            for value in attestation_candidates[index]:
-                is_hex = len(value) % 2 == 0 and all(char in "0123456789abcdefABCDEF" for char in value)
-                is_full_chunk = index < expected_chunks - 1 and len(value) == chunk_width
-                is_last_chunk = index == expected_chunks - 1 and 0 < len(value) <= chunk_width
-                if is_hex and (is_full_chunk or is_last_chunk):
-                    valid_values.append(value)
-            if not valid_values:
-                corrupt_indexes.append(index)
-                continue
-            accepted_chunks.append(valid_values[0])
-        if corrupt_indexes:
-            raise AwsNitroRunnerError(f"remote Nitro attestation chunks corrupt; indexes={corrupt_indexes}")
-        markers["SOLRL_ATTESTATION_HEX"] = "".join(accepted_chunks)
-    required = {
-        "SOLRL_STATUS",
-        "SOLRL_ATTESTATION_HEX",
-        "SOLRL_EXPECTED_USER_DATA_HEX",
-        "SOLRL_EXPECTED_PUBLIC_KEY_HEX",
-        "SOLRL_BUILD_JSON_B64",
-    }
-    missing = sorted(required - markers.keys())
+
+    missing = sorted({"SOLRL_STATUS"} - markers.keys())
     if missing:
         raise AwsNitroRunnerError(f"remote Nitro command did not return markers: {', '.join(missing)}")
+    if markers["SOLRL_STATUS"] == "FAILED":
+        phase = markers.get("SOLRL_PHASE", "unknown")
+        raise AwsNitroRunnerError(f"remote Nitro smoke failed during phase {phase}; see console-output.txt")
     if markers["SOLRL_STATUS"] != "OK":
         raise AwsNitroRunnerError(f"remote Nitro command returned status {markers['SOLRL_STATUS']}")
-    attestation_hex = markers["SOLRL_ATTESTATION_HEX"]
-    if len(attestation_hex) % 2 != 0 or any(char not in "0123456789abcdefABCDEF" for char in attestation_hex):
-        raise AwsNitroRunnerError("remote Nitro attestation marker is not valid hex")
+
+    missing = sorted(FINAL_RESULT_REQUIRED_FIELDS - markers.keys())
+    if missing:
+        raise AwsNitroRunnerError(f"remote Nitro OK result is missing markers: {', '.join(missing)}")
+    for key in ("SOLRL_EIF_SHA384", "SOLRL_PCR0", "SOLRL_PCR1", "SOLRL_PCR2", "SOLRL_PCR16"):
+        value = markers[key]
+        if len(value) != 96 or any(char not in "0123456789abcdefABCDEF" for char in value):
+            raise AwsNitroRunnerError(f"remote Nitro marker {key} must be 48-byte hex")
+    root_sha = markers["SOLRL_NITRO_ROOT_SHA256"]
+    if len(root_sha) != 64 or any(char not in "0123456789abcdefABCDEF" for char in root_sha):
+        raise AwsNitroRunnerError("remote Nitro root key hash marker must be 32-byte hex")
     return markers
 
 
@@ -326,11 +494,43 @@ def verify_attestation_document(
     )
 
 
+def _git_output(*args: str) -> str:
+    try:
+        return subprocess.check_output(["git", *args], cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise AwsNitroRunnerError(f"could not resolve git source with git {' '.join(args)}") from exc
+
+
+def public_clone_url(remote_url: str) -> str:
+    if remote_url.startswith("git@github.com:"):
+        return "https://github.com/" + remote_url.removeprefix("git@github.com:")
+    if remote_url.startswith("ssh://git@github.com/"):
+        return "https://github.com/" + remote_url.removeprefix("ssh://git@github.com/")
+    return remote_url
+
+
+def validate_git_source(source: GitSource) -> None:
+    parsed = urllib.parse.urlparse(source.url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise AwsNitroRunnerError("SOLRL_NITRO_GIT_URL must be a public HTTPS clone URL without credentials")
+    if not source.ref or not all(char.isalnum() or char in "._/-" for char in source.ref):
+        raise AwsNitroRunnerError("SOLRL_NITRO_GIT_REF must contain only letters, numbers, slash, dot, underscore, or dash")
+
+
+def resolve_git_source() -> GitSource:
+    url = os.environ.get("SOLRL_NITRO_GIT_URL") or public_clone_url(_git_output("remote", "get-url", "origin"))
+    ref = os.environ.get("SOLRL_NITRO_GIT_REF") or _git_output("rev-parse", "HEAD")
+    source = GitSource(url=url, ref=ref)
+    validate_git_source(source)
+    return source
+
+
 class AwsNitroRunner:
     def __init__(self, config: RunnerConfig, session: boto3.Session) -> None:
         self.config = config
         self.ec2 = session.client("ec2")
         self.sts = session.client("sts")
+        self.account_id = ""
         self.instance_id = ""
         self.security_group_id = ""
 
@@ -343,38 +543,71 @@ class AwsNitroRunner:
 
     def smoke(self) -> None:
         self.config.artifact_dir.mkdir(parents=True, exist_ok=True)
+        post_audit = False
         try:
+            self._preflight_audit()
+            post_audit = True
             self._smoke()
-        except botocore.exceptions.ClientError as exc:
-            error = exc.response.get("Error", {})
-            code = error.get("Code", "Unknown")
-            message = error.get("Message", str(exc))
-            raise AwsNitroRunnerError(f"AWS API failed with {code}: {message}") from exc
+        except BaseException as exc:
+            run_error = exc
+        else:
+            run_error = None
         finally:
-            self.cleanup()
+            if self.instance_id or self.security_group_id:
+                self.cleanup()
+            if post_audit:
+                self._post_audit()
+        if run_error is not None:
+            if isinstance(run_error, botocore.exceptions.ClientError):
+                error = run_error.response.get("Error", {})
+                code = error.get("Code", "Unknown")
+                message = error.get("Message", str(run_error))
+                raise AwsNitroRunnerError(f"AWS API failed with {code}: {message}") from run_error
+            raise run_error
+
+    def _preflight_audit(self) -> None:
+        audit = audit_resources(self.ec2)
+        self._write_json("preflight-project-audit.json", audit)
+        for line in audit_lines(audit):
+            self.log(f"preflight {line}")
+        if audit_has_resources(audit) and not self.config.allow_existing_solrl:
+            raise AwsNitroRunnerError(
+                "Preflight found existing active/stopped Project=SolRL resources. "
+                "Refusing to launch in a shared AWS account. Pass --allow-existing-solrl to override."
+            )
+
+    def _post_audit(self) -> None:
+        run_audit = audit_resources(self.ec2, self.config.run_id)
+        project_audit = audit_resources(self.ec2)
+        self._write_json("postaudit-run.json", run_audit)
+        self._write_json("postaudit-project.json", project_audit)
+        for line in audit_lines(run_audit):
+            self.log(f"postaudit {line}")
+        for line in audit_lines(project_audit):
+            self.log(f"postaudit {line}")
+        if audit_has_resources(run_audit):
+            raise AwsNitroRunnerError("Post-audit found resources left over for this exact SolRLRunId")
+        if audit_has_resources(project_audit) and not self.config.allow_existing_solrl:
+            raise AwsNitroRunnerError("Post-audit found active/stopped Project=SolRL resources after cleanup")
 
     def _smoke(self) -> None:
         caller = self.sts.get_caller_identity()
+        self.account_id = caller["Account"]
         self._write_json("caller.json", {"Account": caller["Account"], "Arn": caller["Arn"]})
         self.log(f"authenticated AWS account: {caller['Account']}")
+        git_source = resolve_git_source()
+        self._write_json("git-source.json", {"url": git_source.url, "ref": git_source.ref})
+        self.log(f"remote EC2 build source: {git_source.url}@{git_source.ref}")
 
         vpc_id, subnet_id = self._default_network()
         ami_id = self._default_ami()
         self._create_security_group(vpc_id)
-        self._launch_instance(ami_id, subnet_id)
+        self._launch_instance(ami_id, subnet_id, git_source)
         self._wait_for_instance()
-        stdout = self._wait_for_console_smoke()
+        stdout = self._wait_for_final_console_result()
         markers = parse_remote_markers(stdout)
         self._persist_remote_outputs(markers)
-
-        attestation = bytes.fromhex(markers["SOLRL_ATTESTATION_HEX"])
-        decoded = verify_attestation_document(
-            attestation,
-            bytes.fromhex(markers["SOLRL_EXPECTED_USER_DATA_HEX"]),
-            bytes.fromhex(markers["SOLRL_EXPECTED_PUBLIC_KEY_HEX"]),
-        )
-        self._write_json("attestation-summary.json", decoded.to_summary())
-        self.log("Nitro attestation verified: AWS root, COSE signature, PCRs, user_data, public_key")
+        self.log("remote EC2 verified Nitro attestation and printed final result")
 
     def _default_network(self) -> tuple[str, str]:
         response = self.ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
@@ -424,13 +657,18 @@ class AwsNitroRunner:
         self.security_group_id = response["GroupId"]
         self.log(f"security group: {self.security_group_id}")
 
-    def _launch_instance(self, ami_id: str, subnet_id: str) -> None:
-        self.log(f"launching tagged enclave-enabled EC2 parent ({self.config.instance_type})")
+    def _launch_instance(self, ami_id: str, subnet_id: str, git_source: GitSource) -> None:
+        root_device_name = self._ami_root_device_name(ami_id)
+        self.log(
+            f"launching tagged enclave-enabled EC2 parent ({self.config.instance_type}, "
+            f"{self.config.root_volume_gib} GiB root)"
+        )
         user_data = remote_smoke_script(
             self.config,
             sha256_hex(f"{self.config.run_id}:solrl-claim-v1"),
             sha256_hex(f"{self.config.run_id}:worker-public-key"),
             sha256_hex(f"{self.config.run_id}:nonce"),
+            git_source,
         )
         self._write_text("user-data.sh", user_data)
         response = self.ec2.run_instances(
@@ -447,13 +685,30 @@ class AwsNitroRunner:
                 }
             ],
             EnclaveOptions={"Enabled": True},
+            InstanceInitiatedShutdownBehavior="stop",
             MetadataOptions={"HttpTokens": "required", "HttpEndpoint": "enabled"},
+            BlockDeviceMappings=[
+                {
+                    "DeviceName": root_device_name,
+                    "Ebs": {
+                        "VolumeSize": self.config.root_volume_gib,
+                        "VolumeType": "gp3",
+                        "DeleteOnTermination": True,
+                    },
+                }
+            ],
             TagSpecifications=tag_specifications(self.config, ["instance", "volume", "network-interface"]),
             UserData=user_data,
         )
         self._write_json("run-instances.json", response)
         self.instance_id = response["Instances"][0]["InstanceId"]
         self.log(f"instance: {self.instance_id}")
+
+    def _ami_root_device_name(self, ami_id: str) -> str:
+        images = self.ec2.describe_images(ImageIds=[ami_id]).get("Images", [])
+        if not images:
+            raise AwsNitroRunnerError(f"Unable to describe AMI root device for {ami_id}")
+        return images[0].get("RootDeviceName") or "/dev/xvda"
 
     def _wait_for_instance(self) -> None:
         self.log("waiting for EC2 status checks")
@@ -463,61 +718,44 @@ class AwsNitroRunner:
         )
         self.log("EC2 status checks passed")
 
-    def _wait_for_console_smoke(self) -> str:
-        self.log("waiting for SolRL markers in EC2 console output")
+    def _wait_for_final_console_result(self) -> str:
+        self.log("waiting for EC2 user-data to finish and stop the instance")
         deadline = time.time() + self.config.timeout_seconds
-        last_output = ""
         while time.time() < deadline:
+            response = self.ec2.describe_instances(InstanceIds=[self.instance_id])
+            reservations = response.get("Reservations", [])
+            instances = [item for reservation in reservations for item in reservation.get("Instances", [])]
+            if not instances:
+                raise AwsNitroRunnerError(f"instance {self.instance_id} disappeared before final console result")
+            state = instances[0]["State"]["Name"]
+            if state in {"stopped", "terminated"}:
+                break
+            time.sleep(15)
+        else:
+            raise AwsNitroRunnerError("timed out waiting for EC2 instance to finish Nitro smoke")
+
+        self.log("instance finished; reading final EC2 console output")
+        last_output = ""
+        for _attempt in range(12):
             response = self.ec2.get_console_output(InstanceId=self.instance_id, Latest=True)
             output = response.get("Output", "") or ""
-            if output and output != last_output:
+            if output:
                 last_output = output
                 self._write_text("console-output.txt", output)
-            if "SOLRL_REMOTE_FAILED=" in output:
-                raise AwsNitroRunnerError("remote Nitro smoke failed; see artifacts console-output.txt")
-            if "SOLRL_STATUS=OK" in output:
-                return output
-            time.sleep(15)
+                if "SOLRL_RESULT_BEGIN" in output and "SOLRL_RESULT_END" in output:
+                    return output
+            time.sleep(10)
         self._write_text("console-output.txt", last_output)
-        raise AwsNitroRunnerError("timed out waiting for SolRL markers in EC2 console output")
+        raise AwsNitroRunnerError("remote Nitro smoke did not publish a final SOLRL_RESULT block")
 
     def _persist_remote_outputs(self, markers: dict[str, str]) -> None:
-        self._write_text("attestation.hex", markers["SOLRL_ATTESTATION_HEX"] + "\n")
-        build_json = base64.b64decode(markers["SOLRL_BUILD_JSON_B64"])
-        self._write_text("nitro-build.json", build_json.decode("utf-8"))
-        self._write_json("remote-markers.json", {k: v for k, v in markers.items() if k != "SOLRL_ATTESTATION_HEX"})
+        self._write_json("remote-markers.json", markers)
+        self._write_text("eif-sha384.txt", markers["SOLRL_EIF_SHA384"] + "\n")
 
     def cleanup(self) -> None:
         self.log(f"cleanup starting for run id {self.config.run_id}")
-        if self.instance_id:
-            if self._instance_tags_match():
-                self.log(f"terminating tagged instance {self.instance_id}")
-                self.ec2.terminate_instances(InstanceIds=[self.instance_id])
-                self.ec2.get_waiter("instance_terminated").wait(
-                    InstanceIds=[self.instance_id],
-                    WaiterConfig={"Delay": 15, "MaxAttempts": 80},
-                )
-            else:
-                self.log(f"refusing to terminate {self.instance_id}; SolRL tags do not match")
-        if self.security_group_id:
-            if self._security_group_tags_match():
-                self.log(f"deleting tagged security group {self.security_group_id}")
-                try:
-                    self.ec2.delete_security_group(GroupId=self.security_group_id)
-                except botocore.exceptions.ClientError as exc:
-                    self.log(f"security group delete failed: {exc}")
-            else:
-                self.log(f"refusing to delete {self.security_group_id}; SolRL tags do not match")
+        cleanup_run_resources(self.ec2, self.config, self.log)
         self.log("cleanup finished")
-
-    def _instance_tags_match(self) -> bool:
-        response = self.ec2.describe_instances(InstanceIds=[self.instance_id])
-        tags = response["Reservations"][0]["Instances"][0].get("Tags", [])
-        return tags_match(tags, self.config)
-
-    def _security_group_tags_match(self) -> bool:
-        response = self.ec2.describe_security_groups(GroupIds=[self.security_group_id])
-        return tags_match(response["SecurityGroups"][0].get("Tags", []), self.config)
 
     def _write_json(self, name: str, value: Any) -> None:
         self.config.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -536,13 +774,14 @@ def template_text(name: str) -> str:
     return (TEMPLATE_DIR / name).read_text(encoding="utf-8")
 
 
-def template_b64(name: str) -> str:
-    return base64.b64encode((TEMPLATE_DIR / name).read_bytes()).decode("ascii")
-
-
 def validate_remote_token(name: str, value: str) -> None:
     if not value or not all(char.isalnum() or char in "._-" for char in value):
         raise AwsNitroRunnerError(f"{name} must contain only letters, numbers, dot, underscore, or dash")
+
+
+def validate_remote_ref(name: str, value: str) -> None:
+    if not value or not all(char.isalnum() or char in "._/-" for char in value):
+        raise AwsNitroRunnerError(f"{name} must contain only letters, numbers, slash, dot, underscore, or dash")
 
 
 def validate_remote_hex(name: str, value: str) -> None:
@@ -555,16 +794,23 @@ def validate_vsock_port(port: int) -> None:
         raise AwsNitroRunnerError("vsock_port must be between 1 and 65535")
 
 
-def remote_smoke_script(config: RunnerConfig, user_data_hex: str, public_key_hex: str, nonce_hex: str) -> str:
+def remote_smoke_script(
+    config: RunnerConfig,
+    user_data_hex: str,
+    public_key_hex: str,
+    nonce_hex: str,
+    git_source: GitSource,
+) -> str:
     validate_remote_token("run_id", config.run_id)
     validate_remote_hex("user_data_hex", user_data_hex)
     validate_remote_hex("public_key_hex", public_key_hex)
     validate_remote_hex("nonce_hex", nonce_hex)
+    validate_git_source(git_source)
+    validate_remote_ref("git_ref", git_source.ref)
     validate_vsock_port(config.vsock_port)
     replacements = {
-        "__CARGO_TOML_B64__": template_b64("worker-Cargo.toml"),
-        "__MAIN_RS_B64__": template_b64("worker-main.rs"),
-        "__DOCKERFILE_B64__": template_b64("worker-Dockerfile"),
+        "__GIT_URL_B64__": base64.b64encode(git_source.url.encode("utf-8")).decode("ascii"),
+        "__GIT_REF__": git_source.ref,
         "__USER_DATA_HEX__": user_data_hex,
         "__PUBLIC_KEY_HEX__": public_key_hex,
         "__NONCE_HEX__": nonce_hex,
@@ -577,14 +823,31 @@ def remote_smoke_script(config: RunnerConfig, user_data_hex: str, public_key_hex
     unresolved = [token for token in replacements if token in script]
     if unresolved:
         raise AwsNitroRunnerError(f"remote Nitro template has unresolved tokens: {', '.join(unresolved)}")
+    size = len(script.encode("utf-8"))
+    if size > MAX_EC2_USER_DATA_BYTES:
+        raise AwsNitroRunnerError(
+            f"remote Nitro user-data is {size} bytes; EC2 limit is {MAX_EC2_USER_DATA_BYTES} bytes"
+        )
     return script
+
+
+def run_verify_attestation(args: argparse.Namespace) -> int:
+    document = Path(args.attestation_hex_path).read_text(encoding="utf-8").strip()
+    decoded = verify_attestation_document(
+        bytes.fromhex(document),
+        bytes.fromhex(args.expected_user_data_hex),
+        bytes.fromhex(args.expected_public_key_hex),
+    )
+    summary = decoded.to_summary()
+    Path(args.summary_json).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return 0
 
 
 def run_smoke(args: argparse.Namespace) -> int:
     require_docker()
     load_dotenv()
     normalise_aws_env()
-    config = make_config(args.run_id, Path(args.artifact_root))
+    config = make_config(args.run_id, Path(args.artifact_root), allow_existing_solrl=args.allow_existing_solrl)
     session = boto3.Session(region_name=config.region)
     runner = AwsNitroRunner(config, session)
     runner.log(f"run id: {config.run_id}")
@@ -595,13 +858,74 @@ def run_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_audit(args: argparse.Namespace) -> int:
+    require_docker()
+    load_dotenv()
+    normalise_aws_env()
+    session = boto3.Session(region_name=os.environ["AWS_DEFAULT_REGION"])
+    caller = session.client("sts").get_caller_identity()
+    print(f"AWS_ACCOUNT={caller['Account']}")
+    print(f"AWS_ARN={caller['Arn']}")
+    audit = audit_resources(session.client("ec2"), args.run_id)
+    for line in audit_lines(audit):
+        print(line)
+    if args.json:
+        print(json.dumps(audit, indent=2, sort_keys=True))
+    return 0
+
+
+def run_cleanup(args: argparse.Namespace) -> int:
+    require_docker()
+    load_dotenv()
+    normalise_aws_env()
+    if not args.run_id:
+        raise AwsNitroRunnerError("cleanup requires --run-id")
+    config = make_config(args.run_id, Path(args.artifact_root), allow_existing_solrl=True)
+    session = boto3.Session(region_name=config.region)
+    caller = session.client("sts").get_caller_identity()
+    print(f"AWS_ACCOUNT={caller['Account']}")
+    print(f"AWS_ARN={caller['Arn']}")
+    ec2 = session.client("ec2")
+    before = audit_resources(ec2, config.run_id)
+    for line in audit_lines(before):
+        print(f"before {line}")
+    result = cleanup_run_resources(ec2, config)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    after = result["remaining"]
+    for line in audit_lines(after):
+        print(f"after {line}")
+    if audit_has_resources(after):
+        raise AwsNitroRunnerError("cleanup finished with exact run resources still present")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SolRL AWS Nitro runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    verify = subparsers.add_parser("verify-attestation", help=argparse.SUPPRESS)
+    verify.add_argument("--attestation-hex-path", required=True)
+    verify.add_argument("--expected-user-data-hex", required=True)
+    verify.add_argument("--expected-public-key-hex", required=True)
+    verify.add_argument("--summary-json", required=True)
+    verify.set_defaults(func=run_verify_attestation)
     smoke = subparsers.add_parser("smoke", help="run the real AWS Nitro attestation smoke")
     smoke.add_argument("--run-id", default=os.environ.get("SOLRL_RUN_ID"))
     smoke.add_argument("--artifact-root", default=os.environ.get("SOLRL_AWS_ARTIFACT_ROOT", "artifacts/aws-nitro"))
+    smoke.add_argument(
+        "--allow-existing-solrl",
+        action="store_true",
+        help="allow launch when other active/stopped Project=SolRL resources already exist",
+    )
     smoke.set_defaults(func=run_smoke)
+    audit = subparsers.add_parser("audit", help="read-only audit of SolRL-tagged AWS resources")
+    audit.add_argument("--scope", choices=["project"], default="project")
+    audit.add_argument("--run-id")
+    audit.add_argument("--json", action="store_true")
+    audit.set_defaults(func=run_audit)
+    cleanup = subparsers.add_parser("cleanup", help="delete only resources tagged with an exact SolRL run id")
+    cleanup.add_argument("--run-id", required=True)
+    cleanup.add_argument("--artifact-root", default=os.environ.get("SOLRL_AWS_ARTIFACT_ROOT", "artifacts/aws-nitro"))
+    cleanup.set_defaults(func=run_cleanup)
     return parser
 
 
