@@ -7,6 +7,7 @@ import pytest
 
 from solrl_core.aws_nitro_runner import (
     AwsNitroRunnerError,
+    RunnerConfig,
     TEMPLATE_DIR,
     make_config,
     normalise_aws_env,
@@ -183,4 +184,29 @@ def test_remote_script_rejects_shell_unsafe_run_id() -> None:
     config = make_config("solrl-test;rm", Path("artifacts/test"))
 
     with pytest.raises(AwsNitroRunnerError, match="run_id"):
+        remote_smoke_script(config, "aa", "bb", "cc")
+
+
+def test_remote_script_rejects_non_hex_template_values() -> None:
+    config = make_config("solrl-test", Path("artifacts/test"))
+
+    with pytest.raises(AwsNitroRunnerError, match="user_data_hex"):
+        remote_smoke_script(config, "aa;rm", "bb", "cc")
+    with pytest.raises(AwsNitroRunnerError, match="public_key_hex"):
+        remote_smoke_script(config, "aa", "not-hex", "cc")
+    with pytest.raises(AwsNitroRunnerError, match="nonce_hex"):
+        remote_smoke_script(config, "aa", "bb", "c")
+
+
+def test_remote_script_rejects_invalid_vsock_port() -> None:
+    config = RunnerConfig(
+        region="us-east-1",
+        run_id="solrl-test",
+        name="SolRL-test",
+        instance_type="m5.xlarge",
+        artifact_dir=Path("artifacts/test"),
+        vsock_port=70_000,
+    )
+
+    with pytest.raises(AwsNitroRunnerError, match="vsock_port"):
         remote_smoke_script(config, "aa", "bb", "cc")

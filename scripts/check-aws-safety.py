@@ -143,6 +143,12 @@ def main() -> int:
             fail(f"AWS runner default path must not depend on IAM or SSM: found {forbidden}")
     if "env_file:" in compose and ".env" in compose:
         fail("docker-compose.yml must not load .env through env_file; the runner reads it without exposing secrets")
+    aws_runner_block = compose.split("aws-nitro-runner:", 1)[1].split("\n  harbor-runner:", 1)[0]
+    for forbidden_env in ("AWS_ACCESS_KEY_ID: test", "AWS_SECRET_ACCESS_KEY: test", "LOCALSTACK_ENDPOINT:"):
+        if forbidden_env in aws_runner_block:
+            fail(f"aws-nitro-runner must not inherit LocalStack dummy AWS config: found {forbidden_env}")
+    for required_validation in ("validate_remote_hex", "validate_vsock_port", "validate_remote_token"):
+        require(runner, required_validation, f"AWS runner template renderer must validate {required_validation}")
     if "dt.UTC" in runner:
         fail("AWS runner must stay Python 3.10-compatible inside dev-shell; use dt.timezone.utc")
 

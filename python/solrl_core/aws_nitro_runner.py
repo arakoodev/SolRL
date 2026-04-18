@@ -545,8 +545,22 @@ def validate_remote_token(name: str, value: str) -> None:
         raise AwsNitroRunnerError(f"{name} must contain only letters, numbers, dot, underscore, or dash")
 
 
+def validate_remote_hex(name: str, value: str) -> None:
+    if not value or len(value) % 2 != 0 or not all(char in "0123456789abcdefABCDEF" for char in value):
+        raise AwsNitroRunnerError(f"{name} must be non-empty even-length hex")
+
+
+def validate_vsock_port(port: int) -> None:
+    if port < 1 or port > 65_535:
+        raise AwsNitroRunnerError("vsock_port must be between 1 and 65535")
+
+
 def remote_smoke_script(config: RunnerConfig, user_data_hex: str, public_key_hex: str, nonce_hex: str) -> str:
     validate_remote_token("run_id", config.run_id)
+    validate_remote_hex("user_data_hex", user_data_hex)
+    validate_remote_hex("public_key_hex", public_key_hex)
+    validate_remote_hex("nonce_hex", nonce_hex)
+    validate_vsock_port(config.vsock_port)
     replacements = {
         "__CARGO_TOML_B64__": template_b64("worker-Cargo.toml"),
         "__MAIN_RS_B64__": template_b64("worker-main.rs"),
