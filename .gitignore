@@ -3,10 +3,20 @@
 .env.*
 !.env.example
 !.env.sample
+.envrc
+.direnv/
+
+# Local AI tool state. Keep repo skills tracked.
+.claude/settings.local.json
+.claude/**/settings.local.json
+.gemini/settings.json
+.gemini/tmp/
+.codex/
 
 # Generated protocol artifacts and smoke-test evidence
 artifacts/*
 !artifacts/.gitkeep
+*.log
 
 # Vendored upstream repos used for local research, not committed product source
 vendor/
@@ -19,12 +29,20 @@ target/
 *.pdb
 **/mutants.out*/
 
+# Nix
+result
+result-*
+.nix-profile
+
 # Node
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.pnpm-store/
+dist/
+build/
 
 # Python
 __pycache__/
@@ -34,17 +52,28 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.pyre/
+.nox/
+.tox/
+.hypothesis/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
+.pytest_cache/
 .venv/
 venv/
+build/
+dist/
+*.egg-info/
 
 # Terraform local state and plugin cache. Keep .terraform.lock.hcl tracked.
 .terraform/
 **/.terraform/
 *.tfstate
 *.tfstate.*
+*.tfplan
+tfplan
 crash.log
 crash.*.log
 override.tf
@@ -55,6 +84,15 @@ override.tf.json
 # Solana local validator state
 test-ledger/
 ledger/
+.anchor/
+*.keypair
+*.pem
+*.key
+
+# AWS CLI and SDK scratch files must stay local.
+.aws/
+awscliv2.zip
+aws/
 
 # Editor and OS noise
 .DS_Store
