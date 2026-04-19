@@ -8,6 +8,19 @@ The local implementation proves the protocol wiring with mocks:
 mock worker -> mock attestation -> verifier signs ClaimV1 -> hook simulator pays -> replay fails
 ```
 
+Use the local MVP path like this:
+
+```bash
+docker compose run --rm --no-deps dev-shell ./scripts/e2e-local-mock.sh
+```
+
+That script drives the first-class CLI. Same flow, fewer ways to accidentally test a different product:
+
+```bash
+docker compose run --rm --no-deps harbor-runner \
+  python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
+```
+
 The Anchor program now compiles the real registry path too:
 
 ```text
@@ -174,6 +187,36 @@ anchor build --no-idl
 The current Anchor instruction tests cover registry bootstrap, verifier policy binding, operator auth on leases, on-chain PCR16 computation, Token-2022 extra-account metadata initialization, and stake-withdrawal guard rails. The Python mock e2e covers the full off-chain protocol shape, then runs the registry instruction tests in the same Docker entrypoint.
 
 One honest remaining gap: there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. V1 verifies claims in `settle_claim`, arms a one-use `TransferGuard`, flushes it before the CPI, and requires the hook to consume that guard. Full hook-side claim verification still needs a PDA seed redesign so the hook can derive the job, lease, receipt, and policy graph from the transfer inputs.
+
+## Verifier Service
+
+The mock verifier can run as a small HTTP service:
+
+```bash
+docker compose up verifier-service
+curl -fsS http://localhost:8787/healthz
+```
+
+It exposes:
+
+```text
+GET  /healthz
+POST /verify/mock
+```
+
+`POST /verify/mock` accepts a mock Nitro attestation and ClaimV1 context, checks PCR and user-data binding, and returns the verifier signature. This is not the persistent production verifier enclave yet. It is the long-running service shape the operator path can call while real Nitro proof stays on `python -m solrl_core.aws_nitro_runner`.
+
+## Harbor Import Path
+
+Harbor supports custom environments through import paths. SolRL ships this one:
+
+```text
+solrl_harbor.nitro_environment:NitroEnvironment
+```
+
+Local mode implements Harbor's environment method surface over a deterministic workspace under `artifacts/harbor-nitro/<session_id>`. It supports `start`, `exec`, upload/download, file checks, and `stop`.
+
+AWS mode intentionally errors right now. Production Harbor-over-Nitro still needs the VSOCK worker RPC path and the worker EIF that carries the trusted Harbor runner.
 
 ## Real Nitro Smoke
 

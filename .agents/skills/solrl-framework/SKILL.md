@@ -82,6 +82,14 @@ When touching ClaimV1, PCR16, settlement, or slashing:
 3. Keep signed fields verified against on-chain state. A signed field that is never checked is a replay or forgery bug waiting for a Friday afternoon.
 4. Run schema and registry lints through `docker compose run --rm lint`.
 
+When touching the MVP command surface, verifier API, or Harbor import path:
+
+1. Keep the local demo on `python -m solrl_core.cli local-mock`.
+2. Keep the verifier API on `python -m solrl_core.verifier_service`.
+3. Keep the Harbor import path `solrl_harbor.nitro_environment:NitroEnvironment` documented.
+4. Update `scripts/check-mvp-entrypoints.py` if the shape intentionally changes.
+5. Run `docker compose run --rm --no-deps harbor-runner pytest -q tests/test_cli.py tests/test_verifier_service.py tests/test_harbor_nitro_environment.py`.
+
 When touching Docker:
 
 1. Keep `SOLRL_IN_DOCKER=1` for services that must refuse host execution.

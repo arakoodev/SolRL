@@ -10,7 +10,7 @@ python/solrl_core/mock_worker.py
     |
     | emits mock-nitro-attestation-v1
     v
-python/solrl_core/mock_verifier.py
+python/solrl_core/verifier_service.py or python/solrl_core/mock_verifier.py
     |
     | signs canonical ClaimV1 bytes
     v
@@ -22,6 +22,36 @@ tests/test_claim_flow.py
 ```
 
 This proves the protocol shape without pretending to be Nitro.
+
+The single command path is:
+
+```text
+scripts/e2e-local-mock.sh
+    |
+    v
+python -m solrl_core.cli local-mock
+    |
+    +--> mock worker
+    +--> verifier signing
+    +--> hook simulator payout
+    +--> replay rejection
+    +--> registry instruction tests
+```
+
+## Harbor Environment Surface
+
+```text
+Harbor EnvironmentFactory
+    |
+    | import_path="solrl_harbor.nitro_environment:NitroEnvironment"
+    v
+python/solrl_harbor/nitro_environment.py
+    |
+    +--> local mode: deterministic workspace transport
+    +--> aws mode: rejected until VSOCK worker RPC is implemented
+```
+
+Do not fork Harbor first. The import-path class is the integration seam.
 
 ## Real Registry Flow
 

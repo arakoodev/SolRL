@@ -67,5 +67,6 @@ Relevant checks:
 - `scripts/check-token2022-wiring.py`
 - `scripts/check-aws-safety.py`
 - `scripts/check-docker-boundary.sh`
+- `scripts/check-mvp-entrypoints.py`
 
 When fixing a bug that should never happen again, add a lint or regression test in the same change. This repo already paid the tuition. Do not pay it twice.

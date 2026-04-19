@@ -337,6 +337,9 @@ Implemented:
 - Token-2022 transfer hook guard shape.
 - Slashing path that moves stake to treasury.
 - Stake withdrawal guard rails.
+- First-class local MVP command: `python -m solrl_core.cli local-mock`.
+- Long-running mock verifier service: `python -m solrl_core.verifier_service`.
+- Harbor import path: `solrl_harbor.nitro_environment:NitroEnvironment`.
 - Docker lints for AWS safety, schema parity, Token-2022 wiring, and no Docker-in-Docker.
 - Real AWS Nitro smoke runner that launches tagged Nitro-enabled EC2 and boots a Nix-built EIF path.
 
@@ -350,7 +353,7 @@ The production network is not done.
 
 Not done:
 
-- Production Harbor plugin.
+- Production Harbor-over-Nitro execution.
 - Production Harbor Nitro EIF.
 - Persistent verifier enclave service.
 - Full Token-2022 local-validator transaction proving hook invocation end-to-end.
@@ -541,4 +544,3 @@ one slash path
 Then put it in front of agent teams.
 
 The feedback loop is the company.
-

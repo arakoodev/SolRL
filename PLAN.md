@@ -296,12 +296,15 @@ Implemented now:
 - On-chain PCR16 recomputation from `Job`, `Lease`, `Operator`, and claim nonce
 - Lease expiry cleanup instruction
 - Strict Python hash/pubkey parsing, no silent fallback hashing
+- First-class local MVP CLI: `python -m solrl_core.cli local-mock`
+- Long-running mock verifier service: `python -m solrl_core.verifier_service`
+- Harbor import-path environment surface: `solrl_harbor.nitro_environment:NitroEnvironment`
 
 Not implemented yet:
 - Full local-validator instruction test that proves Token-2022 calls the hook end-to-end.
 - Full hook-as-verifier mode. Token-2022 hook execute data only carries `amount`, and the mint-wide `ExtraAccountMetaList` can only pass accounts resolvable from source, mint, destination, owner, instruction data, or prior resolved accounts. The current job PDA graph is not derivable from those values. V1 therefore verifies the claim in `settle_claim`, arms a scoped `TransferGuard`, and requires the hook to consume it.
 - Anchor IDL generation. `anchor build --no-idl` passes; full IDL generation currently hits an Anchor `0.30.1` / `proc-macro2` compatibility problem.
-- Production Harbor Nitro environment plugin.
+- Production Harbor-over-Nitro execution. The import-path class exists, but AWS mode intentionally errors until the VSOCK worker RPC path is wired.
 - Production Harbor Nitro EIF. The current real AWS gate boots a minimal SolRL worker EIF for NSM attestation smoke.
 
 ### `Config`
@@ -647,6 +650,11 @@ V1 deterministic reward:
 - no LLM judge
 - no internet
 
+Current implementation:
+- `solrl_harbor.nitro_environment:NitroEnvironment` exists and implements Harbor's environment method surface.
+- Local mode runs commands in a deterministic workspace under `artifacts/harbor-nitro/<session_id>`.
+- AWS mode deliberately errors until the production VSOCK worker RPC is wired.
+
 ## Docker Compose Services
 
 Implemented Docker files:
@@ -740,6 +748,23 @@ Against LocalStack endpoints.
 
 Runs Marlin verifier tests and SolRL `ClaimV1` signing tests against fixtures.
 
+### `verifier-service`
+
+Runs:
+
+```bash
+python -m solrl_core.verifier_service --host 0.0.0.0 --port 8787 --config solrl.toml
+```
+
+Endpoints:
+
+```text
+GET  /healthz
+POST /verify/mock
+```
+
+This is the service interface the operator path can call. V1 still uses mock attestations here. Real Nitro proof remains in `aws_nitro_runner`.
+
 ### `worker-mock`
 
 Runs:
@@ -806,6 +831,8 @@ Current test reality:
 - Rust and Python tests share a ClaimV1 golden vector.
 - Python tests cover canonical ClaimV1 signing, PCR16 composition, replay rejection, wrong cluster rejection, and slash claim signing.
 - `scripts/e2e-local-mock.sh` proves the local worker -> verifier -> hook simulator path.
+- `solrl_core.verifier_service` has HTTP tests for valid proof signing and tampered claim rejection.
+- `solrl_harbor.nitro_environment:NitroEnvironment` has tests for start, exec, upload, download, stop, and the unwired AWS-mode failure.
 - A full Token-2022 validator transaction test is still missing. This is the next correctness gap, not a nice-to-have.
 
 ## Failure Modes To Test

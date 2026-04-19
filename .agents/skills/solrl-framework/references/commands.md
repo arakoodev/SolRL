@@ -14,6 +14,13 @@ docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 ```
 
+The local MVP path can also be called directly:
+
+```bash
+docker compose run --rm --no-deps harbor-runner \
+  python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
+```
+
 ## Anchor And Registry
 
 ```bash
@@ -40,6 +47,32 @@ docker compose run --rm aws-test-runner
 ```
 
 LocalStack validates AWS API and Terraform behavior. It cannot emulate `/dev/nsm`, PCRs, EIF boot, VSOCK, or Nitro attestation.
+
+## Verifier Service
+
+```bash
+docker compose up verifier-service
+curl -fsS http://localhost:8787/healthz
+```
+
+The service is the mock long-running verifier API:
+
+```text
+GET  /healthz
+POST /verify/mock
+```
+
+Do not use this as evidence of real Nitro. It signs only after mock attestation checks pass.
+
+## Harbor Import Path
+
+Use this import path when asking Harbor to instantiate SolRL's environment surface:
+
+```text
+solrl_harbor.nitro_environment:NitroEnvironment
+```
+
+Local mode uses a deterministic workspace transport. AWS mode intentionally errors until the production VSOCK worker RPC is wired.
 
 ## Real AWS Nitro
 
@@ -76,5 +109,6 @@ SolRLRunId=<exact run id>
 ```bash
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_claim_flow.py
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_aws_nitro_runner.py
+docker compose run --rm --no-deps harbor-runner pytest -q tests/test_verifier_service.py tests/test_harbor_nitro_environment.py tests/test_cli.py
 docker compose run --rm --no-deps dev-shell cargo test --workspace
 ```

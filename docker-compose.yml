@@ -154,6 +154,20 @@ services:
       PYTHONPATH: /workspace/python
     command: python -m solrl_core.mock_verifier --help
 
+  verifier-service:
+    build:
+      context: .
+      dockerfile: docker/python-runner.Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      PYTHONPATH: /workspace/python
+      SOLRL_IN_DOCKER: "1"
+    ports:
+      - "8787:8787"
+    command: python -m solrl_core.verifier_service --host 0.0.0.0 --port 8787 --config solrl.toml
+
   worker-mock:
     build:
       context: .
