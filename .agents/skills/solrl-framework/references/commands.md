@@ -14,6 +14,9 @@ docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 ```
 
+The lint gate also checks Dependabot: root Cargo is direct-only, the Nitro worker has its own Cargo lane, vendored code is
+excluded, and Docker base images do not use floating `latest` tags.
+
 The local MVP path can also be called directly:
 
 ```bash

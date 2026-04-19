@@ -31,6 +31,7 @@ Use this skill to keep another AI from improvising around the sharp edges. The b
 - Do not use broad cleanup. Delete only resources tagged `Project=SolRL` and the exact current `SolRLRunId`.
 - Do not introduce S3, IAM roles, SSM, SSH keys, inbound security group rules, or debug-mode Nitro into the smoke path without naming it as an architecture change and getting user approval.
 - Do not change ClaimV1, SlashClaimV1, or PCR16 on only one side. Rust and Python must stay byte-compatible.
+- Do not remove `.github/dependabot.yml` or let root Cargo Dependabot manage indirect dependencies. Solana's lockfile has duplicate transitive crates and unconfigured Dependabot creates noisy failed update runs.
 
 ## Standard Workflow
 
@@ -103,7 +104,8 @@ When touching Docker:
 
 1. Keep `SOLRL_IN_DOCKER=1` for services that must refuse host execution.
 2. Keep LocalStack dummy credentials isolated from `aws-nitro-runner`.
-3. Run `scripts/check-docker-boundary.sh` through the lint service.
+3. Keep Docker base image tags versioned, not `latest`, so Dependabot can produce real update PRs.
+4. Run `scripts/check-docker-boundary.sh` and `scripts/check-dependabot-config.py` through the lint service.
 
 ## Real AWS Decision Point
 

@@ -206,6 +206,32 @@ act pull_request -W .github/workflows/build-nitro-eif.yml -j build-nitro-eif
 The `act` pull-request path builds and prepares the EIF artifact, but skips GitHub-only upload and GHCR publish steps
 because local `act` does not provide the Actions artifact runtime or `GITHUB_TOKEN` package permissions.
 
+## Dependabot
+
+Dependabot is configured in:
+
+```text
+.github/dependabot.yml
+```
+
+The root Cargo workspace only allows direct dependency updates. That is intentional. The root `Cargo.lock` contains many
+duplicate transitive crates from the Solana `1.18.26` toolchain, including multiple `borsh`, `rand`, and `ring` versions.
+Unconfigured Dependabot tries to patch those transitive crates one by one, hits Cargo ambiguity or upstream Solana
+constraints, and creates noisy failed `Dependabot Updates` runs.
+
+The useful update lanes are explicit:
+
+- root Cargo workspace: direct Anchor, Solana, SPL, and project dependency updates
+- Nitro worker Cargo crate: its standalone direct and transitive Rust updates
+- Nix flake inputs: `flake.lock`
+- GitHub Actions
+- Dockerfiles under `docker/`
+- Docker Compose image tags
+- Terraform provider lockfile under `infra/localstack`
+
+The lint gate checks this shape with `scripts/check-dependabot-config.py`. It also rejects floating Docker `:latest`
+base images, because Dependabot cannot turn `latest` into a meaningful security PR.
+
 ## Anchor Program
 
 The first on-chain layer lives in:

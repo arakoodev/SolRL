@@ -1,0 +1,129 @@
+version: 2
+
+multi-ecosystem-groups:
+  infrastructure:
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Calcutta"
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Calcutta"
+    open-pull-requests-limit: 5
+    rebase-strategy: "auto"
+    versioning-strategy: "increase-if-necessary"
+    allow:
+      - dependency-type: "direct"
+    groups:
+      solana-anchor:
+        patterns:
+          - "anchor-*"
+          - "solana-*"
+          - "spl-*"
+    commit-message:
+      prefix: "deps(cargo-root)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "cargo"
+    exclude-paths:
+      - "vendor/**"
+      - "target/**"
+      - "artifacts/**"
+      - "crates/solrl-nitro-worker/**"
+
+  - package-ecosystem: "cargo"
+    directory: "/crates/solrl-nitro-worker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:15"
+      timezone: "Asia/Calcutta"
+    open-pull-requests-limit: 5
+    rebase-strategy: "auto"
+    versioning-strategy: "increase-if-necessary"
+    groups:
+      nitro-worker-rust:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps(nitro-worker)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "cargo"
+      - "nitro"
+
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:30"
+      timezone: "Asia/Calcutta"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(nix)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "nix"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    multi-ecosystem-group: "infrastructure"
+    patterns:
+      - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(actions)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    multi-ecosystem-group: "infrastructure"
+    patterns:
+      - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(docker)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    multi-ecosystem-group: "infrastructure"
+    patterns:
+      - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(compose)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  - package-ecosystem: "terraform"
+    directory: "/infra/localstack"
+    multi-ecosystem-group: "infrastructure"
+    patterns:
+      - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(terraform)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "terraform"
