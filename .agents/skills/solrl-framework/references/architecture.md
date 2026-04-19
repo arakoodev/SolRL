@@ -1,0 +1,81 @@
+# SolRL Architecture
+
+## Local Mock Flow
+
+```text
+Harbor-style task
+    |
+    v
+python/solrl_core/mock_worker.py
+    |
+    | emits mock-nitro-attestation-v1
+    v
+python/solrl_core/mock_verifier.py
+    |
+    | signs canonical ClaimV1 bytes
+    v
+python/solrl_core/mock_hook.py
+    |
+    | simulates payout + replay rejection
+    v
+tests/test_claim_flow.py
+```
+
+This proves the protocol shape without pretending to be Nitro.
+
+## Real Registry Flow
+
+```text
+ClaimV1 bytes
+    |
+    v
+programs/solrl-registry::settle_claim
+    |
+    +--> verify Ed25519 proof
+    +--> verify verifier policy
+    +--> recompute PCR16 from registered components
+    +--> cross-check Job, Lease, Operator, ImagePolicy fields
+    +--> create ClaimReceipt / NonceReceipt
+    +--> arm TransferGuard
+    +--> Token-2022 transfer_checked CPI
+    +--> transfer hook consumes TransferGuard
+```
+
+Slashing follows the same idea: a signed `SlashClaimV1` moves stake from the operator stake vault to treasury.
+
+## Real AWS Nitro Smoke
+
+```text
+local Docker aws-nitro-runner
+    |
+    | boto3, .env credentials
+    v
+temporary EC2 parent
+    |
+    | tagged Project=SolRL, SolRLRunId=<run>
+    | no SSH key, no inbound SG, no instance profile
+    v
+cloud-init
+    |
+    +--> install Nitro CLI + Nix
+    +--> git clone public SolRL ref
+    +--> nix build .#solrl-nitro-worker-eif
+    +--> nitro-cli run-enclave
+    +--> VSOCK request to worker
+    +--> verify COSE / AWS root / PCRs / user_data
+    +--> emit final result block
+    +--> shutdown
+```
+
+The laptop never builds the real EIF for the smoke. The EC2 parent rebuilds the pinned git ref, because the smoke is supposed to prove the deployed source can build and attest in AWS.
+
+## Marlin/Oyster Baseline
+
+SolRL follows the useful pieces from Marlin Oyster:
+
+- Build EIFs with Nix and `monzo/aws-nitro-util`, not `nitro-cli build-enclave`.
+- Keep the kernel/image path reproducible.
+- Treat raw AWS Nitro attestation verification as off-chain work.
+- Keep the on-chain program focused on lightweight signed claims, PCR/policy matching, replay protection, staking, and settlement.
+
+Do not copy Marlin blindly. SolRL is narrower: Harbor evals and RL settlement, not general-purpose TEE compute.

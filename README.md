@@ -26,6 +26,84 @@ Only these should be required on the laptop:
 
 Do not install Rust, Anchor, Solana CLI, Node, Python dependencies, Nix, Terraform, or AWS CLI on the host. Use the Compose services.
 
+## Agent Skill
+
+This repo includes a project skill for AI coding tools:
+
+```text
+.agents/skills/solrl-framework/          # canonical skill source
+.claude/skills/solrl-framework -> ...    # Claude Code symlink
+.gemini/skills/solrl-framework -> ...    # Gemini CLI symlink
+```
+
+Do not copy the skill into tool-specific folders. Update `.agents/skills/solrl-framework` and let the symlinks point at it. Copies turn one operating manual into three stale ones. Very normal software trap.
+
+Use it when handing this repo to an AI before asking it to run AWS, touch Token-2022, change ClaimV1/PCR16, or edit Docker:
+
+```text
+$solrl-framework
+```
+
+The skill explains the Docker-only workflow, ClaimV1/PCR16 parity rules, Token-2022 settlement shape, LocalStack boundaries, and real AWS Nitro safety rules. It is intentionally strict about not installing host packages, not adding sidecar AWS scripts, and not touching shared AWS resources without exact SolRL tags.
+
+### Claude Code
+
+Claude Code discovers project skills from `.claude/skills/<skill-name>/SKILL.md`. In this repo that path is a symlink to the canonical `.agents` skill.
+
+From the repo root:
+
+```text
+/solrl-framework
+```
+
+Then ask the task:
+
+```text
+/solrl-framework run the safe local test gate
+/solrl-framework update the AWS Nitro smoke without adding sidecar scripts
+/solrl-framework explain the ClaimV1/PCR16 settlement flow
+```
+
+If Claude Code was already open before the `.claude/skills` directory existed, restart it so it watches the new skill directory.
+
+### Codex
+
+Codex discovers repo skills from `.agents/skills` while working inside the repository. Invoke the skill explicitly with:
+
+```text
+$solrl-framework
+```
+
+Example prompts:
+
+```text
+$solrl-framework inspect the Nitro runner and tell me the safe command to run
+$solrl-framework modify ClaimV1 and update every parity test
+$solrl-framework run the Docker-only validation gate and summarize failures
+```
+
+Codex also reads `agents/openai.yaml` for UI metadata, so keep that file in the canonical skill folder.
+
+### Gemini CLI
+
+Gemini CLI discovers workspace skills from `.agents/skills` and `.gemini/skills`. This repo includes the `.gemini` symlink for explicit compatibility, but `.agents/skills` remains the source of truth.
+
+From the repo root:
+
+```bash
+gemini skills list
+gemini skills reload
+```
+
+Then ask Gemini to use the skill by name:
+
+```text
+Use the solrl-framework skill to run the safe local gate.
+Use the solrl-framework skill to review AWS Nitro cleanup safety.
+```
+
+If a tool shows both `.agents` and `.gemini` entries, prefer the `.agents/skills/solrl-framework` entry. Same target, less indirection.
+
 ## Quick Start
 
 ```bash
