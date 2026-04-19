@@ -3,24 +3,30 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import botocore.exceptions
 import pytest
 
 from solrl_core.aws_nitro_runner import (
+    AwsNitroRunner,
     AwsNitroRunnerError,
+    EifArtifactSource,
     GitSource,
     RunnerConfig,
     audit_counts,
     audit_has_resources,
     audit_resources,
     cleanup_run_resources,
+    derive_ghcr_eif_ref,
     make_config,
     normalise_aws_env,
     parse_remote_markers,
     public_clone_url,
     resource_tags,
+    resolve_eif_artifact_source,
     resolve_git_source,
     remote_smoke_script,
     tags_match,
+    validate_oci_ref,
 )
 
 
@@ -128,6 +134,14 @@ class FakeEc2:
         return self._Waiter()
 
 
+def example_git_source(ref: str = "abcdef1234567890abcdef1234567890abcdef12") -> GitSource:
+    return GitSource("https://github.com/arakoodev/SolRL.git", ref)
+
+
+def example_eif_source(ref: str = "abcdef1234567890abcdef1234567890abcdef12") -> EifArtifactSource:
+    return EifArtifactSource(f"ghcr.io/arakoodev/solrl-nitro-worker-eif:{ref}")
+
+
 def test_normalise_aws_env_accepts_existing_env_names(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AWS_ACCESS_KEY", "access")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
@@ -157,11 +171,33 @@ def test_public_clone_url_converts_github_ssh_remote() -> None:
 
 def test_resolve_git_source_prefers_explicit_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SOLRL_NITRO_GIT_URL", "https://github.com/arakoodev/SolRL.git")
-    monkeypatch.setenv("SOLRL_NITRO_GIT_REF", "main")
+    monkeypatch.setenv("SOLRL_NITRO_GIT_REF", "abcdef1234567890abcdef1234567890abcdef12")
 
     source = resolve_git_source()
 
-    assert source == GitSource("https://github.com/arakoodev/SolRL.git", "main")
+    assert source == example_git_source()
+
+
+def test_default_eif_oci_ref_is_derived_from_github_commit() -> None:
+    assert (
+        derive_ghcr_eif_ref(example_git_source("ABCDEF1234567890ABCDEF1234567890ABCDEF12"))
+        == "ghcr.io/arakoodev/solrl-nitro-worker-eif:abcdef1234567890abcdef1234567890abcdef12"
+    )
+
+
+def test_eif_oci_ref_requires_immutable_git_ref_without_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOLRL_NITRO_EIF_OCI", raising=False)
+
+    with pytest.raises(AwsNitroRunnerError, match="40-character commit SHA"):
+        resolve_eif_artifact_source(GitSource("https://github.com/arakoodev/SolRL.git", "main"))
+
+
+def test_eif_oci_ref_can_be_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SOLRL_NITRO_EIF_OCI", "ghcr.io/arakoodev/solrl-nitro-worker-eif:manual")
+
+    source = resolve_eif_artifact_source(GitSource("https://github.com/arakoodev/SolRL.git", "main"))
+
+    assert source == EifArtifactSource("ghcr.io/arakoodev/solrl-nitro-worker-eif:manual")
 
 
 def test_make_config_allows_root_volume_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -216,6 +252,7 @@ def final_block(**overrides: str) -> str:
         "SOLRL_STATUS": "OK",
         "SOLRL_RUN_ID": "solrl-test",
         "SOLRL_GIT_REF": "abcdef123456",
+        "SOLRL_EIF_OCI_REF": "ghcr.io/arakoodev/solrl-nitro-worker-eif:abcdef123456",
         "SOLRL_EIF_SHA384": "a" * 96,
         "SOLRL_NITRO_ROOT_SHA256": "b" * 64,
         "SOLRL_PCR0": "c" * 96,
@@ -264,23 +301,23 @@ def test_parse_remote_markers_rejects_failed_status() -> None:
         [
             "SOLRL_RESULT_BEGIN",
             "SOLRL_STATUS=FAILED",
-            "SOLRL_PHASE=build_eif",
+            "SOLRL_PHASE=pull_eif",
             "SOLRL_ERROR_TAIL_BEGIN",
-            "nix exploded",
+            "oras pull failed",
             "SOLRL_ERROR_TAIL_END",
             "SOLRL_RESULT_END",
         ]
     )
 
-    with pytest.raises(AwsNitroRunnerError, match="build_eif"):
+    with pytest.raises(AwsNitroRunnerError, match="pull_eif"):
         parse_remote_markers(stdout)
 
 
 def test_remote_script_configures_allocator_before_start() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
-    source = GitSource("https://github.com/arakoodev/SolRL.git", "abcdef123456")
+    source = example_git_source()
 
-    script = remote_smoke_script(config, "aa", "bb", "cc", source)
+    script = remote_smoke_script(config, "aa", "bb", "cc", source, example_eif_source())
 
     assert "systemctl enable --now nitro-enclaves-allocator.service" not in script
     assert "exec >\"$LOG_DIR/user-data.log\" 2>&1" in script
@@ -298,7 +335,7 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "sleep 10" in script
     assert "write_console_file" in script
     assert "/dev/ttyS0" in script
-    assert "OVERALL_TIMEOUT_SECONDS=5400" in script
+    assert "OVERALL_TIMEOUT_SECONDS=1800" in script
     assert "start_watchdog" in script
     assert "SOLRL_PHASE=overall_timeout" in script
     assert "/run/solrl.done" in script
@@ -306,17 +343,21 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "kill -TERM \"$phase_pid\"" in script
     assert "kill -KILL \"$phase_pid\"" in script
     assert "yum update -y" not in script
-    assert "run_phase packages 900 phase_packages" in script
-    assert "run_phase build_eif 5400 phase_build_eif" in script
+    assert "run_phase packages 600 phase_packages" in script
+    assert "run_phase oras 300 phase_oras" in script
+    assert "run_phase pull_eif 900 phase_pull_eif" in script
     assert "run_phase attestation 300 phase_attestation" in script
     assert "systemctl daemon-reload" in script
     assert "docker build" not in script
     assert "nitro-cli build-enclave" not in script
-    assert "nixos.org/nix/install" in script
-    assert "nix build .#solrl-nitro-worker-eif" in script
+    assert "nixos.org/nix/install" not in script
+    assert "nix build .#solrl-nitro-worker-eif" not in script
+    assert "oras pull \"$eif_ref\" --output \"$EIF_DIR\"" in script
+    assert "sha384sum -c \"$sha_path\"" in script
+    assert "oras login" not in script
     assert "'cryptography<42'" in script
     assert "git clone \"$git_url\" \"$SRC_DIR\"" in script
-    assert "git checkout --detach \"abcdef123456\"" in script
+    assert "git checkout --detach \"abcdef1234567890abcdef1234567890abcdef12\"" in script
     assert "--build-arg SOLRL_USER_DATA_HEX" not in script
     assert "USER_DATA_HEX=aa" in script
     assert "PUBLIC_KEY_HEX=bb" in script
@@ -325,6 +366,7 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "verify-attestation" in script
     assert script.index("verify-attestation") < script.index("SOLRL_STATUS=OK")
     assert "nitro-cli describe-eif" in script
+    assert "SOLRL_EIF_OCI_REF=" in script
     assert "SOLRL_EIF_SHA384=" in script
     assert "SOLRL_NITRO_ROOT_SHA256=" in script
     assert "SOLRL_PCR16=" in script
@@ -337,30 +379,30 @@ def test_remote_script_configures_allocator_before_start() -> None:
 
 def test_remote_script_rejects_shell_unsafe_run_id() -> None:
     config = make_config("solrl-test;rm", Path("artifacts/test"))
-    source = GitSource("https://github.com/arakoodev/SolRL.git", "abcdef123456")
+    source = example_git_source()
 
     with pytest.raises(AwsNitroRunnerError, match="run_id"):
-        remote_smoke_script(config, "aa", "bb", "cc", source)
+        remote_smoke_script(config, "aa", "bb", "cc", source, example_eif_source())
 
 
 def test_remote_script_rejects_non_hex_template_values() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
-    source = GitSource("https://github.com/arakoodev/SolRL.git", "abcdef123456")
+    source = example_git_source()
 
     with pytest.raises(AwsNitroRunnerError, match="user_data_hex"):
-        remote_smoke_script(config, "aa;rm", "bb", "cc", source)
+        remote_smoke_script(config, "aa;rm", "bb", "cc", source, example_eif_source())
     with pytest.raises(AwsNitroRunnerError, match="public_key_hex"):
-        remote_smoke_script(config, "aa", "not-hex", "cc", source)
+        remote_smoke_script(config, "aa", "not-hex", "cc", source, example_eif_source())
     with pytest.raises(AwsNitroRunnerError, match="nonce_hex"):
-        remote_smoke_script(config, "aa", "bb", "c", source)
+        remote_smoke_script(config, "aa", "bb", "c", source, example_eif_source())
 
 
 def test_remote_script_rejects_private_git_source() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
-    source = GitSource("https://token@github.com/arakoodev/SolRL.git", "abcdef123456")
+    source = GitSource("https://token@github.com/arakoodev/SolRL.git", "abcdef1234567890abcdef1234567890abcdef12")
 
     with pytest.raises(AwsNitroRunnerError, match="public HTTPS"):
-        remote_smoke_script(config, "aa", "bb", "cc", source)
+        remote_smoke_script(config, "aa", "bb", "cc", source, example_eif_source())
 
 
 def test_remote_script_rejects_invalid_vsock_port() -> None:
@@ -374,4 +416,87 @@ def test_remote_script_rejects_invalid_vsock_port() -> None:
     )
 
     with pytest.raises(AwsNitroRunnerError, match="vsock_port"):
-        remote_smoke_script(config, "aa", "bb", "cc", GitSource("https://github.com/arakoodev/SolRL.git", "abc"))
+        remote_smoke_script(config, "aa", "bb", "cc", example_git_source(), example_eif_source())
+
+
+def test_remote_script_rejects_shell_unsafe_eif_oci_ref() -> None:
+    config = make_config("solrl-test", Path("artifacts/test"))
+
+    with pytest.raises(AwsNitroRunnerError, match="SOLRL_NITRO_EIF_OCI"):
+        remote_smoke_script(
+            config,
+            "aa",
+            "bb",
+            "cc",
+            example_git_source(),
+            EifArtifactSource("ghcr.io/arakoodev/solrl-nitro-worker-eif:abc;rm"),
+        )
+
+
+def test_validate_oci_ref_requires_tag_or_digest() -> None:
+    with pytest.raises(AwsNitroRunnerError, match="tag or digest"):
+        validate_oci_ref("ghcr.io/arakoodev/solrl-nitro-worker-eif")
+
+
+def test_wait_for_instance_uses_running_waiter_not_status_ok() -> None:
+    class FakeWaiter:
+        def wait(self, **_kwargs: object) -> None:
+            return None
+
+    class WaiterEc2:
+        def __init__(self) -> None:
+            self.waiter_names: list[str] = []
+
+        def get_waiter(self, name: str) -> FakeWaiter:
+            self.waiter_names.append(name)
+            return FakeWaiter()
+
+    runner = AwsNitroRunner.__new__(AwsNitroRunner)
+    runner.config = make_config("solrl-test", Path("artifacts/test"))
+    runner.ec2 = WaiterEc2()
+    runner.instance_id = "i-test"
+    runner.log = lambda _message: None
+
+    runner._wait_for_instance()
+
+    assert runner.ec2.waiter_names == ["instance_running"]
+
+
+def test_smoke_wraps_waiter_error_and_captures_console_snapshot() -> None:
+    class FailingWaiterRunner(AwsNitroRunner):
+        def __init__(self) -> None:
+            self.config = make_config("solrl-test", Path("artifacts/test"))
+            self.instance_id = "i-test"
+            self.security_group_id = ""
+            self.captured = False
+            self.cleaned = False
+            self.posted = False
+
+        def _preflight_audit(self) -> None:
+            return None
+
+        def _smoke(self) -> None:
+            raise botocore.exceptions.WaiterError(
+                name="InstanceRunning",
+                reason="Max attempts exceeded",
+                last_response={},
+            )
+
+        def _capture_console_snapshot(self, name: str = "console-output-snapshot.txt") -> None:
+            assert name == "console-output-snapshot.txt"
+            self.captured = True
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+
+        def _post_audit(self) -> None:
+            self.posted = True
+
+    runner = FailingWaiterRunner()
+
+    with pytest.raises(AwsNitroRunnerError, match="AWS waiter failed"):
+        runner.smoke()
+
+    assert runner.captured
+    assert runner.cleaned
+    assert runner.posted

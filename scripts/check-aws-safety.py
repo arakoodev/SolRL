@@ -15,6 +15,8 @@ PREFLIGHT_SIDECAR = ROOT / "scripts/_preflight_readonly.py"
 POSTAUDIT_SIDECAR = ROOT / "scripts/_postaudit_readonly.py"
 WORKER = ROOT / "crates/solrl-nitro-worker/src/main.rs"
 FLAKE = ROOT / "flake.nix"
+WORKFLOW = ROOT / ".github/workflows/build-nitro-eif.yml"
+ACTRC = ROOT / ".actrc"
 
 
 def fail(message: str) -> None:
@@ -36,13 +38,14 @@ def main() -> int:
     runner = RUNNER.read_text(encoding="utf-8")
     templates = "\n".join(path.read_text(encoding="utf-8") for path in sorted(TEMPLATE_DIR.glob("*")))
     remote_path = TEMPLATE_DIR / "remote_smoke.sh.tpl"
-    if not remote_path.exists() or not WORKER.exists() or not FLAKE.exists():
-        fail("AWS Nitro runner must keep remote template, worker crate, and flake source")
+    if not remote_path.exists() or not WORKER.exists() or not FLAKE.exists() or not WORKFLOW.exists() or not ACTRC.exists():
+        fail("AWS Nitro runner must keep remote template, worker crate, flake source, GitHub EIF workflow, and act config")
     e2e = E2E.read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     remote = remote_path.read_text(encoding="utf-8")
     worker = WORKER.read_text(encoding="utf-8")
     flake = FLAKE.read_text(encoding="utf-8")
+    workflow = WORKFLOW.read_text(encoding="utf-8")
     combined_runner = runner + "\n" + templates
 
     require(e2e, "python3 -m solrl_core.aws_nitro_runner smoke", "e2e-aws-nitro.sh must call the main runner module")
@@ -55,7 +58,7 @@ def main() -> int:
     require(runner, "tags_match(", "cleanup must be gated on ownership tags")
     require(runner, "EnclaveOptions={\"Enabled\": True}", "EC2 parent must launch with Nitro Enclaves enabled")
     require(runner, "AssociatePublicIpAddress", "runner must make egress explicit for default subnets")
-    require(runner, "BlockDeviceMappings=", "AWS runner must size the temporary root volume explicitly for Nix builds")
+    require(runner, "BlockDeviceMappings=", "AWS runner must size the temporary root volume explicitly")
     require(runner, "\"DeleteOnTermination\": True", "AWS runner root volume must be deleted with the instance")
     require(runner, "SOLRL_NITRO_ROOT_VOLUME_GIB", "AWS runner must allow explicit root volume override")
     require(runner, "SOLRL_NITRO_AMI_ID", "AWS runner must allow an explicit AMI override")
@@ -72,7 +75,11 @@ def main() -> int:
     require(runner, "Preflight found existing active/stopped Project=SolRL resources", "preflight must block by default")
     require(runner, "Post-audit found resources left over", "post-audit must fail on exact run leftovers")
     require(runner, "MAX_EC2_USER_DATA_BYTES", "runner must guard EC2 user-data size")
-    require(runner, "resolve_git_source(", "AWS runner must resolve the public git source for the EC2 rebuild")
+    require(runner, "resolve_git_source(", "AWS runner must resolve the public git source for EC2 source verification")
+    require(runner, "resolve_eif_artifact_source(", "AWS runner must resolve the GHCR EIF artifact source")
+    require(runner, "SOLRL_NITRO_EIF_OCI", "AWS runner must allow an explicit EIF OCI artifact override")
+    require(runner, "derive_ghcr_eif_ref(", "AWS runner must derive the default EIF artifact from the git commit")
+    require(runner, "40-character commit SHA", "AWS runner must reject branch refs for default EIF artifacts")
     require(runner, "public_clone_url(", "AWS runner must convert GitHub SSH remotes to public HTTPS clone URLs")
     require(runner, "verify-attestation", "EC2 parent must verify the Nitro attestation before printing OK")
     require(
@@ -109,27 +116,37 @@ def main() -> int:
     require(remote, "sleep 10", "AWS remote smoke must give EC2 console output time to persist before shutdown")
     require(remote, "write_console_file", "AWS remote smoke must write result files to serial console")
     require(remote, "/dev/ttyS0", "AWS remote smoke must write diagnostics directly to the serial tty")
-    require(remote, "OVERALL_TIMEOUT_SECONDS=5400", "AWS remote smoke must have a hard overall watchdog")
+    require(remote, "OVERALL_TIMEOUT_SECONDS=1800", "AWS remote smoke must have a hard overall watchdog")
     require(remote, "start_watchdog", "AWS remote smoke must start the hard watchdog")
     require(remote, "SOLRL_PHASE=overall_timeout", "AWS remote watchdog must emit a typed timeout failure")
     require(remote, "/run/solrl.done", "AWS remote smoke must mark completion for the watchdog")
     require(remote, "/run/solrl.phase", "AWS remote smoke must track the current phase for timeout diagnostics")
     require(remote, "kill -TERM \"$phase_pid\"", "AWS remote smoke must terminate timed-out phases")
     require(remote, "kill -KILL \"$phase_pid\"", "AWS remote smoke must force-kill stuck phases")
-    require(remote, "run_phase packages 900 phase_packages", "AWS remote smoke must timeout package setup")
-    require(remote, "run_phase build_eif 5400 phase_build_eif", "AWS remote smoke must timeout EIF builds")
+    require(remote, "run_phase packages 600 phase_packages", "AWS remote smoke must timeout package setup")
+    require(remote, "run_phase oras 300 phase_oras", "AWS remote smoke must timeout ORAS setup")
+    require(remote, "run_phase pull_eif 900 phase_pull_eif", "AWS remote smoke must timeout EIF artifact pulls")
     require(remote, "run_phase attestation 300 phase_attestation", "AWS remote smoke must timeout VSOCK attestation")
     require(remote, "export HOME=/root", "AWS remote smoke must set HOME under cloud-init")
     require(remote, "git clone \"$git_url\" \"$SRC_DIR\"", "AWS remote smoke must clone the public repo on EC2")
     require(remote, "git checkout --detach", "AWS remote smoke must checkout an explicit immutable git ref")
-    require(remote, "nixos.org/nix/install", "AWS remote smoke must install Nix on the EC2 parent that rebuilds the EIF")
-    require(remote, "nix build .#solrl-nitro-worker-eif", "AWS remote smoke must rebuild the EIF on EC2")
+    require(remote, "oras pull \"$eif_ref\" --output \"$EIF_DIR\"", "AWS remote smoke must pull the CI-built EIF through ORAS")
+    require(remote, "sha384sum -c \"$sha_path\"", "AWS remote smoke must verify the pulled EIF checksum")
+    require(remote, "SOLRL_EIF_OCI_REF", "AWS remote smoke must report the EIF OCI reference it booted")
     require(remote, "'cryptography<42'", "AWS remote smoke must pin Python deps for Amazon Linux 2 Python compatibility")
     require(remote, "nitro-cli describe-eif", "AWS remote smoke must persist EIF measurements")
     require(remote, "sha384sum", "AWS remote smoke must persist EIF hash evidence")
     require(remote, "sock.sendall(payload.encode(\"ascii\"))", "attestation inputs must arrive over VSOCK at runtime")
     require(flake, "nitro.buildEif", "SolRL flake must build an EIF through aws-nitro-util")
     require(flake, "oysterPkgs.kernels.vanilla", "SolRL EIF must use the pinned Marlin/Oyster kernel path")
+    require(workflow, "nix build .#solrl-nitro-worker-eif", "GitHub Actions must build the EIF with Nix")
+    require(workflow, "application/vnd.aws.nitro.eif", "GitHub Actions must publish the raw EIF as an OCI artifact")
+    require(workflow, "oras push", "GitHub Actions must publish the EIF with ORAS")
+    require(workflow, "packages: write", "GitHub Actions must declare package write permission")
+    require(workflow, "id-token: write", "GitHub Actions must declare OIDC permission for the Nix installer action")
+    require(workflow, "DeterminateSystems/nix-installer-action@v", "GitHub Actions must pin the Nix installer to a version tag")
+    if "DeterminateSystems/nix-installer-action@main" in workflow:
+        fail("GitHub Actions must not float the Nix installer on @main")
     for request in ("ExtendPCR", "LockPCR", "DescribePCR"):
         if not re.search(rf"Request::{request}\s*\{{[^}}]*\bindex:\s*16\b", worker, re.DOTALL):
             fail(f"AWS worker must issue Request::{request} against PCR16")
@@ -137,6 +154,11 @@ def main() -> int:
     if remote.index("verify-attestation") > remote.index("SOLRL_STATUS=OK"):
         fail("AWS remote smoke must verify attestation before printing OK")
     require(runner, "aws_nitro_templates", "AWS runner must render the remote smoke from source templates")
+    require(runner, "instance_running", "AWS runner must not block on long EC2 status checks before polling cloud-init")
+    require(runner, "_capture_console_snapshot", "AWS runner must capture best-effort console output on failure")
+    require(runner, "botocore.exceptions.WaiterError", "AWS runner must wrap waiter failures as typed runner errors")
+    if "instance_status_ok" in runner:
+        fail("AWS runner must not wait for full instance_status_ok before reading cloud-init output")
     if "__SOURCE_TARBALL_B64__" in remote:
         fail("AWS remote smoke must not ship a source tarball to the EC2 parent")
     if "create_bucket(" in combined_runner or "generate_presigned_url" in combined_runner or "upload_file(" in combined_runner:
@@ -145,6 +167,10 @@ def main() -> int:
         fail("AWS Nitro smoke must not build the EIF through Docker")
     if "nitro-cli build-enclave" in remote:
         fail("AWS Nitro smoke must not use non-reproducible nitro-cli build-enclave")
+    if "nixos.org/nix/install" in remote or "nix build .#solrl-nitro-worker-eif" in remote:
+        fail("AWS remote smoke must not rebuild the EIF on the EC2 hot path")
+    if "oras login" in remote:
+        fail("AWS remote smoke must not require registry credentials on the EC2 parent")
     if "--build-arg SOLRL_USER_DATA_HEX" in combined_runner:
         fail("run-specific attestation inputs must not be baked into the EIF image")
     if "systemctl enable --now nitro-enclaves-allocator.service" in combined_runner:

@@ -34,6 +34,8 @@ DEFAULT_INSTANCE_TYPE = "m5.xlarge"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_ROOT_VOLUME_GIB = 64
 DEFAULT_VSOCK_PORT = 5005
+DEFAULT_EIF_PACKAGE_NAME = "solrl-nitro-worker-eif"
+ORAS_VERSION = "1.2.2"
 MAX_EC2_USER_DATA_BYTES = 16_384
 ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +43,7 @@ FINAL_RESULT_REQUIRED_FIELDS = {
     "SOLRL_STATUS",
     "SOLRL_RUN_ID",
     "SOLRL_GIT_REF",
+    "SOLRL_EIF_OCI_REF",
     "SOLRL_EIF_SHA384",
     "SOLRL_NITRO_ROOT_SHA256",
     "SOLRL_PCR0",
@@ -91,6 +94,11 @@ class DecodedAttestation:
 class GitSource:
     url: str
     ref: str
+
+
+@dataclass(frozen=True)
+class EifArtifactSource:
+    oci_ref: str
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -517,6 +525,50 @@ def validate_git_source(source: GitSource) -> None:
         raise AwsNitroRunnerError("SOLRL_NITRO_GIT_REF must contain only letters, numbers, slash, dot, underscore, or dash")
 
 
+def is_full_git_sha(ref: str) -> bool:
+    return len(ref) == 40 and all(char in "0123456789abcdefABCDEF" for char in ref)
+
+
+def validate_oci_ref(value: str) -> None:
+    if not value:
+        raise AwsNitroRunnerError("SOLRL_NITRO_EIF_OCI must not be empty")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/@-")
+    if any(char not in allowed for char in value):
+        raise AwsNitroRunnerError("SOLRL_NITRO_EIF_OCI contains shell-unsafe characters")
+    parsed = urllib.parse.urlparse(f"oci://{value}")
+    if not parsed.path or "/" not in value:
+        raise AwsNitroRunnerError("SOLRL_NITRO_EIF_OCI must be a full OCI reference")
+    if ":" not in value.rsplit("/", 1)[-1] and "@" not in value.rsplit("/", 1)[-1]:
+        raise AwsNitroRunnerError("SOLRL_NITRO_EIF_OCI must include an immutable tag or digest")
+
+
+def derive_ghcr_eif_ref(source: GitSource) -> str:
+    if not is_full_git_sha(source.ref):
+        raise AwsNitroRunnerError(
+            "SOLRL_NITRO_GIT_REF must be a full 40-character commit SHA when deriving the default GHCR EIF. "
+            "Set SOLRL_NITRO_EIF_OCI to override with an explicit OCI artifact reference."
+        )
+    parsed = urllib.parse.urlparse(source.url)
+    if parsed.scheme != "https" or parsed.netloc != "github.com":
+        raise AwsNitroRunnerError(
+            "Default EIF OCI derivation only supports public GitHub remotes. "
+            "Set SOLRL_NITRO_EIF_OCI for non-GitHub sources."
+        )
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise AwsNitroRunnerError("Could not derive GHCR owner from SOLRL_NITRO_GIT_URL")
+    owner = parts[0].lower()
+    ref = f"ghcr.io/{owner}/{DEFAULT_EIF_PACKAGE_NAME}:{source.ref.lower()}"
+    validate_oci_ref(ref)
+    return ref
+
+
+def resolve_eif_artifact_source(git_source: GitSource) -> EifArtifactSource:
+    oci_ref = os.environ.get("SOLRL_NITRO_EIF_OCI") or derive_ghcr_eif_ref(git_source)
+    validate_oci_ref(oci_ref)
+    return EifArtifactSource(oci_ref=oci_ref)
+
+
 def resolve_git_source() -> GitSource:
     url = os.environ.get("SOLRL_NITRO_GIT_URL") or public_clone_url(_git_output("remote", "get-url", "origin"))
     ref = os.environ.get("SOLRL_NITRO_GIT_REF") or _git_output("rev-parse", "HEAD")
@@ -549,6 +601,8 @@ class AwsNitroRunner:
             post_audit = True
             self._smoke()
         except BaseException as exc:
+            if self.instance_id:
+                self._capture_console_snapshot()
             run_error = exc
         else:
             run_error = None
@@ -563,6 +617,8 @@ class AwsNitroRunner:
                 code = error.get("Code", "Unknown")
                 message = error.get("Message", str(run_error))
                 raise AwsNitroRunnerError(f"AWS API failed with {code}: {message}") from run_error
+            if isinstance(run_error, botocore.exceptions.WaiterError):
+                raise AwsNitroRunnerError(f"AWS waiter failed: {run_error}") from run_error
             raise run_error
 
     def _preflight_audit(self) -> None:
@@ -597,12 +653,15 @@ class AwsNitroRunner:
         self.log(f"authenticated AWS account: {caller['Account']}")
         git_source = resolve_git_source()
         self._write_json("git-source.json", {"url": git_source.url, "ref": git_source.ref})
-        self.log(f"remote EC2 build source: {git_source.url}@{git_source.ref}")
+        eif_source = resolve_eif_artifact_source(git_source)
+        self._write_json("eif-source.json", {"oci_ref": eif_source.oci_ref})
+        self.log(f"remote EC2 source checkout: {git_source.url}@{git_source.ref}")
+        self.log(f"remote EC2 EIF artifact: {eif_source.oci_ref}")
 
         vpc_id, subnet_id = self._default_network()
         ami_id = self._default_ami()
         self._create_security_group(vpc_id)
-        self._launch_instance(ami_id, subnet_id, git_source)
+        self._launch_instance(ami_id, subnet_id, git_source, eif_source)
         self._wait_for_instance()
         stdout = self._wait_for_final_console_result()
         markers = parse_remote_markers(stdout)
@@ -657,7 +716,13 @@ class AwsNitroRunner:
         self.security_group_id = response["GroupId"]
         self.log(f"security group: {self.security_group_id}")
 
-    def _launch_instance(self, ami_id: str, subnet_id: str, git_source: GitSource) -> None:
+    def _launch_instance(
+        self,
+        ami_id: str,
+        subnet_id: str,
+        git_source: GitSource,
+        eif_source: EifArtifactSource,
+    ) -> None:
         root_device_name = self._ami_root_device_name(ami_id)
         self.log(
             f"launching tagged enclave-enabled EC2 parent ({self.config.instance_type}, "
@@ -669,6 +734,7 @@ class AwsNitroRunner:
             sha256_hex(f"{self.config.run_id}:worker-public-key"),
             sha256_hex(f"{self.config.run_id}:nonce"),
             git_source,
+            eif_source,
         )
         self._write_text("user-data.sh", user_data)
         response = self.ec2.run_instances(
@@ -711,12 +777,12 @@ class AwsNitroRunner:
         return images[0].get("RootDeviceName") or "/dev/xvda"
 
     def _wait_for_instance(self) -> None:
-        self.log("waiting for EC2 status checks")
-        self.ec2.get_waiter("instance_status_ok").wait(
+        self.log("waiting for EC2 instance to enter running state")
+        self.ec2.get_waiter("instance_running").wait(
             InstanceIds=[self.instance_id],
-            WaiterConfig={"Delay": 15, "MaxAttempts": 80},
+            WaiterConfig={"Delay": 10, "MaxAttempts": 60},
         )
-        self.log("EC2 status checks passed")
+        self.log("EC2 instance is running; waiting for cloud-init result")
 
     def _wait_for_final_console_result(self) -> str:
         self.log("waiting for EC2 user-data to finish and stop the instance")
@@ -732,6 +798,7 @@ class AwsNitroRunner:
                 break
             time.sleep(15)
         else:
+            self._capture_console_snapshot("console-output.txt")
             raise AwsNitroRunnerError("timed out waiting for EC2 instance to finish Nitro smoke")
 
         self.log("instance finished; reading final EC2 console output")
@@ -747,6 +814,17 @@ class AwsNitroRunner:
             time.sleep(10)
         self._write_text("console-output.txt", last_output)
         raise AwsNitroRunnerError("remote Nitro smoke did not publish a final SOLRL_RESULT block")
+
+    def _capture_console_snapshot(self, name: str = "console-output-snapshot.txt") -> None:
+        if not self.instance_id:
+            return
+        try:
+            response = self.ec2.get_console_output(InstanceId=self.instance_id, Latest=True)
+        except botocore.exceptions.ClientError as exc:
+            self._write_text(name, f"could not read EC2 console output: {exc}\n")
+            return
+        output = response.get("Output", "") or ""
+        self._write_text(name, output)
 
     def _persist_remote_outputs(self, markers: dict[str, str]) -> None:
         self._write_json("remote-markers.json", markers)
@@ -800,6 +878,7 @@ def remote_smoke_script(
     public_key_hex: str,
     nonce_hex: str,
     git_source: GitSource,
+    eif_source: EifArtifactSource,
 ) -> str:
     validate_remote_token("run_id", config.run_id)
     validate_remote_hex("user_data_hex", user_data_hex)
@@ -807,10 +886,13 @@ def remote_smoke_script(
     validate_remote_hex("nonce_hex", nonce_hex)
     validate_git_source(git_source)
     validate_remote_ref("git_ref", git_source.ref)
+    validate_oci_ref(eif_source.oci_ref)
     validate_vsock_port(config.vsock_port)
     replacements = {
         "__GIT_URL_B64__": base64.b64encode(git_source.url.encode("utf-8")).decode("ascii"),
         "__GIT_REF__": git_source.ref,
+        "__EIF_OCI_REF_B64__": base64.b64encode(eif_source.oci_ref.encode("utf-8")).decode("ascii"),
+        "__ORAS_VERSION__": ORAS_VERSION,
         "__USER_DATA_HEX__": user_data_hex,
         "__PUBLIC_KEY_HEX__": public_key_hex,
         "__NONCE_HEX__": nonce_hex,

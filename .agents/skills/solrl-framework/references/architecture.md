@@ -87,9 +87,10 @@ temporary EC2 parent
     v
 cloud-init
     |
-    +--> install Nitro CLI + Nix
+    +--> install Nitro CLI + ORAS
     +--> git clone public SolRL ref
-    +--> nix build .#solrl-nitro-worker-eif
+    +--> pull public GHCR EIF artifact
+    +--> sha384sum -c artifact sidecar
     +--> nitro-cli run-enclave
     +--> VSOCK request to worker
     +--> verify COSE / AWS root / PCRs / user_data
@@ -97,7 +98,9 @@ cloud-init
     +--> shutdown
 ```
 
-The laptop never builds the real EIF for the smoke. The EC2 parent rebuilds the pinned git ref, because the smoke is supposed to prove the deployed source can build and attest in AWS.
+The laptop never builds the real EIF for the smoke. GitHub Actions builds the EIF from the pinned flake and publishes the
+raw `.eif` as an OCI artifact. The EC2 parent clones the same git ref for verifier code identity, pulls the matching EIF,
+verifies the SHA-384 sidecar, then boots it.
 
 ## Marlin/Oyster Baseline
 

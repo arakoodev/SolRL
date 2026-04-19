@@ -1,0 +1,91 @@
+name: Build Nitro EIF
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+concurrency:
+  group: build-nitro-eif-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-nitro-eif:
+    name: Build and publish Nitro EIF
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Build reproducible EIF
+        run: |
+          set -euo pipefail
+          nix build .#solrl-nitro-worker-eif --no-write-lock-file --out-link result
+
+      - name: Prepare EIF artifact
+        id: eif
+        run: |
+          set -euo pipefail
+          eif_path="$(find -L result -type f -name '*.eif' -print -quit)"
+          test -n "$eif_path"
+          cp "$eif_path" solrl-nitro-worker.eif
+          sha384sum solrl-nitro-worker.eif > solrl-nitro-worker.eif.sha384
+          echo "sha384=$(awk '{ print $1 }' solrl-nitro-worker.eif.sha384)" >> "$GITHUB_OUTPUT"
+          ls -lh solrl-nitro-worker.eif solrl-nitro-worker.eif.sha384
+
+      - name: Upload workflow artifact
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: solrl-nitro-worker-eif-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            solrl-nitro-worker.eif
+            solrl-nitro-worker.eif.sha384
+
+      - name: Install ORAS
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          oras_version="1.2.2"
+          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${oras_version}/oras_${oras_version}_linux_amd64.tar.gz" \
+            -o /tmp/oras.tar.gz
+          tar -xzf /tmp/oras.tar.gz -C /tmp oras
+          sudo install -m 0755 /tmp/oras /usr/local/bin/oras
+          oras version
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish EIF OCI artifact
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/solrl-nitro-worker-eif:${GITHUB_SHA}"
+          oras push "$image" \
+            --artifact-type application/vnd.aws.nitro.eif \
+            solrl-nitro-worker.eif:application/octet-stream \
+            solrl-nitro-worker.eif.sha384:text/plain
+          {
+            echo "### SolRL Nitro EIF"
+            echo ""
+            echo "\`SOLRL_NITRO_EIF_OCI=$image\`"
+            echo ""
+            echo "\`SHA384=${{ steps.eif.outputs.sha384 }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

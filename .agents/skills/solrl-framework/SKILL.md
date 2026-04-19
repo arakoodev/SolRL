@@ -58,6 +58,12 @@ Use this for Nix EIF build checks without touching AWS:
 docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
 ```
 
+Use this for GitHub Actions EIF workflow checks through `act`:
+
+```bash
+act pull_request -W .github/workflows/build-nitro-eif.yml -j build-nitro-eif
+```
+
 Use this for real AWS only after local gates pass:
 
 ```bash
@@ -100,7 +106,7 @@ When touching Docker:
 
 The current no-S3, no-IAM smoke path uses EC2 console output as the return channel after cloud-init stops the instance. This is intentionally limited.
 
-If real AWS runs reach `build_eif` but no final `SOLRL_RESULT_BEGIN` block appears, do not keep adding console tail hacks. That already failed. Read `references/troubleshooting.md`, then propose a real return channel as an explicit architecture decision.
+The real AWS path pulls a public GHCR OCI artifact for the raw EIF, verifies its `.sha384` sidecar on the EC2 parent, then boots it. If real AWS runs reach `pull_eif` but no final `SOLRL_RESULT_BEGIN` block appears, do not keep adding console tail hacks. That already failed. Read `references/troubleshooting.md`, then propose a real return channel as an explicit architecture decision.
 
 ## Completion Checklist
 

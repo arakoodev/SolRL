@@ -139,8 +139,9 @@ docker compose run --rm dev-shell bash
 That image is intentionally heavier. It contains the toolchain needed later for Rust, Anchor, Solana, Node, Python, Terraform, and AWS CLI work.
 
 It does not install the Docker CLI. No default service runs privileged Docker-in-Docker.
-The real AWS Nitro runner does not need local build privileges. Nix runs on the temporary EC2 parent, not in a privileged
-local container. It is not Docker-in-Docker and it does not mount the host Docker socket.
+The real AWS Nitro runner does not need local build privileges. Nix runs in GitHub Actions for the publish path or in the
+dedicated `nix-builder` container for local verification. The AWS runner is not Docker-in-Docker and it does not mount
+the host Docker socket.
 
 ## Guardrails
 
@@ -160,7 +161,34 @@ docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solr
 ```
 
 Keeping Nix separate avoids mixing the Anchor/Solana toolchain with Nix store behavior. The real AWS smoke does not
-build the EIF on the laptop. The EC2 parent clones the configured Git ref and rebuilds the EIF there before booting it.
+build the EIF on the laptop and no longer rebuilds it on the EC2 hot path. GitHub Actions builds the EIF from the pinned
+flake, publishes the raw `.eif` plus `.sha384` as a public GHCR OCI artifact, and the EC2 parent pulls that artifact,
+verifies the SHA-384 file, and boots it.
+
+The workflow lives at:
+
+```text
+.github/workflows/build-nitro-eif.yml
+```
+
+It publishes:
+
+```text
+ghcr.io/<github-owner>/solrl-nitro-worker-eif:<commit-sha>
+```
+
+The package must be public for the no-secret EC2 smoke path. If you intentionally use a private package, pass an explicit
+`SOLRL_NITRO_EIF_OCI` only after designing a credential path. Do not sneak registry credentials into EC2 user-data.
+
+To test workflow wiring locally with `act`:
+
+```bash
+act pull_request -W .github/workflows/build-nitro-eif.yml -j build-nitro-eif
+```
+
+`.actrc` pins the Ubuntu runner image and amd64 architecture so local workflow checks behave like GitHub-hosted runners.
+The `act` pull-request path builds and prepares the EIF artifact, but skips GitHub-only upload and GHCR publish steps
+because local `act` does not provide the Actions artifact runtime or `GITHUB_TOKEN` package permissions.
 
 ## Anchor Program
 
@@ -247,18 +275,26 @@ no inbound security group rules. Every created AWS resource is tagged with `Proj
 and cleanup refuses to delete anything whose tags do not match the current run. Post-audit fails the run if exact
 run-id resources remain.
 
-The smoke has the EC2 parent clone the configured public Git ref, install Nix on the EC2 parent, rebuild the
-`solrl-nitro-worker-eif` through `monzo/aws-nitro-util` and the pinned Marlin/Oyster kernel path, boot the EIF, request a
-real NSM attestation over VSOCK, and verify the COSE signature, AWS root public key, non-zero PCRs, PCR16 digest,
-`user_data`, and worker public key on the EC2 parent before printing success. The local runner reads only the final
+The smoke has the EC2 parent clone the configured public Git ref, pull the matching public GHCR EIF artifact with ORAS,
+verify its SHA-384 sidecar, boot the EIF, request a real NSM attestation over VSOCK, and verify the COSE signature, AWS
+root public key, non-zero PCRs, PCR16 digest, `user_data`, and worker public key on the EC2 parent before printing
+success. The local runner reads only the final
 `SOLRL_RESULT_BEGIN` / `SOLRL_RESULT_END` console block after the instance stops. Build logs stay on the EC2 root volume
 under `/var/log/solrl`; EC2 console is not used as an artifact transport. It only gets small phase-start markers plus the
 final result block. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
 boot, VSOCK, or real Nitro attestations.
 
-The EC2 cloud-init script has bounded phases and a hard overall watchdog. A stuck package install, Nix build, VSOCK
+The EC2 cloud-init script has bounded phases and a hard overall watchdog. A stuck package install, ORAS pull, VSOCK
 connect, or verifier call emits a typed failed result block with the current phase and a capped log tail, then shuts the
 instance down. The local runner should never wait on a silently wedged EC2 parent.
+
+By default the runner derives the EIF reference from the current GitHub remote owner and commit SHA. Branch names are
+rejected for the default path because a branch is not an immutable artifact identity. To use a manually published EIF:
+
+```bash
+SOLRL_NITRO_EIF_OCI=ghcr.io/arakoodev/solrl-nitro-worker-eif:<commit-sha> \
+  docker compose run --rm aws-nitro-runner
+```
 
 ## Docker-in-Docker
 
@@ -266,6 +302,5 @@ Default services avoid privileged Docker-in-Docker.
 
 The current `dev-shell` image does not include the Docker CLI. If a future step needs a container to build or run other containers, prefer mounting the host Docker socket into a dedicated service and document the trust cost. Do not silently add privileged `docker:dind`.
 
-The `aws-nitro-runner` service does not need local Linux build privileges now. Nix runs on the temporary EC2 parent for
-the real smoke. The local Docker service does not run Docker, does not mount the Docker socket, and does not run with
-`privileged: true`.
+The `aws-nitro-runner` service does not need local Linux build privileges now. The local Docker service does not run
+Docker, does not mount the Docker socket, and does not run with `privileged: true`.

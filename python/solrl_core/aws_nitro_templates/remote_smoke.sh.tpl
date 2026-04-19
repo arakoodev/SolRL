@@ -5,11 +5,11 @@ export HOME=/root
 LOG_DIR=/var/log/solrl
 CONSOLE=/dev/console
 SRC_DIR=/opt/solrl
-RESULT_LINK=/opt/solrl-eif-result
+EIF_DIR=/opt/solrl-eif
 PHASE=init
 DONE_FILE=/run/solrl.done
 PHASE_FILE=/run/solrl.phase
-OVERALL_TIMEOUT_SECONDS=5400
+OVERALL_TIMEOUT_SECONDS=1800
 WATCHDOG_PID=
 
 mkdir -p "$LOG_DIR"
@@ -145,24 +145,17 @@ start_watchdog
 
 phase_packages() {
   amazon-linux-extras install aws-nitro-enclaves-cli -y
-  yum install -y aws-nitro-enclaves-cli-devel curl git jq python3 python3-pip xz
+  yum install -y aws-nitro-enclaves-cli-devel curl git gzip jq python3 python3-pip tar
   python3 -m pip install --upgrade pip
   python3 -m pip install 'boto3<1.34' 'botocore<1.34' 'cbor2<6' 'cryptography<42'
 }
 
-phase_nix() {
-  if ! command -v nix >/dev/null 2>&1; then
-    curl -fsSL https://nixos.org/nix/install -o /tmp/solrl-install-nix.sh
-    sh /tmp/solrl-install-nix.sh --daemon --yes --no-channel-add
-  fi
-  mkdir -p /etc/nix
-  cat >/etc/nix/nix.conf <<'NIXCONF'
-experimental-features = nix-command flakes
-accept-flake-config = true
-sandbox = true
-sandbox-fallback = false
-NIXCONF
-  systemctl restart nix-daemon.service
+phase_oras() {
+  curl -fsSL "https://github.com/oras-project/oras/releases/download/v__ORAS_VERSION__/oras___ORAS_VERSION___linux_amd64.tar.gz" \
+    -o /tmp/solrl-oras.tar.gz
+  tar -xzf /tmp/solrl-oras.tar.gz -C /tmp oras
+  install -m 0755 /tmp/oras /usr/local/bin/oras
+  oras version
 }
 
 phase_clone() {
@@ -173,12 +166,13 @@ phase_clone() {
   git checkout --detach "__GIT_REF__"
 }
 
-phase_build_eif() {
-  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-  cd "$SRC_DIR"
-  rm -f "$RESULT_LINK"
+phase_pull_eif() {
+  eif_ref="$(printf '%s' '__EIF_OCI_REF_B64__' | base64 -d)"
+  rm -rf "$EIF_DIR"
+  mkdir -p "$EIF_DIR"
+  cd "$EIF_DIR"
   for attempt in 1 2 3; do
-    if nix build .#solrl-nitro-worker-eif --no-write-lock-file --out-link "$RESULT_LINK"; then
+    if oras pull "$eif_ref" --output "$EIF_DIR"; then
       break
     fi
     if [ "$attempt" = 3 ]; then
@@ -186,10 +180,14 @@ phase_build_eif() {
     fi
     sleep $((attempt * 20))
   done
-  find -L "$RESULT_LINK" -type f -name '*.eif' -print -quit >/tmp/solrl-eif-path
+  find "$EIF_DIR" -type f -name '*.eif' -print -quit >/tmp/solrl-eif-path
   test -s /tmp/solrl-eif-path
   eif_path="$(cat /tmp/solrl-eif-path)"
-  sha384sum "$eif_path" >/tmp/solrl-eif-sha384.txt
+  sha_path="$(find "$EIF_DIR" -type f -name '*.sha384' -print -quit)"
+  test -s "$sha_path"
+  sha384sum -c "$sha_path"
+  cp "$sha_path" /tmp/solrl-eif-sha384.txt
+  printf '%s\n' "$eif_ref" >/tmp/solrl-eif-oci-ref.txt
   nitro-cli describe-eif --eif-path "$eif_path" >/tmp/solrl-build.json
 }
 
@@ -259,10 +257,10 @@ phase_terminate_enclave() {
   nitro-cli terminate-enclave --enclave-id "$enclave_id" >/tmp/solrl-terminate.json
 }
 
-run_phase packages 900 phase_packages
-run_phase nix 900 phase_nix
+run_phase packages 600 phase_packages
+run_phase oras 300 phase_oras
 run_phase clone 300 phase_clone
-run_phase build_eif 5400 phase_build_eif
+run_phase pull_eif 900 phase_pull_eif
 run_phase allocator 300 phase_allocator
 run_phase run_enclave 300 phase_run_enclave
 run_phase attestation 300 phase_attestation
@@ -271,6 +269,7 @@ run_phase terminate_enclave 300 phase_terminate_enclave
 
 summary=/tmp/solrl-attestation-summary.json
 eif_sha384="$(awk '{ print $1 }' /tmp/solrl-eif-sha384.txt)"
+eif_oci_ref="$(cat /tmp/solrl-eif-oci-ref.txt)"
 pcr0="$(jq -r '.pcrs["0"]' "$summary")"
 pcr1="$(jq -r '.pcrs["1"]' "$summary")"
 pcr2="$(jq -r '.pcrs["2"]' "$summary")"
@@ -287,6 +286,7 @@ fi
   echo SOLRL_STATUS=OK
   echo SOLRL_RUN_ID=__RUN_ID__
   echo SOLRL_GIT_REF=__GIT_REF__
+  echo SOLRL_EIF_OCI_REF="$eif_oci_ref"
   echo SOLRL_EIF_SHA384="$eif_sha384"
   echo SOLRL_NITRO_ROOT_SHA256="$root_sha"
   echo SOLRL_PCR0="$pcr0"

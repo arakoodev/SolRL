@@ -16,7 +16,12 @@
 # Generated protocol artifacts and smoke-test evidence
 artifacts/*
 !artifacts/.gitkeep
+*.eif
+*.eif.sha384
 *.log
+
+# Local GitHub Actions runner scratch
+.act/
 
 # Vendored upstream repos used for local research, not committed product source
 vendor/

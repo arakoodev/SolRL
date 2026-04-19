@@ -43,7 +43,11 @@ Cleanup rules:
 
 ## Return Channel
 
-The no-S3, no-IAM path currently relies on final EC2 console output. Console output is useful for small phase markers, but it has proven unreliable as the only completion channel after long Nix builds.
+The no-S3, no-IAM path currently relies on final EC2 console output. Console output is useful for small phase markers and
+one final result block. It is not an artifact transport.
+
+The EIF is built by GitHub Actions and published as a public GHCR OCI artifact. The EC2 parent pulls it with ORAS and
+verifies the `.sha384` sidecar before booting it. Do not put GHCR credentials in EC2 user-data for the default smoke path.
 
 If asked to make real AWS smoke reliable, propose a scoped return channel instead of adding more tail parsing:
 

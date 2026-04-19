@@ -36,7 +36,17 @@ docker compose run --rm nix-builder nix --version
 docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
 ```
 
-This checks the Marlin/Oyster-style Nix EIF path locally in a container. The real AWS smoke rebuilds the EIF on EC2.
+This checks the Marlin/Oyster-style Nix EIF path locally in a container. The real AWS smoke pulls the CI-built EIF from
+public GHCR instead of rebuilding it on EC2.
+
+The shipped smoke path expects GitHub Actions to publish the raw EIF as a public GHCR OCI artifact. Test the workflow
+shape locally with:
+
+```bash
+act pull_request -W .github/workflows/build-nitro-eif.yml -j build-nitro-eif
+```
+
+The EC2 parent then pulls that `.eif` with ORAS and verifies its `.sha384` sidecar before booting it.
 
 ## LocalStack
 
