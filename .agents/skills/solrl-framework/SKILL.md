@@ -55,6 +55,9 @@ docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
 Use this for Nix EIF build checks without touching AWS:
 
 ```bash
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-kernel-bundle
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-root
 docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
 ```
 

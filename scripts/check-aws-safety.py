@@ -14,6 +14,7 @@ SIDECAR = ROOT / "scripts/aws-nitro-smoke.sh"
 PREFLIGHT_SIDECAR = ROOT / "scripts/_preflight_readonly.py"
 POSTAUDIT_SIDECAR = ROOT / "scripts/_postaudit_readonly.py"
 WORKER = ROOT / "crates/solrl-nitro-worker/src/main.rs"
+WORKER_CARGO = ROOT / "crates/solrl-nitro-worker/Cargo.toml"
 FLAKE = ROOT / "flake.nix"
 WORKFLOW = ROOT / ".github/workflows/build-nitro-eif.yml"
 ACTRC = ROOT / ".actrc"
@@ -38,12 +39,20 @@ def main() -> int:
     runner = RUNNER.read_text(encoding="utf-8")
     templates = "\n".join(path.read_text(encoding="utf-8") for path in sorted(TEMPLATE_DIR.glob("*")))
     remote_path = TEMPLATE_DIR / "remote_smoke.sh.tpl"
-    if not remote_path.exists() or not WORKER.exists() or not FLAKE.exists() or not WORKFLOW.exists() or not ACTRC.exists():
+    if (
+        not remote_path.exists()
+        or not WORKER.exists()
+        or not WORKER_CARGO.exists()
+        or not FLAKE.exists()
+        or not WORKFLOW.exists()
+        or not ACTRC.exists()
+    ):
         fail("AWS Nitro runner must keep remote template, worker crate, flake source, GitHub EIF workflow, and act config")
     e2e = E2E.read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     remote = remote_path.read_text(encoding="utf-8")
     worker = WORKER.read_text(encoding="utf-8")
+    worker_cargo = WORKER_CARGO.read_text(encoding="utf-8")
     flake = FLAKE.read_text(encoding="utf-8")
     workflow = WORKFLOW.read_text(encoding="utf-8")
     combined_runner = runner + "\n" + templates
@@ -139,14 +148,68 @@ def main() -> int:
     require(remote, "sock.sendall(payload.encode(\"ascii\"))", "attestation inputs must arrive over VSOCK at runtime")
     require(flake, "nitro.buildEif", "SolRL flake must build an EIF through aws-nitro-util")
     require(flake, "oysterPkgs.kernels.vanilla", "SolRL EIF must use the pinned Marlin/Oyster kernel path")
+    require(
+        flake,
+        "pkgs.pkgsStatic.rustPlatform.buildRustPackage",
+        "SolRL Nitro worker must be built as a static Rust binary to keep the EIF runtime root small",
+    )
+    require(flake, "copyToRoot = app;", "SolRL Nitro EIF must copy only the app root into the runtime image")
+    require(
+        flake,
+        "solrl-nitro-worker-root = app;",
+        "SolRL flake must expose the worker root as a cacheable CI stage",
+    )
+    require(
+        flake,
+        "solrl-nitro-kernel-bundle = oysterPkgs.kernels.vanilla.default;",
+        "SolRL flake must expose the Marlin/Oyster kernel bundle as a cacheable CI stage",
+    )
+    if "pkgs.busybox" in flake:
+        fail("SolRL Nitro worker EIF must not include busybox; the entrypoint is a binary, not a shell script")
+    if 'hex = "0.4.3"' in worker_cargo or "hex::" in worker:
+        fail("SolRL Nitro worker must not pull the hex crate into the EIF for small fixed hex parsing/encoding")
+    for release_flag in (
+        "[profile.release]",
+        "lto = true",
+        'opt-level = "z"',
+        'panic = "abort"',
+        'strip = "symbols"',
+    ):
+        require(worker_cargo, release_flag, f"SolRL Nitro worker release profile must keep {release_flag}")
     require(workflow, "nix build .#solrl-nitro-worker-eif", "GitHub Actions must build the EIF with Nix")
+    require(
+        workflow,
+        "DeterminateSystems/magic-nix-cache-action@v",
+        "GitHub Actions must use a pinned Nix cache action for EIF builds",
+    )
+    require(
+        workflow,
+        'diagnostic-endpoint: ""',
+        "GitHub Actions Nix cache must disable diagnostics for this repo workflow",
+    )
+    require(
+        workflow,
+        "nix build .#solrl-nitro-worker --no-write-lock-file --no-link",
+        "GitHub Actions must stage the static worker build for cache reuse",
+    )
+    require(
+        workflow,
+        "nix build .#solrl-nitro-kernel-bundle --no-write-lock-file --no-link",
+        "GitHub Actions must stage the Nitro kernel bundle build for cache reuse",
+    )
+    require(
+        workflow,
+        "nix build .#solrl-nitro-worker-root --no-write-lock-file --no-link",
+        "GitHub Actions must stage the app root build for cache reuse",
+    )
     require(workflow, "application/vnd.aws.nitro.eif", "GitHub Actions must publish the raw EIF as an OCI artifact")
     require(workflow, "oras push", "GitHub Actions must publish the EIF with ORAS")
     require(workflow, "packages: write", "GitHub Actions must declare package write permission")
     require(workflow, "id-token: write", "GitHub Actions must declare OIDC permission for the Nix installer action")
     require(workflow, "DeterminateSystems/nix-installer-action@v", "GitHub Actions must pin the Nix installer to a version tag")
-    if "DeterminateSystems/nix-installer-action@main" in workflow:
-        fail("GitHub Actions must not float the Nix installer on @main")
+    for floating_action in ("DeterminateSystems/nix-installer-action@main", "DeterminateSystems/magic-nix-cache-action@main"):
+        if floating_action in workflow:
+            fail(f"GitHub Actions must not float Actions on @main: found {floating_action}")
     for request in ("ExtendPCR", "LockPCR", "DescribePCR"):
         if not re.search(rf"Request::{request}\s*\{{[^}}]*\bindex:\s*16\b", worker, re.DOTALL):
             fail(f"AWS worker must issue Request::{request} against PCR16")

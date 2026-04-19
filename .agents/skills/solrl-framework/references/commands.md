@@ -33,11 +33,15 @@ This runs workspace Rust tests and `anchor build --no-idl`. `--no-idl` is curren
 
 ```bash
 docker compose run --rm nix-builder nix --version
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-kernel-bundle
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-root
 docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
 ```
 
-This checks the Marlin/Oyster-style Nix EIF path locally in a container. The real AWS smoke pulls the CI-built EIF from
-public GHCR instead of rebuilding it on EC2.
+This checks the Marlin/Oyster-style Nix EIF path locally in a container. The staged commands mirror GitHub Actions cache
+boundaries: static worker, Marlin/Oyster kernel bundle, app root, final EIF. The real AWS smoke pulls the CI-built EIF
+from public GHCR instead of rebuilding it on EC2.
 
 The shipped smoke path expects GitHub Actions to publish the raw EIF as a public GHCR OCI artifact. Test the workflow
 shape locally with:

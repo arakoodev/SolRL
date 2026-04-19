@@ -102,6 +102,27 @@ The laptop never builds the real EIF for the smoke. GitHub Actions builds the EI
 raw `.eif` as an OCI artifact. The EC2 parent clones the same git ref for verifier code identity, pulls the matching EIF,
 verifies the SHA-384 sidecar, then boots it.
 
+CI builds the EIF in cacheable Nix stages:
+
+```text
+static worker -> Marlin/Oyster kernel bundle -> app root -> final EIF
+```
+
+The workflow uses Magic Nix Cache on GitHub runners. Local `act` skips that cache step because `act` does not provide the
+same GitHub cache runtime, but it still exercises the staged build and artifact preparation path.
+
+The attestation smoke EIF runtime root is intentionally tiny:
+
+```text
+/
++-- app/
+    +-- solrl-nitro-worker   static Rust binary
+```
+
+There is no shell, `busybox`, package manager, CA bundle, Docker, Python, Node, or Harbor code in this smoke EIF. Build
+dependencies can still mention cross-platform packages in Nix logs. That does not mean they are present in the runtime
+root. As of the optimized build, the output is about 8.6 MiB in the Nix store with a 9,028,133 byte `image.eif`.
+
 ## Marlin/Oyster Baseline
 
 SolRL follows the useful pieces from Marlin Oyster:

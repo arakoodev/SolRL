@@ -29,6 +29,27 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
 
+      - name: Start Nix cache
+        if: env.ACT != 'true'
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+        with:
+          diagnostic-endpoint: ""
+
+      - name: Build static worker
+        run: |
+          set -euo pipefail
+          nix build .#solrl-nitro-worker --no-write-lock-file --no-link --print-out-paths
+
+      - name: Build Nitro kernel bundle
+        run: |
+          set -euo pipefail
+          nix build .#solrl-nitro-kernel-bundle --no-write-lock-file --no-link --print-out-paths
+
+      - name: Build worker root
+        run: |
+          set -euo pipefail
+          nix build .#solrl-nitro-worker-root --no-write-lock-file --no-link --print-out-paths
+
       - name: Build reproducible EIF
         run: |
           set -euo pipefail

@@ -23,14 +23,41 @@ struct AttestationRequest {
     nonce: Vec<u8>,
 }
 
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn validate_hex(name: &str, value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if value.is_empty()
-        || value.len() % 2 != 0
-        || !value.chars().all(|char| char.is_ascii_hexdigit())
-    {
+    if value.is_empty() || value.len() % 2 != 0 {
         return Err(format!("{name} must be non-empty even-length hex").into());
     }
-    Ok(hex::decode(value)?)
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let Some(high) = hex_nibble(pair[0]) else {
+            return Err(format!("{name} contains non-hex input").into());
+        };
+        let Some(low) = hex_nibble(pair[1]) else {
+            return Err(format!("{name} contains non-hex input").into());
+        };
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn write_hex_lower<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = Vec::with_capacity(bytes.len() * 2 + 1);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize]);
+        encoded.push(HEX[(byte & 0x0f) as usize]);
+    }
+    encoded.push(b'\n');
+    writer.write_all(&encoded)
 }
 
 fn parse_request(raw: &str) -> Result<AttestationRequest, Box<dyn std::error::Error>> {
@@ -177,7 +204,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = listen(port)?;
     let request = recv_request(&mut stream)?;
     let document = request_attestation(request)?;
-    stream.write_all(hex::encode(document).as_bytes())?;
-    stream.write_all(b"\n")?;
+    write_hex_lower(&mut stream, &document)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_request, validate_hex, write_hex_lower};
+    use std::error::Error;
+
+    #[test]
+    fn validate_hex_accepts_mixed_case_even_length_input() -> Result<(), Box<dyn Error>> {
+        let decoded = validate_hex("VALUE", "00aAFf")?;
+
+        assert_eq!(decoded, vec![0x00, 0xaa, 0xff]);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_hex_rejects_empty_odd_or_non_hex_input() {
+        assert!(validate_hex("VALUE", "").is_err());
+        assert!(validate_hex("VALUE", "abc").is_err());
+        assert!(validate_hex("VALUE", "zz").is_err());
+    }
+
+    #[test]
+    fn parse_request_requires_all_attestation_fields() {
+        let err = parse_request("USER_DATA_HEX=00\nPUBLIC_KEY_HEX=01\n").err();
+
+        assert!(err.is_some_and(|err| err.to_string().contains("missing NONCE_HEX")));
+    }
+
+    #[test]
+    fn write_hex_lower_uses_lowercase_without_hex_crate() -> Result<(), Box<dyn Error>> {
+        let mut out = Vec::new();
+
+        write_hex_lower(&mut out, &[0x00, 0xab, 0xff])?;
+
+        assert_eq!(out, b"00abff\n");
+        Ok(())
+    }
 }

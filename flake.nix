@@ -17,7 +17,7 @@
     pkgs = nixpkgs.legacyPackages.${system};
     nitro = nitro-util.lib.${system};
     oysterPkgs = oyster.packages.${system}.gnu;
-    worker = pkgs.rustPlatform.buildRustPackage {
+    worker = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
       pname = "solrl-nitro-worker";
       version = "0.1.0";
       src = ./crates/solrl-nitro-worker;
@@ -25,8 +25,7 @@
       doCheck = false;
     };
     app = pkgs.runCommand "solrl-nitro-worker-root" {} ''
-      mkdir -p $out/app
-      cp ${worker}/bin/solrl-nitro-worker $out/app/solrl-nitro-worker
+      install -D -m 0555 ${worker}/bin/solrl-nitro-worker $out/app/solrl-nitro-worker
     '';
     initPerms = pkgs.runCommand "solrl-nitro-init" {} ''
       cp ${oysterPkgs.kernels.vanilla.init} $out
@@ -35,6 +34,9 @@
   in {
     packages.${system} = {
       solrl-nitro-worker = worker;
+      solrl-nitro-worker-root = app;
+      solrl-nitro-kernel-bundle = oysterPkgs.kernels.vanilla.default;
+      solrl-nitro-init = initPerms;
       solrl-nitro-worker-eif = nitro.buildEif {
         name = "solrl-nitro-worker";
         arch = "x86_64";
@@ -45,11 +47,7 @@
         cmdline = builtins.readFile nitro.blobs.x86_64.cmdLine;
         entrypoint = "/app/solrl-nitro-worker";
         env = "SOLRL_VSOCK_PORT=5005";
-        copyToRoot = pkgs.buildEnv {
-          name = "solrl-nitro-worker-image-root";
-          paths = [app pkgs.busybox];
-          pathsToLink = ["/app" "/bin"];
-        };
+        copyToRoot = app;
       };
       default = self.packages.${system}.solrl-nitro-worker-eif;
     };

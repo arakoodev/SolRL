@@ -160,10 +160,17 @@ docker compose run --rm nix-builder nix --version
 docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
 ```
 
-Keeping Nix separate avoids mixing the Anchor/Solana toolchain with Nix store behavior. The real AWS smoke does not
-build the EIF on the laptop and no longer rebuilds it on the EC2 hot path. GitHub Actions builds the EIF from the pinned
-flake, publishes the raw `.eif` plus `.sha384` as a public GHCR OCI artifact, and the EC2 parent pulls that artifact,
-verifies the SHA-384 file, and boots it.
+Keeping Nix separate avoids mixing the Anchor/Solana toolchain with Nix store behavior. The worker EIF is deliberately
+small: it uses the pinned Marlin/Oyster vanilla kernel, a static Rust NSM worker, and an `/app` root only. No shell,
+`busybox`, package manager, CA bundle, Docker, Python, Node, or Harbor code is copied into this attestation smoke EIF.
+The current Docker-built EIF is about 8.6 MiB in the Nix store, with a 9,028,133 byte `image.eif`; the previous
+`busybox`-rooted build was 23.2 MiB / 24,299,887 bytes.
+
+The real AWS smoke does not build the EIF on the laptop and no longer rebuilds it on the EC2 hot path. GitHub Actions
+builds the EIF from the pinned flake in cacheable stages: static worker, Marlin/Oyster kernel bundle, worker root, then
+final EIF. CI uses `DeterminateSystems/magic-nix-cache-action@v13` so Nix store paths produced by one run can be reused by
+later runs. The workflow publishes the raw `.eif` plus `.sha384` as a public GHCR OCI artifact, and the EC2 parent pulls
+that artifact, verifies the SHA-384 file, and boots it.
 
 The workflow lives at:
 
@@ -179,6 +186,15 @@ ghcr.io/<github-owner>/solrl-nitro-worker-eif:<commit-sha>
 
 The package must be public for the no-secret EC2 smoke path. If you intentionally use a private package, pass an explicit
 `SOLRL_NITRO_EIF_OCI` only after designing a credential path. Do not sneak registry credentials into EC2 user-data.
+
+To inspect the same cacheable stages locally:
+
+```bash
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-kernel-bundle
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-root
+docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
+```
 
 To test workflow wiring locally with `act`:
 
