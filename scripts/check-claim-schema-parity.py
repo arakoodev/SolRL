@@ -31,6 +31,25 @@ def rust_domain(source: str, name: str) -> str:
     return match.group(1)
 
 
+def rust_function_body(source: str, name: str) -> str:
+    match = re.search(rf"pub fn {name}\([^)]*\).*?\{{", source, re.S)
+    if not match:
+        fail(f"missing Rust function {name}")
+    start = match.end()
+    depth = 1
+    index = start
+    while index < len(source):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index]
+        index += 1
+    fail(f"could not parse Rust function {name}")
+
+
 def python_tuple(source: str, name: str) -> list[str]:
     tree = ast.parse(source)
     for node in tree.body:
@@ -90,6 +109,15 @@ def main() -> int:
         body = python_function_body(python, name)
         if "hashlib" in body or ".digest(" in body or "sha256" in body:
             fail(f"Python {name} must reject invalid input, not hash/coerce it")
+
+    rust_pcr16 = rust_function_body(rust, "pcr16_digest")
+    python_pcr16 = python_function_body(python, "pcr16_digest")
+    if "pcr16_user_data" not in rust or "pcr16_user_data" not in python:
+        fail("Rust and Python must expose pcr16_user_data for Nitro ExtendPCR input")
+    if "pcr16_user_data" not in rust_pcr16 or "[0u8; 48]" not in rust_pcr16:
+        fail("Rust pcr16_digest must model Nitro PCR16 extension from a zero PCR")
+    if "pcr16_user_data" not in python_pcr16 or "bytes(48)" not in python_pcr16:
+        fail("Python pcr16_digest must model Nitro PCR16 extension from a zero PCR")
 
     print("schema parity lint OK")
     return 0

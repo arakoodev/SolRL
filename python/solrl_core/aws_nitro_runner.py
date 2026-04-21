@@ -22,6 +22,9 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
 
+from solrl_core.claim_context import build_aws_smoke_artifacts, build_claim_context, claim_context_hash
+from solrl_core.config import load_config
+
 
 AWS_ROOT_KEY_HEX = (
     "fc0254eba608c1f36870e29ada90be46383292736e894bfff672d989444b5051e534a4b1f6dbe3c0"
@@ -50,6 +53,8 @@ FINAL_RESULT_REQUIRED_FIELDS = {
     "SOLRL_PCR1",
     "SOLRL_PCR2",
     "SOLRL_PCR16",
+    "SOLRL_CLAIM_PCR16",
+    "SOLRL_CLAIM_CONTEXT_HASH",
 }
 
 
@@ -376,10 +381,15 @@ def parse_remote_markers(stdout: str) -> dict[str, str]:
     missing = sorted(FINAL_RESULT_REQUIRED_FIELDS - markers.keys())
     if missing:
         raise AwsNitroRunnerError(f"remote Nitro OK result is missing markers: {', '.join(missing)}")
-    for key in ("SOLRL_EIF_SHA384", "SOLRL_PCR0", "SOLRL_PCR1", "SOLRL_PCR2", "SOLRL_PCR16"):
+    for key in ("SOLRL_EIF_SHA384", "SOLRL_PCR0", "SOLRL_PCR1", "SOLRL_PCR2", "SOLRL_PCR16", "SOLRL_CLAIM_PCR16"):
         value = markers[key]
         if len(value) != 96 or any(char not in "0123456789abcdefABCDEF" for char in value):
             raise AwsNitroRunnerError(f"remote Nitro marker {key} must be 48-byte hex")
+    context_hash = markers["SOLRL_CLAIM_CONTEXT_HASH"]
+    if len(context_hash) != 64 or any(char not in "0123456789abcdefABCDEF" for char in context_hash):
+        raise AwsNitroRunnerError("remote Nitro claim context hash marker must be 32-byte hex")
+    if markers["SOLRL_PCR16"].lower() != markers["SOLRL_CLAIM_PCR16"].lower():
+        raise AwsNitroRunnerError("remote Nitro PCR16 does not match ClaimV1 PCR16")
     root_sha = markers["SOLRL_NITRO_ROOT_SHA256"]
     if len(root_sha) != 64 or any(char not in "0123456789abcdefABCDEF" for char in root_sha):
         raise AwsNitroRunnerError("remote Nitro root key hash marker must be 32-byte hex")
@@ -467,6 +477,7 @@ def verify_attestation_document(
     document: bytes,
     expected_user_data: bytes,
     expected_public_key: bytes,
+    expected_pcr16: bytes | None = None,
 ) -> DecodedAttestation:
     protected, payload, signature, payload_map = _load_cose_sign1(document)
     timestamp_ms = int(payload_map["timestamp"])
@@ -482,8 +493,10 @@ def verify_attestation_document(
             raise AwsNitroRunnerError(f"PCR{index} must be 48 bytes")
         if pcrs[index] == bytes(48):
             raise AwsNitroRunnerError(f"PCR{index} is all zero; non-debug Nitro smoke required")
-    expected_pcr16 = hashlib.sha384(bytes(48) + expected_user_data).digest()
-    if pcrs[16] != expected_pcr16:
+    computed_pcr16 = hashlib.sha384(bytes(48) + expected_user_data).digest()
+    if expected_pcr16 is not None and expected_pcr16 != computed_pcr16:
+        raise AwsNitroRunnerError("expected ClaimV1 PCR16 does not match Nitro ExtendPCR(user_data)")
+    if pcrs[16] != computed_pcr16:
         raise AwsNitroRunnerError("PCR16 does not match the expected ClaimV1 context extension")
 
     user_data = payload_map.get("user_data") or b""
@@ -728,11 +741,20 @@ class AwsNitroRunner:
             f"launching tagged enclave-enabled EC2 parent ({self.config.instance_type}, "
             f"{self.config.root_volume_gib} GiB root)"
         )
+        protocol_config = load_config()
+        claim_context = build_claim_context(
+            protocol_config,
+            build_aws_smoke_artifacts(self.config.run_id),
+            self.config.run_id,
+        )
+        self._write_json("claim-context.json", claim_context)
         user_data = remote_smoke_script(
             self.config,
-            sha256_hex(f"{self.config.run_id}:solrl-claim-v1"),
-            sha256_hex(f"{self.config.run_id}:worker-public-key"),
-            sha256_hex(f"{self.config.run_id}:nonce"),
+            claim_context["pcr16_user_data"],
+            claim_context["worker_public_key_hash"],
+            claim_context["nonce"],
+            claim_context["pcr16"],
+            claim_context_hash(claim_context),
             git_source,
             eif_source,
         )
@@ -877,6 +899,8 @@ def remote_smoke_script(
     user_data_hex: str,
     public_key_hex: str,
     nonce_hex: str,
+    claim_pcr16_hex: str,
+    claim_context_hash_hex: str,
     git_source: GitSource,
     eif_source: EifArtifactSource,
 ) -> str:
@@ -884,6 +908,8 @@ def remote_smoke_script(
     validate_remote_hex("user_data_hex", user_data_hex)
     validate_remote_hex("public_key_hex", public_key_hex)
     validate_remote_hex("nonce_hex", nonce_hex)
+    validate_remote_hex("claim_pcr16_hex", claim_pcr16_hex)
+    validate_remote_hex("claim_context_hash_hex", claim_context_hash_hex)
     validate_git_source(git_source)
     validate_remote_ref("git_ref", git_source.ref)
     validate_oci_ref(eif_source.oci_ref)
@@ -896,6 +922,8 @@ def remote_smoke_script(
         "__USER_DATA_HEX__": user_data_hex,
         "__PUBLIC_KEY_HEX__": public_key_hex,
         "__NONCE_HEX__": nonce_hex,
+        "__CLAIM_PCR16_HEX__": claim_pcr16_hex,
+        "__CLAIM_CONTEXT_HASH_HEX__": claim_context_hash_hex,
         "__VSOCK_PORT__": str(config.vsock_port),
         "__RUN_ID__": config.run_id,
     }
@@ -919,6 +947,7 @@ def run_verify_attestation(args: argparse.Namespace) -> int:
         bytes.fromhex(document),
         bytes.fromhex(args.expected_user_data_hex),
         bytes.fromhex(args.expected_public_key_hex),
+        bytes.fromhex(args.expected_pcr16_hex) if args.expected_pcr16_hex else None,
     )
     summary = decoded.to_summary()
     Path(args.summary_json).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -988,6 +1017,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--attestation-hex-path", required=True)
     verify.add_argument("--expected-user-data-hex", required=True)
     verify.add_argument("--expected-public-key-hex", required=True)
+    verify.add_argument("--expected-pcr16-hex")
     verify.add_argument("--summary-json", required=True)
     verify.set_defaults(func=run_verify_attestation)
     smoke = subparsers.add_parser("smoke", help="run the real AWS Nitro attestation smoke")

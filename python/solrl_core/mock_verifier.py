@@ -13,6 +13,7 @@ from solrl_core.claim import (
     verifier_identity,
     write_json,
 )
+from solrl_core.claim_context import claim_context_hash, claim_fields_from_context
 from solrl_core.config import load_config
 from solrl_core.claim import load_json
 
@@ -44,11 +45,12 @@ def verify_and_sign(
         raise VerificationError("PCR16 mismatch")
     if attestation.get("public_key_hash") != claim_context["worker_public_key_hash"]:
         raise VerificationError("worker public key hash mismatch")
-    context_hash = sha256_hex(claim_context)
-    if attestation["user_data"]["claim_context_hash"] != context_hash:
+    if attestation["user_data"]["claim_context_hash"] != claim_context_hash(claim_context):
         raise VerificationError("claim context hash not bound in attestation user_data")
+    if attestation["user_data"]["pcr16_user_data"] != claim_context["pcr16_user_data"]:
+        raise VerificationError("PCR16 user_data not bound in attestation")
 
-    claim = dict(claim_context)
+    claim = claim_fields_from_context(claim_context)
     claim["attestation_document_hash"] = _attestation_hash(attestation)
     identity = verifier_identity(seed)
     signature = sign_claim(claim, private_key_from_seed(seed))

@@ -22,7 +22,24 @@ A signed-but-unchecked field is usually a replay bug.
 
 ## PCR16
 
-PCR16 is not decorative. It is the digest tying the Harbor/eval context to the claim.
+PCR16 is not decorative. It is the hardware PCR tying the Harbor/eval context to the claim.
+
+SolRL uses two related values:
+
+```text
+Pcr16Components
+    |
+    v
+pcr16_user_data = sha384(domain || b"\0" || borsh(Pcr16Components))
+    |
+    | NSM ExtendPCR(index=16, data=pcr16_user_data)
+    v
+pcr16_digest = sha384(zeros48 || pcr16_user_data)
+```
+
+`pcr16_user_data` is what the Nitro worker sends as attestation `user_data`. `pcr16_digest` is the locked PCR16 value
+that ClaimV1 signs and the registry recomputes. If those two values collapse into one again, the AWS proof and Solana
+settlement rail drift apart. Bad.
 
 When changing PCR16 inputs, update:
 
@@ -31,6 +48,7 @@ When changing PCR16 inputs, update:
 - Registry cross-checks.
 - Mock worker/verifier flow.
 - Golden fixture and tests.
+- AWS Nitro runner user-data bridge.
 
 The registry should recompute PCR16 from registered components where possible, not trust caller-provided bytes.
 

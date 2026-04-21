@@ -92,6 +92,23 @@ def main() -> int:
     require(runner, "public_clone_url(", "AWS runner must convert GitHub SSH remotes to public HTTPS clone URLs")
     require(runner, "verify-attestation", "EC2 parent must verify the Nitro attestation before printing OK")
     require(
+        runner,
+        "build_claim_context(",
+        "AWS smoke must derive Nitro user_data from the canonical ClaimV1 context builder",
+    )
+    require(
+        runner,
+        "claim_context[\"pcr16_user_data\"]",
+        "AWS smoke must send PCR16 user_data derived from Pcr16Components, not run-id filler",
+    )
+    require(
+        runner,
+        "claim_context[\"pcr16\"]",
+        "AWS smoke must compare the Nitro PCR16 to the registry ClaimV1 PCR16",
+    )
+    if 'sha256_hex(f"{self.config.run_id}:solrl-claim-v1")' in runner:
+        fail("AWS smoke must not use run-id filler as Nitro user_data")
+    require(
         combined_runner,
         "cat >/etc/nitro_enclaves/allocator.yaml",
         "AWS runner must write Nitro allocator config in the main user-data path",
@@ -214,6 +231,13 @@ def main() -> int:
         if not re.search(rf"Request::{request}\s*\{{[^}}]*\bindex:\s*16\b", worker, re.DOTALL):
             fail(f"AWS worker must issue Request::{request} against PCR16")
     require(remote, "verify-attestation", "AWS remote smoke must run the EC2-side attestation verifier")
+    require(remote, "--expected-pcr16-hex", "AWS remote smoke must pass the registry ClaimV1 PCR16 to attestation verify")
+    require(remote, "SOLRL_CLAIM_PCR16", "AWS remote smoke must print the registry ClaimV1 PCR16 beside Nitro PCR16")
+    require(
+        remote,
+        "SOLRL_CLAIM_CONTEXT_HASH",
+        "AWS remote smoke must print the ClaimV1 context hash used to derive Nitro user_data",
+    )
     if remote.index("verify-attestation") > remote.index("SOLRL_STATUS=OK"):
         fail("AWS remote smoke must verify attestation before printing OK")
     require(runner, "aws_nitro_templates", "AWS runner must render the remote smoke from source templates")

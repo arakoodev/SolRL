@@ -36,6 +36,7 @@ Only these should be required on the laptop:
 
 - Docker
 - Docker Compose
+- `.env` with AWS credentials, only when running the real Nitro smoke
 
 Do not install Rust, Anchor, Solana CLI, Node, Python dependencies, Nix, Terraform, or AWS CLI on the host. Use the Compose services.
 
@@ -124,10 +125,14 @@ docker compose build dev-shell harbor-runner aws-test-runner
 docker compose up -d localstack
 docker compose run --rm lint
 docker compose run --rm harbor-runner pytest -q
+docker compose run --rm --no-deps harbor-runner python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
 docker compose run --rm --no-deps dev-shell ./scripts/e2e-local-mock.sh
+docker compose up verifier-service
 docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
 ```
+
+`verifier-service` stays running until `docker compose stop verifier-service` or `docker compose down`.
 
 For the full development shell:
 
@@ -256,7 +261,7 @@ anchor build --no-idl
 
 The current Anchor instruction tests cover registry bootstrap, verifier policy binding, operator auth on leases, on-chain PCR16 computation, Token-2022 extra-account metadata initialization, and stake-withdrawal guard rails. The Python mock e2e covers the full off-chain protocol shape, then runs the registry instruction tests in the same Docker entrypoint.
 
-One honest remaining gap: there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. V1 verifies claims in `settle_claim`, arms a one-use `TransferGuard`, flushes it before the CPI, and requires the hook to consume that guard. Full hook-side claim verification still needs a PDA seed redesign so the hook can derive the job, lease, receipt, and policy graph from the transfer inputs.
+One honest remaining gap: there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. V1 verifies claims in `settle_claim`, arms a one-use `TransferGuard`, flushes it before the CPI, and requires the hook to consume that guard. Full hook-side claim verification still needs a PDA seed redesign so the hook can derive the job, lease, receipt, and policy graph from the transfer inputs. Treat that as the current shipping boundary, not a buried footnote.
 
 ## Verifier Service
 
@@ -317,6 +322,10 @@ no inbound security group rules. Every created AWS resource is tagged with `Proj
 and cleanup refuses to delete anything whose tags do not match the current run. Post-audit fails the run if exact
 run-id resources remain.
 
+Expected duration is about 3-4 minutes when the GHCR EIF artifact exists for the commit. On the default `m5.xlarge`,
+that is roughly cents per run. If it fails, start with `artifacts/aws-nitro/<run-id>/console-output.txt` and the last
+`SOLRL_PHASE_*` marker. More failure notes live in `.agents/skills/solrl-framework/references/troubleshooting.md`.
+
 The smoke has the EC2 parent clone the configured public Git ref, pull the matching public GHCR EIF artifact with ORAS,
 verify its SHA-384 sidecar, boot the EIF, request a real NSM attestation over VSOCK, and verify the COSE signature, AWS
 root public key, non-zero PCRs, PCR16 digest, `user_data`, and worker public key on the EC2 parent before printing
@@ -325,6 +334,10 @@ success. The local runner reads only the final
 under `/var/log/solrl`; EC2 console is not used as an artifact transport. It only gets small phase-start markers plus the
 final result block. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
 boot, VSOCK, or real Nitro attestations.
+
+The Nitro `user_data` is derived from the same `Pcr16Components` used by the registry. The worker extends PCR16 once
+with that digest, locks PCR16, and the parent verifies `SOLRL_PCR16 == SOLRL_CLAIM_PCR16` before declaring success. That
+is the connecting wire between the AWS attestation rail and the Solana settlement rail.
 
 The EC2 cloud-init script has bounded phases and a hard overall watchdog. A stuck package install, ORAS pull, VSOCK
 connect, or verifier call emits a typed failed result block with the current phase and a capped log tail, then shuts the
@@ -337,6 +350,31 @@ rejected for the default path because a branch is not an immutable artifact iden
 SOLRL_NITRO_EIF_OCI=ghcr.io/arakoodev/solrl-nitro-worker-eif:<commit-sha> \
   docker compose run --rm aws-nitro-runner
 ```
+
+## How A Judge Verifies This
+
+Run the local path first:
+
+```bash
+docker compose run --rm --no-deps harbor-runner python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
+```
+
+Check:
+
+- `artifacts/mock/mvp_result.json` has `"status": "paid"` and `"replay_rejected": true`.
+- `artifacts/mock/claim_receipt.json` contains the verifier signature and ClaimV1 hash.
+- `artifacts/mock/claim_context.json` contains `pcr16` and `pcr16_user_data`.
+
+For real AWS, run the audit and smoke commands in the Real Nitro section, then check:
+
+- `artifacts/aws-nitro/<run-id>/remote-markers.json` has `SOLRL_STATUS=OK`.
+- `SOLRL_PCR16` equals `SOLRL_CLAIM_PCR16`.
+- `SOLRL_NITRO_ROOT_SHA256` is present and stable across real Nitro runs.
+- Post-audit reports zero exact-run resources left behind.
+
+That proves the demo chain in two pieces today: local settlement semantics and real Nitro attestation semantics. The
+remaining production hardening item is the full local-validator Token-2022 hook invocation test documented in the Anchor
+section.
 
 ## Docker-in-Docker
 

@@ -29,16 +29,21 @@ If launch succeeds but no final result block appears:
 
 1. Read `artifacts/aws-nitro/<run-id>/console-output.txt`.
 2. Check the last `SOLRL_PHASE_START`, `SOLRL_PHASE_END`, or `SOLRL_PHASE_FAILED`.
-3. Run the audit command before any cleanup.
-4. If cleanup is needed, use exact run-id cleanup only.
+3. If the last phase is `pull_eif`, check `.github/workflows/build-nitro-eif.yml` is green for the exact commit and that
+   `ghcr.io/<owner>/solrl-nitro-worker-eif:<commit-sha>` is public.
+4. Run the audit command before any cleanup.
+5. If cleanup is needed, use exact run-id cleanup only.
 
-Known limitation:
+Why the current path works:
 
 ```text
-EC2 GetConsoleOutput is not reliable as the only completion/result transport for long Nitro smoke runs.
+cloud-init phase markers -> instance stops -> local runner fetches one final console block
 ```
 
-We already tried:
+The runner no longer streams build artifacts through EC2 console output. GitHub Actions builds the EIF, publishes it to
+GHCR, and the EC2 parent pulls it with ORAS. The console only carries small phase markers plus one final result block.
+
+What already failed:
 
 - Small phase markers.
 - Final-only result blocks.
@@ -46,8 +51,10 @@ We already tried:
 - `/dev/ttyS0`.
 - Sleep before shutdown.
 - Capped log tails.
+- Chunking large build JSON or attestation blobs through the 65KB console tail.
 
-Do not keep inventing tail hacks. Use a real, scoped return channel after user approval.
+Do not bring back tail hacks or chunk protocols. If this path needs richer artifacts, propose a real scoped return
+channel as an explicit architecture decision.
 
 ## AWS Cleanup
 

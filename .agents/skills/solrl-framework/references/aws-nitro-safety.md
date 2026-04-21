@@ -49,6 +49,10 @@ one final result block. It is not an artifact transport.
 The EIF is built by GitHub Actions and published as a public GHCR OCI artifact. The EC2 parent pulls it with ORAS and
 verifies the `.sha384` sidecar before booting it. Do not put GHCR credentials in EC2 user-data for the default smoke path.
 
+The final result must include `SOLRL_PCR16`, `SOLRL_CLAIM_PCR16`, and `SOLRL_CLAIM_CONTEXT_HASH`. `SOLRL_PCR16` and
+`SOLRL_CLAIM_PCR16` must be equal. This is the regression check that proves the real Nitro smoke is using the same PCR16
+meaning as the registry.
+
 If asked to make real AWS smoke reliable, propose a scoped return channel instead of adding more tail parsing:
 
 - A minimal instance role that can write only this instance's exact run result tag, or

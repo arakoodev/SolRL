@@ -247,6 +247,7 @@ phase_verify_attestation() {
     --attestation-hex-path /tmp/solrl-attestation.hex \
     --expected-user-data-hex __USER_DATA_HEX__ \
     --expected-public-key-hex __PUBLIC_KEY_HEX__ \
+    --expected-pcr16-hex __CLAIM_PCR16_HEX__ \
     --summary-json /tmp/solrl-attestation-summary.json
 }
 
@@ -293,6 +294,8 @@ fi
   echo SOLRL_PCR1="$pcr1"
   echo SOLRL_PCR2="$pcr2"
   echo SOLRL_PCR16="$pcr16"
+  echo SOLRL_CLAIM_PCR16=__CLAIM_PCR16_HEX__
+  echo SOLRL_CLAIM_CONTEXT_HASH=__CLAIM_CONTEXT_HASH_HEX__
   echo SOLRL_RESULT_END
 } >/run/solrl-result.txt
 

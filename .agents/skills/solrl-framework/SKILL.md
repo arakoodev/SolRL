@@ -31,6 +31,8 @@ Use this skill to keep another AI from improvising around the sharp edges. The b
 - Do not use broad cleanup. Delete only resources tagged `Project=SolRL` and the exact current `SolRLRunId`.
 - Do not introduce S3, IAM roles, SSM, SSH keys, inbound security group rules, or debug-mode Nitro into the smoke path without naming it as an architecture change and getting user approval.
 - Do not change ClaimV1, SlashClaimV1, or PCR16 on only one side. Rust and Python must stay byte-compatible.
+- Do not let Nitro `user_data` drift from registry PCR16 semantics. `pcr16_user_data` is the NSM ExtendPCR input;
+  `pcr16_digest` is the locked PCR16 ClaimV1 signs and the registry recomputes.
 - Do not remove `.github/dependabot.yml` or let root Cargo Dependabot manage indirect dependencies. Solana's lockfile has duplicate transitive crates and unconfigured Dependabot creates noisy failed update runs.
 
 ## Standard Workflow
@@ -112,6 +114,9 @@ When touching Docker:
 The current no-S3, no-IAM smoke path uses EC2 console output as the return channel after cloud-init stops the instance. This is intentionally limited.
 
 The real AWS path pulls a public GHCR OCI artifact for the raw EIF, verifies its `.sha384` sidecar on the EC2 parent, then boots it. If real AWS runs reach `pull_eif` but no final `SOLRL_RESULT_BEGIN` block appears, do not keep adding console tail hacks. That already failed. Read `references/troubleshooting.md`, then propose a real return channel as an explicit architecture decision.
+
+The smoke must print both `SOLRL_PCR16` and `SOLRL_CLAIM_PCR16`, and they must match. If they do not, the AWS attestation
+rail and the Solana settlement rail are proving different things.
 
 ## Completion Checklist
 

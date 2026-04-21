@@ -94,6 +94,7 @@ cloud-init
     +--> nitro-cli run-enclave
     +--> VSOCK request to worker
     +--> verify COSE / AWS root / PCRs / user_data
+    +--> assert SOLRL_PCR16 == SOLRL_CLAIM_PCR16
     +--> emit final result block
     +--> shutdown
 ```

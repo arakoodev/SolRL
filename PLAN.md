@@ -210,8 +210,9 @@ Required AWS safety invariants:
 - Cleanup refuses to delete resources unless ownership tags match the active run.
 - The default AWS smoke does not create IAM roles, pass roles, use an instance profile, or depend on SSM.
 - The smoke uses a non-debug Nitro enclave. Debug-mode PCRs are not acceptable for attestation.
-- The smoke extends PCR16 with the ClaimV1 context, locks PCR16, verifies the locked PCR16 digest, and verifies the COSE
-  signature, AWS root public key, non-zero PCRs, `user_data`, and worker public key before declaring success.
+- The smoke derives `pcr16_user_data` from the same `Pcr16Components` the registry uses, extends PCR16 once with that
+  value, locks PCR16, verifies `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`, and verifies the COSE signature, AWS root public key,
+  non-zero PCRs, `user_data`, and worker public key before declaring success.
 
 ## Protocol Architecture
 

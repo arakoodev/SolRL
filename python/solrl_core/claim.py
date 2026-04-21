@@ -179,8 +179,13 @@ def pcr16_preimage(components: dict[str, Any]) -> bytes:
     return PCR16_DOMAIN + b"\0" + encode_pcr16_components(components)
 
 
-def pcr16_digest(components: dict[str, Any]) -> str:
+def pcr16_user_data(components: dict[str, Any]) -> str:
     return hashlib.sha384(pcr16_preimage(components)).hexdigest()
+
+
+def pcr16_digest(components: dict[str, Any]) -> str:
+    extension_data = bytes.fromhex(pcr16_user_data(components))
+    return hashlib.sha384(bytes(48) + extension_data).hexdigest()
 
 
 def encode_claim_v1(claim: dict[str, Any]) -> bytes:

@@ -275,6 +275,10 @@ Solana registry
   transfers escrow to operator
 ```
 
+Implementation detail that matters: the Nitro worker does not invent a separate PCR16 meaning. It receives
+`pcr16_user_data = sha384(Pcr16Components)`, extends PCR16 once, and the registry signs/checks the resulting locked PCR16.
+Same input, same proof, same payout path. This is the whole game.
+
 The token changes operator behavior because bad execution has a cost.
 
 Without stake, a fake operator just disappears.

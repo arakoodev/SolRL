@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ from solrl_core.claim import (
     claim_message,
     hex32,
     load_json,
+    pcr16_digest,
+    pcr16_user_data,
     private_key_from_seed,
     pubkey_bytes,
     sign_slash_claim,
@@ -21,6 +24,7 @@ from solrl_core.claim import (
     verify_claim,
     verify_slash_claim,
 )
+from solrl_core.claim_context import build_pcr16_components
 from solrl_core.config import load_config
 from solrl_core.mock_hook import HookError, apply_transfer_hook
 from solrl_core.mock_verifier import verify_and_sign
@@ -64,6 +68,18 @@ def test_claim_signature_roundtrip(tmp_path):
     assert verify_claim(claim, signature, identity.public_key_hex)
     assert "network_policy_hash" in claim
     assert len(bytes.fromhex(claim["pcr16"])) == 48
+    assert "pcr16_user_data" not in claim
+
+
+def test_pcr16_models_nitro_extend_pcr_once(tmp_path):
+    config = load_config()
+    artifacts = build_mock_artifacts(tmp_path, config["job"]["job_account"])
+    components = build_pcr16_components(config, artifacts, "pytest-nonce")
+
+    user_data = bytes.fromhex(pcr16_user_data(components))
+    expected_locked_pcr16 = hashlib.sha384(bytes(48) + user_data).hexdigest()
+
+    assert pcr16_digest(components) == expected_locked_pcr16
 
 
 def test_hook_accepts_once_and_rejects_replay(tmp_path):

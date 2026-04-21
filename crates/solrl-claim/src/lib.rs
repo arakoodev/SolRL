@@ -108,9 +108,20 @@ pub fn pcr16_preimage(components: &Pcr16Components) -> std::io::Result<Vec<u8>> 
     domain_message(PCR16_DOMAIN, components)
 }
 
-pub fn pcr16_digest(components: &Pcr16Components) -> std::io::Result<[u8; 48]> {
+pub fn pcr16_user_data(components: &Pcr16Components) -> std::io::Result<[u8; 48]> {
     let preimage = pcr16_preimage(components)?;
     let digest = Sha384::digest(preimage);
+    let mut out = [0u8; 48];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+pub fn pcr16_digest(components: &Pcr16Components) -> std::io::Result<[u8; 48]> {
+    let extension_data = pcr16_user_data(components)?;
+    let mut hasher = Sha384::new();
+    hasher.update([0u8; 48]);
+    hasher.update(extension_data);
+    let digest = hasher.finalize();
     let mut out = [0u8; 48];
     out.copy_from_slice(&digest);
     Ok(out)
@@ -257,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn pcr16_is_sha384_and_stable() -> std::io::Result<()> {
+    fn pcr16_models_nitro_extend_pcr_once() -> std::io::Result<()> {
         let components = Pcr16Components {
             job_account: pubkey(1),
             lease_account: pubkey(2),
@@ -278,7 +289,17 @@ mod tests {
             protocol_version: CLAIM_PROTOCOL_VERSION,
         };
 
+        let user_data = pcr16_user_data(&components)?;
+        let mut hasher = Sha384::new();
+        hasher.update([0u8; 48]);
+        hasher.update(user_data);
+        let expected_locked_pcr16 = hasher.finalize();
+        let mut expected = [0u8; 48];
+        expected.copy_from_slice(&expected_locked_pcr16);
+
+        assert_eq!(user_data.len(), 48);
         assert_eq!(pcr16_digest(&components)?.len(), 48);
+        assert_eq!(pcr16_digest(&components)?, expected);
         assert_eq!(pcr16_digest(&components)?, pcr16_digest(&components)?);
         Ok(())
     }
