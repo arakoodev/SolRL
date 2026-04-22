@@ -23,7 +23,6 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
 
 from solrl_core.claim_context import build_aws_smoke_artifacts, build_claim_context, claim_context_hash
-from solrl_core.config import load_config
 
 
 AWS_ROOT_KEY_HEX = (
@@ -41,6 +40,8 @@ DEFAULT_EIF_PACKAGE_NAME = "solrl-nitro-worker-eif"
 ORAS_VERSION = "1.2.2"
 MAX_EC2_USER_DATA_BYTES = 16_384
 ACTIVE_INSTANCE_STATES = ["pending", "running", "stopping", "stopped"]
+CONSOLE_RESULT_POLL_ATTEMPTS = 60
+CONSOLE_RESULT_POLL_SECONDS = 10
 ROOT = Path(__file__).resolve().parents[2]
 FINAL_RESULT_REQUIRED_FIELDS = {
     "SOLRL_STATUS",
@@ -374,7 +375,9 @@ def parse_remote_markers(stdout: str) -> dict[str, str]:
         raise AwsNitroRunnerError(f"remote Nitro command did not return markers: {', '.join(missing)}")
     if markers["SOLRL_STATUS"] == "FAILED":
         phase = markers.get("SOLRL_PHASE", "unknown")
-        raise AwsNitroRunnerError(f"remote Nitro smoke failed during phase {phase}; see console-output.txt")
+        tail = _extract_remote_error_tail(block)
+        detail = f"; remote tail:\n{tail}" if tail else "; see console-output.txt"
+        raise AwsNitroRunnerError(f"remote Nitro smoke failed during phase {phase}{detail}")
     if markers["SOLRL_STATUS"] != "OK":
         raise AwsNitroRunnerError(f"remote Nitro command returned status {markers['SOLRL_STATUS']}")
 
@@ -394,6 +397,22 @@ def parse_remote_markers(stdout: str) -> dict[str, str]:
     if len(root_sha) != 64 or any(char not in "0123456789abcdefABCDEF" for char in root_sha):
         raise AwsNitroRunnerError("remote Nitro root key hash marker must be 32-byte hex")
     return markers
+
+
+def _extract_remote_error_tail(block: list[str]) -> str:
+    collecting = False
+    lines: list[str] = []
+    for line in block:
+        if line == "SOLRL_ERROR_TAIL_BEGIN":
+            collecting = True
+            lines = []
+            continue
+        if line == "SOLRL_ERROR_TAIL_END":
+            collecting = False
+            continue
+        if collecting:
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _load_cose_sign1(document: bytes) -> tuple[bytes, bytes, bytes, dict[str, Any]]:
@@ -455,10 +474,16 @@ def _verify_cert_chain(payload_map: dict[str, Any], timestamp_ms: int) -> bytes:
     bundle = [x509.load_der_x509_certificate(cert) for cert in reversed(payload_map["cabundle"])]
     chain = [leaf, *bundle]
     checked_at = dt.datetime.fromtimestamp(timestamp_ms / 1000, tz=dt.timezone.utc)
-    for child, parent in zip(chain, chain[1:], strict=False):
+    for child, parent in zip(chain, chain[1:]):
         if child.issuer != parent.subject:
             raise AwsNitroRunnerError("Nitro certificate chain issuer mismatch")
-        if checked_at < child.not_valid_before_utc or checked_at > child.not_valid_after_utc:
+        valid_before = getattr(child, "not_valid_before_utc", None)
+        if valid_before is None:
+            valid_before = child.not_valid_before.replace(tzinfo=dt.timezone.utc)
+        valid_after = getattr(child, "not_valid_after_utc", None)
+        if valid_after is None:
+            valid_after = child.not_valid_after.replace(tzinfo=dt.timezone.utc)
+        if checked_at < valid_before or checked_at > valid_after:
             raise AwsNitroRunnerError("Nitro certificate is not valid at attestation timestamp")
         _verify_cert_signature(child, parent)
 
@@ -524,9 +549,9 @@ def _git_output(*args: str) -> str:
 
 def public_clone_url(remote_url: str) -> str:
     if remote_url.startswith("git@github.com:"):
-        return "https://github.com/" + remote_url.removeprefix("git@github.com:")
+        return "https://github.com/" + remote_url[len("git@github.com:") :]
     if remote_url.startswith("ssh://git@github.com/"):
-        return "https://github.com/" + remote_url.removeprefix("ssh://git@github.com/")
+        return "https://github.com/" + remote_url[len("ssh://git@github.com/") :]
     return remote_url
 
 
@@ -700,7 +725,8 @@ class AwsNitroRunner:
         return vpc_id, subnet_id
 
     def _default_ami(self) -> str:
-        if ami_id := os.environ.get("SOLRL_NITRO_AMI_ID"):
+        ami_id = os.environ.get("SOLRL_NITRO_AMI_ID")
+        if ami_id:
             self.log(f"using SOLRL_NITRO_AMI_ID: {ami_id}")
             return ami_id
         images = self.ec2.describe_images(
@@ -741,6 +767,8 @@ class AwsNitroRunner:
             f"launching tagged enclave-enabled EC2 parent ({self.config.instance_type}, "
             f"{self.config.root_volume_gib} GiB root)"
         )
+        from solrl_core.config import load_config
+
         protocol_config = load_config()
         claim_context = build_claim_context(
             protocol_config,
@@ -825,28 +853,43 @@ class AwsNitroRunner:
 
         self.log("instance finished; reading final EC2 console output")
         last_output = ""
-        for _attempt in range(12):
-            response = self.ec2.get_console_output(InstanceId=self.instance_id, Latest=True)
-            output = response.get("Output", "") or ""
-            if output:
-                last_output = output
-                self._write_text("console-output.txt", output)
-                if "SOLRL_RESULT_BEGIN" in output and "SOLRL_RESULT_END" in output:
-                    return output
-            time.sleep(10)
+        for _attempt in range(CONSOLE_RESULT_POLL_ATTEMPTS):
+            for latest in (True, False):
+                output = self._read_console_output(latest)
+                if output:
+                    last_output = output
+                    self._write_text("console-output.txt", output)
+                    if "SOLRL_RESULT_BEGIN" in output and "SOLRL_RESULT_END" in output:
+                        return output
+            time.sleep(CONSOLE_RESULT_POLL_SECONDS)
         self._write_text("console-output.txt", last_output)
         raise AwsNitroRunnerError("remote Nitro smoke did not publish a final SOLRL_RESULT block")
 
     def _capture_console_snapshot(self, name: str = "console-output-snapshot.txt") -> None:
         if not self.instance_id:
             return
-        try:
-            response = self.ec2.get_console_output(InstanceId=self.instance_id, Latest=True)
-        except botocore.exceptions.ClientError as exc:
-            self._write_text(name, f"could not read EC2 console output: {exc}\n")
+        errors: list[str] = []
+        for latest in (True, False):
+            try:
+                output = self._read_console_output(latest)
+            except botocore.exceptions.ClientError as exc:
+                errors.append(f"Latest={latest}: {exc}")
+                continue
+            if output:
+                self._write_text(name, output)
+                return
+        if errors:
+            self._write_text(name, "could not read EC2 console output:\n" + "\n".join(errors) + "\n")
             return
+        self._write_text(name, "")
+
+    def _read_console_output(self, latest: bool) -> str:
+        try:
+            response = self.ec2.get_console_output(InstanceId=self.instance_id, Latest=latest)
+        except botocore.exceptions.ClientError:
+            raise
         output = response.get("Output", "") or ""
-        self._write_text(name, output)
+        return output
 
     def _persist_remote_outputs(self, markers: dict[str, str]) -> None:
         self._write_json("remote-markers.json", markers)

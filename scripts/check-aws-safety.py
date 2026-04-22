@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
@@ -18,6 +19,12 @@ WORKER_CARGO = ROOT / "crates/solrl-nitro-worker/Cargo.toml"
 FLAKE = ROOT / "flake.nix"
 WORKFLOW = ROOT / ".github/workflows/build-nitro-eif.yml"
 ACTRC = ROOT / ".actrc"
+REMOTE_PYTHON_FILES = (
+    ROOT / "python/solrl_core/aws_nitro_runner.py",
+    ROOT / "python/solrl_core/claim.py",
+    ROOT / "python/solrl_core/claim_context.py",
+    ROOT / "python/solrl_core/config.py",
+)
 
 
 def fail(message: str) -> None:
@@ -28,6 +35,13 @@ def fail(message: str) -> None:
 def require(text: str, needle: str, message: str) -> None:
     if needle not in text:
         fail(message)
+
+
+def require_python37_parse(path: Path) -> None:
+    try:
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 7))
+    except SyntaxError as exc:
+        fail(f"{path.relative_to(ROOT)} must parse on Amazon Linux 2 Python 3.7: line {exc.lineno}: {exc.msg}")
 
 
 def main() -> int:
@@ -57,6 +71,9 @@ def main() -> int:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     combined_runner = runner + "\n" + templates
 
+    for path in REMOTE_PYTHON_FILES:
+        require_python37_parse(path)
+
     require(e2e, "python3 -m solrl_core.aws_nitro_runner smoke", "e2e-aws-nitro.sh must call the main runner module")
     require(runner, "def require_docker(", "AWS runner must refuse host execution")
     require(runner, "SOLRL_IN_DOCKER", "AWS runner must check SOLRL_IN_DOCKER")
@@ -74,6 +91,16 @@ def main() -> int:
     require(runner, "describe_images(", "AWS runner must resolve the AMI through ec2:DescribeImages")
     require(runner, "UserData=user_data", "AWS runner must execute the remote smoke through EC2 user-data")
     require(runner, "get_console_output(", "AWS runner must collect the final smoke result through EC2 console output")
+    require(
+        runner,
+        "CONSOLE_RESULT_POLL_ATTEMPTS = 60",
+        "AWS runner must poll EC2 console for 10 minutes after stopped state; AWS propagation is delayed",
+    )
+    require(
+        runner,
+        "for latest in (True, False):",
+        "AWS runner must read both Latest and non-Latest EC2 console output variants",
+    )
     require(runner, "audit_resources(", "AWS runner must include read-only resource audits")
     require(runner, "_preflight_audit(", "smoke must run a first-class preflight audit")
     require(runner, "_post_audit(", "smoke must run a first-class post-run audit")
@@ -106,6 +133,21 @@ def main() -> int:
         "claim_context[\"pcr16\"]",
         "AWS smoke must compare the Nitro PCR16 to the registry ClaimV1 PCR16",
     )
+    require(
+        runner,
+        "remote tail:",
+        "AWS runner must surface compact remote failure tails instead of hiding failed SOLRL_RESULT blocks",
+    )
+    if ":=" in runner:
+        fail("AWS runner must stay Python 3.7 compatible for the Amazon Linux 2 EC2 parent; walrus operator is forbidden")
+    if "strict=False" in runner:
+        fail("AWS runner must stay Python 3.7 compatible; zip(strict=...) is forbidden")
+    if ".removeprefix(" in runner:
+        fail("AWS runner must stay Python 3.7 compatible; str.removeprefix is forbidden")
+    if ".not_valid_before_utc" in runner or ".not_valid_after_utc" in runner:
+        fail("AWS runner must support cryptography<42 on the EC2 parent; use compatibility accessors")
+    if "from solrl_core.config import load_config" in runner.split("class AwsNitroRunner", 1)[0]:
+        fail("verify-attestation must import on EC2 without tomli; load_config must not be a top-level runner import")
     if 'sha256_hex(f"{self.config.run_id}:solrl-claim-v1")' in runner:
         fail("AWS smoke must not use run-id filler as Nitro user_data")
     require(

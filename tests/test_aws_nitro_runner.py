@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
 
@@ -320,8 +321,60 @@ def test_parse_remote_markers_rejects_failed_status() -> None:
         ]
     )
 
-    with pytest.raises(AwsNitroRunnerError, match="pull_eif"):
+    with pytest.raises(AwsNitroRunnerError, match="pull_eif; remote tail:\\noras pull failed"):
         parse_remote_markers(stdout)
+
+
+def test_remote_python_files_parse_as_python37() -> None:
+    for path in (
+        Path("python/solrl_core/aws_nitro_runner.py"),
+        Path("python/solrl_core/claim.py"),
+        Path("python/solrl_core/claim_context.py"),
+        Path("python/solrl_core/config.py"),
+    ):
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 7))
+
+
+def test_remote_verifier_path_avoids_newer_runtime_features() -> None:
+    runner = Path("python/solrl_core/aws_nitro_runner.py").read_text(encoding="utf-8")
+
+    assert ":=" not in runner
+    assert "strict=False" not in runner
+    assert ".not_valid_before_utc" not in runner
+    assert ".not_valid_after_utc" not in runner
+    assert "from solrl_core.config import load_config" not in runner.split("class AwsNitroRunner", 1)[0]
+
+
+def test_wait_for_final_console_result_handles_delayed_console_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedConsoleEc2:
+        def __init__(self) -> None:
+            self.latest_values: list[bool] = []
+            self.remaining_outputs = ["", "", final_block()]
+
+        def describe_instances(self, InstanceIds: list[str]) -> dict:
+            return {"Reservations": [{"Instances": [{"InstanceId": InstanceIds[0], "State": {"Name": "stopped"}}]}]}
+
+        def get_console_output(self, InstanceId: str, Latest: bool) -> dict:
+            assert InstanceId == "i-test"
+            self.latest_values.append(Latest)
+            output = self.remaining_outputs.pop(0) if self.remaining_outputs else ""
+            return {"Output": output}
+
+    monkeypatch.setattr("solrl_core.aws_nitro_runner.time.sleep", lambda _seconds: None)
+    runner = AwsNitroRunner.__new__(AwsNitroRunner)
+    runner.config = make_config("solrl-test", tmp_path)
+    runner.ec2 = DelayedConsoleEc2()
+    runner.instance_id = "i-test"
+    runner.log = lambda _message: None
+
+    output = runner._wait_for_final_console_result()
+
+    assert "SOLRL_RESULT_BEGIN" in output
+    assert runner.ec2.latest_values[:3] == [True, False, True]
+    assert (runner.config.artifact_dir / "console-output.txt").read_text(encoding="utf-8") == output
 
 
 def test_remote_script_configures_allocator_before_start() -> None:
