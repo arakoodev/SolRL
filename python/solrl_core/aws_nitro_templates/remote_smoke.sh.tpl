@@ -253,9 +253,15 @@ phase_verify_attestation() {
 
 phase_terminate_enclave() {
   nitro-cli describe-enclaves >/tmp/solrl-describe.json
-  enclave_id="$(jq -r '.[0].EnclaveID // empty' /tmp/solrl-describe.json)"
-  test -n "$enclave_id"
-  nitro-cli terminate-enclave --enclave-id "$enclave_id" >/tmp/solrl-terminate.json
+  enclave_ids="$(jq -r '.[].EnclaveID // empty' /tmp/solrl-describe.json)"
+  if [ -z "$enclave_ids" ]; then
+    printf '{"terminated":[],"note":"no running enclaves"}\n' >/tmp/solrl-terminate.json
+    return 0
+  fi
+  : >/tmp/solrl-terminate.json
+  for enclave_id in $enclave_ids; do
+    nitro-cli terminate-enclave --enclave-id "$enclave_id" >>/tmp/solrl-terminate.json
+  done
 }
 
 run_phase packages 600 phase_packages

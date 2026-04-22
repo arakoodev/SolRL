@@ -432,6 +432,8 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "sock.sendall(payload.encode(\"ascii\"))" in script
     assert "verify-attestation" in script
     assert script.index("verify-attestation") < script.index("SOLRL_STATUS=OK")
+    assert "no running enclaves" in script
+    assert 'test -n "$enclave_id"' not in script
     assert "nitro-cli describe-eif" in script
     assert "SOLRL_EIF_OCI_REF=" in script
     assert "SOLRL_EIF_SHA384=" in script

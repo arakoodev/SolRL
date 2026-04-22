@@ -195,6 +195,13 @@ def main() -> int:
     require(remote, "run_phase oras 300 phase_oras", "AWS remote smoke must timeout ORAS setup")
     require(remote, "run_phase pull_eif 900 phase_pull_eif", "AWS remote smoke must timeout EIF artifact pulls")
     require(remote, "run_phase attestation 300 phase_attestation", "AWS remote smoke must timeout VSOCK attestation")
+    require(
+        remote,
+        "no running enclaves",
+        "AWS remote smoke must treat an already-exited one-shot enclave as successful cleanup",
+    )
+    if 'test -n "$enclave_id"' in remote:
+        fail("AWS terminate_enclave phase must not fail when the one-shot enclave already exited")
     require(remote, "export HOME=/root", "AWS remote smoke must set HOME under cloud-init")
     require(remote, "git clone \"$git_url\" \"$SRC_DIR\"", "AWS remote smoke must clone the public repo on EC2")
     require(remote, "git checkout --detach", "AWS remote smoke must checkout an explicit immutable git ref")
