@@ -16,7 +16,7 @@ python3 -m solrl_core.cli local-mock \
   --state "$WORK_DIR/hook_state.json" \
   --nonce local-attempt-1
 
-cargo test -p solrl-registry --test registry_flow
+cargo test -p solrl-registry --test registry_flow --locked
 
 echo "SolRL local mock e2e OK"
 echo "Artifacts: $WORK_DIR"

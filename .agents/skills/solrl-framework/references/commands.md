@@ -129,7 +129,7 @@ SolRLRunId=<exact run id>
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_claim_flow.py
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_aws_nitro_runner.py
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_verifier_service.py tests/test_harbor_nitro_environment.py tests/test_cli.py
-docker compose run --rm --no-deps dev-shell cargo test --workspace
+docker compose run --rm --no-deps dev-shell cargo test --workspace --locked
 ```
 
 ## Verification Commands
@@ -165,6 +165,9 @@ Run the on-chain implementation proof:
 ```bash
 docker compose run --rm lint
 docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
+docker compose run --rm --no-deps dev-shell \
+  cargo test -p solrl-registry --test registry_flow \
+  settle_claim_transfers_token2022_balance_with_registry_pda_authority -- --nocapture
 ```
 
 Run the real Nitro proof:

@@ -515,13 +515,11 @@ pub mod solrl_registry {
             claim.amount,
             ctx.bumps.transfer_guard,
         )?;
-        ctx.accounts.transfer_guard.exit(ctx.program_id)?;
+        // Program-initiated settlement is guarded by the escrow PDA authority. Do
+        // not require the same registry program's transfer hook to consume this
+        // guard here: registry -> Token-2022 -> registry hook is rejected by the
+        // runtime as same-instruction reentry.
         transfer_escrow_to_operator(&ctx, claim.amount)?;
-        ctx.accounts.transfer_guard.reload()?;
-        require!(
-            ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
-            SolrlError::InvalidTransferGuard
-        );
         close_transfer_guard(
             ctx.accounts.transfer_guard.to_account_info(),
             ctx.accounts.payer.to_account_info(),
@@ -594,13 +592,10 @@ pub mod solrl_registry {
             slash_claim.slash_amount,
             ctx.bumps.transfer_guard,
         )?;
-        ctx.accounts.transfer_guard.exit(ctx.program_id)?;
+        // Stake slashing follows the same PDA-authority path as settlement. The
+        // same-program hook remains available for direct token-hook validation,
+        // but it is not part of this program-initiated CPI.
         transfer_stake_to_treasury(&ctx, slash_claim.slash_amount)?;
-        ctx.accounts.transfer_guard.reload()?;
-        require!(
-            ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
-            SolrlError::InvalidTransferGuard
-        );
         close_transfer_guard(
             ctx.accounts.transfer_guard.to_account_info(),
             ctx.accounts.payer.to_account_info(),
@@ -662,13 +657,10 @@ pub mod solrl_registry {
             amount,
             ctx.bumps.transfer_guard,
         )?;
-        ctx.accounts.transfer_guard.exit(ctx.program_id)?;
+        // Withdrawal uses the stake PDA authority directly for the same reason
+        // as settlement and slashing: same-program transfer-hook reentry is not
+        // a valid settlement mechanism.
         transfer_stake_to_withdraw_destination(&ctx, amount)?;
-        ctx.accounts.transfer_guard.reload()?;
-        require!(
-            ctx.accounts.transfer_guard.status == TRANSFER_GUARD_STATUS_CONSUMED,
-            SolrlError::InvalidTransferGuard
-        );
         close_transfer_guard(
             ctx.accounts.transfer_guard.to_account_info(),
             ctx.accounts.owner.to_account_info(),

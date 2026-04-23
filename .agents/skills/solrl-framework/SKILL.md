@@ -1,6 +1,6 @@
 ---
 name: solrl-framework
-description: Operate and modify the SolRL repository safely. Use when working on SolRL Docker workflows, Harbor mock evals, Anchor/Token-2022 registry code, ClaimV1 schema parity, PCR16 hashing, LocalStack tests, real AWS Nitro smoke tests, Marlin/Oyster Nix EIF builds, AWS tagging and cleanup, or docs for this framework.
+description: Operate and modify the SolRL repository safely. Use when working on SolRL Docker workflows, Harbor mock evals, Anchor/Token-2022 registry code, verification proof runs, ClaimV1 schema parity, PCR16 hashing, LocalStack tests, real AWS Nitro smoke tests, Marlin/Oyster Nix EIF builds, AWS tagging and cleanup, or docs for this framework.
 ---
 
 # SolRL Framework
@@ -88,7 +88,7 @@ When the user asks to verify the system, do not only run the smoke. Produce evid
 
 ```text
 1. Token settlement semantics: local-mock paid once and rejected replay.
-2. On-chain token implementation: lint + Anchor tests prove Token-2022 CPI wiring and registry checks compile.
+2. On-chain token implementation: lint + Anchor tests prove Token-2022 CPI wiring, registry checks, and local-validator balance movement.
 3. Real Nitro attestation: AWS smoke proves NSM attestation, AWS root verification, PCR16 bridge, and cleanup.
 ```
 
@@ -109,14 +109,15 @@ Report these exact artifacts:
 - `artifacts/mock/mvp_result.json`: `status=paid`, `replay_rejected=true`.
 - `artifacts/mock/hook_state.json`: one ledger entry with amount, claim hash, job account, and payout token account.
 - `artifacts/mock/claim_receipt.json`: ClaimV1, verifier signature, token mint, payout account, amount.
+- `programs/solrl-registry/tests/registry_flow.rs`: `settle_claim_transfers_token2022_balance_with_registry_pda_authority` proves real Token-2022 balance movement.
 - `artifacts/aws-nitro/<run-id>/remote-markers.json`: `SOLRL_STATUS=OK`, `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`.
 - `artifacts/aws-nitro/<run-id>/run-instances.json`: enclave enabled, IMDSv2 required, exact SolRL tags.
 - `artifacts/aws-nitro/<run-id>/postaudit-project.json`: zero SolRL instances, security groups, and volumes.
 
 Be precise about the token boundary. V1 has real Token-2022 CPI code in `settle_claim` and `slash_operator`, lints that
-reject fake flag-only settlement, and a local payout/replay simulator. It does not yet have a full local-validator
-balance test proving the Token-2022 hook fires through the real token program and changes balances in one transaction.
-Do not oversell this. Reviewers trust clean boundaries more than inflated claims.
+reject fake flag-only settlement, a local payout/replay simulator, and a local-validator Token-2022 balance test. Do not
+claim the same-program transfer hook fires during settlement. Solana rejects `registry -> Token-2022 -> registry hook`
+reentry; V1 settlement uses registry PDA authorities over escrow and stake vaults.
 
 ## Edit Rules
 

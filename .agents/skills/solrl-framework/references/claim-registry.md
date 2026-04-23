@@ -63,12 +63,13 @@ settle_claim
     |
     +--> verify claim and policy graph
     +--> create replay receipts
-    +--> arm one-use TransferGuard
     +--> invoke Token-2022 transfer_checked
-    +--> transfer hook validates caller + consumes guard
+    +--> registry PDA authority signs escrow payout
 ```
 
-The hook is not the whole verifier. `settle_claim` owns the full claim graph. The hook is the narrow guard that prevents arbitrary direct transfers around settlement.
+The hook is not the settlement verifier. `settle_claim` owns the full claim graph, and the registry PDA authority is the
+enforceable boundary for escrow and stake vault token movement. Do not claim the same registry program hook fires during
+settlement; Solana rejects that same-program reentry path.
 
 ## What Counts As Token Evidence
 
@@ -84,16 +85,15 @@ implementation evidence
     programs/solrl-registry/src/lib.rs   settle_claim and slash_operator call Token-2022 transfer_checked
     scripts/check-token2022-wiring.py    rejects fake flag-only settlement regressions
     scripts/check-registry-claim-checks.py rejects signed-but-unchecked claim fields
-
-missing V1 evidence
-    no full local-validator balance test yet proving Token-2022 invokes the hook and mutates token balances
+    programs/solrl-registry/tests/registry_flow.rs
+        settle_claim_transfers_token2022_balance_with_registry_pda_authority proves balance movement
 ```
 
 Say this plainly if asked whether the token is live: the registry is built around a Token-2022 mint, escrow token account,
 operator payout token account, operator stake token account, and treasury token account. `settle_claim` moves escrow to
 operator payout, and `slash_operator` moves operator stake to treasury. The local MVP proves the claim-to-payout behavior
-with a deterministic simulator. The remaining proof gap is a balance-level local-validator test through the real Token-2022
-program hook path.
+with a deterministic simulator. The local-validator test proves the real Token-2022 program mutates balances through the
+registry PDA authority path.
 
 ## Lints That Should Catch Past Mistakes
 

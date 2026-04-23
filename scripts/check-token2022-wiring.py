@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "programs/solrl-registry/src/lib.rs"
+REGISTRY_FLOW_TEST = ROOT / "programs/solrl-registry/tests/registry_flow.rs"
 README = ROOT / "README.md"
 PLAN = ROOT / "PLAN.md"
 
@@ -43,6 +44,7 @@ def main() -> int:
     hook = function_body(source, "transfer_hook")
     slash = function_body(source, "slash_operator")
     withdraw = function_body(source, "withdraw_stake")
+    registry_flow_test = REGISTRY_FLOW_TEST.read_text(encoding="utf-8")
 
     if "transfer_escrow_to_operator" not in settle:
         fail("settle_claim must execute the escrow payout")
@@ -55,25 +57,15 @@ def main() -> int:
     if "ctx.accounts.config.token_mint" not in hook:
         fail("transfer hook must guard the configured mint")
     if "consume_transfer_guard" not in hook:
-        fail("transfer hook must consume a TransferGuard")
+        fail("transfer hook must keep the narrow TransferGuard check for direct token transfers")
     if "arm_transfer_guard" not in settle:
-        fail("settle_claim must arm a TransferGuard before payout")
-    if "TransferGuard" not in source:
-        fail("registry must define a TransferGuard account")
-    if "ctx.accounts.transfer_guard.exit(ctx.program_id)" not in settle:
-        fail("settle_claim must flush the armed TransferGuard before Token-2022 CPI")
-    if "TRANSFER_GUARD_STATUS_CONSUMED" not in settle:
-        fail("settle_claim must fail unless the Token-2022 hook consumed the TransferGuard")
-    if "TRANSFER_GUARD_STATUS_CONSUMED" not in slash:
-        fail("slash_operator must fail unless the Token-2022 hook consumed the TransferGuard")
-    if "TRANSFER_GUARD_STATUS_CONSUMED" not in withdraw:
-        fail("withdraw_stake must fail unless the Token-2022 hook consumed the TransferGuard")
+        fail("settle_claim must retain scoped transfer metadata before payout")
     if "close_transfer_guard" not in settle:
-        fail("settle_claim must close the TransferGuard after the hook consumes it")
+        fail("settle_claim must close the temporary TransferGuard after payout")
     if "close_transfer_guard" not in slash:
-        fail("slash_operator must close the TransferGuard after the hook consumes it")
+        fail("slash_operator must close the temporary TransferGuard after slashing")
     if "close_transfer_guard" not in withdraw:
-        fail("withdraw_stake must close the TransferGuard after the hook consumes it")
+        fail("withdraw_stake must close the temporary TransferGuard after withdrawal")
     if "transfer_stake_to_withdraw_destination" not in withdraw:
         fail("withdraw_stake must transfer operator stake through Token-2022")
     if "ExtraAccountMetaList::init" not in source:
@@ -95,16 +87,45 @@ def main() -> int:
     if "armed_slot" not in source:
         fail("TransferGuard must store the slot it was armed in")
 
+    test_requirements = (
+        "settle_claim_transfers_token2022_balance_with_registry_pda_authority",
+        "spl_token_2022::processor::Processor::process",
+        "token_instruction::initialize_mint2",
+        "token_instruction::initialize_account3",
+        "token_instruction::mint_to",
+        "new_ed25519_instruction",
+        "assert_eq!(escrow_after, 0)",
+        "assert_eq!(payout_after, claim.amount)",
+    )
+    for requirement in test_requirements:
+        if requirement not in registry_flow_test:
+            fail(f"registry_flow.rs is missing Token-2022 balance proof: {requirement}")
+    if "transfer_hook_instruction::initialize" in registry_flow_test:
+        fail(
+            "registry_flow Token-2022 balance proof must not rely on reentrant same-program transfer hooks"
+        )
+
     combined_docs = README.read_text(encoding="utf-8") + "\n" + PLAN.read_text(encoding="utf-8")
     forbidden = (
         "hook verifies the full claim",
         "full claim verification in the transfer hook",
         "hook-side claim verification is implemented",
         "Token-2022 hook performs the entire claim check",
+        "requires the hook to consume",
+        "hook to consume that guard",
+        "watching the hook fire",
+        "hook fires through the real token program",
     )
     for phrase in forbidden:
         if phrase.lower() in combined_docs.lower():
             fail(f"docs overclaim Token-2022 hook behavior: {phrase}")
+    required_doc_phrases = (
+        "registry PDA authority",
+        "local-validator Token-2022 balance test",
+    )
+    for phrase in required_doc_phrases:
+        if phrase.lower() not in combined_docs.lower():
+            fail(f"docs must name the current Token-2022 proof boundary: {phrase}")
 
     print("Token-2022 lint OK")
     return 0

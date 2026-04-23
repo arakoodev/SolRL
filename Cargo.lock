@@ -4985,6 +4985,7 @@ name = "solrl-registry"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "ed25519-dalek",
  "solana-program",
  "solana-program-test",
  "solana-sdk",

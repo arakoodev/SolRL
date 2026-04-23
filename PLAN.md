@@ -10,7 +10,7 @@ What it does:
 - The worker produces an AWS Nitro attestation that binds the reward, task digest, artifact hashes, operator, job, and payout context.
 - A verifier enclave checks the Nitro attestation off-chain.
 - The registry validates the claim and releases payout through Token-2022.
-- A Token-2022 transfer hook guards token movement at the mint boundary.
+- Registry PDA authorities guard escrow and stake token movement.
 
 Why it matters:
 RL eval markets only work if the reward is hard to fake. Regular containers can be fast and cheap, but the host can lie. Nitro gives a hardware-rooted proof path. Solana gives fast settlement.
@@ -285,13 +285,14 @@ Implemented now:
 - Claim schema parity lints shared across Rust and Python
 - ClaimV1 golden vectors shared across Rust and Python tests
 - Signed-field validation lint for `settle_claim`
-- Token-2022 wiring lint for payout CPI and hook guard behavior
+- Token-2022 wiring lint for payout CPI and local-validator balance proof behavior
 - Docker boundary lint for no Docker-in-Docker, Cargo lockfile/SBF compatibility, and LocalStack honesty
 - Ed25519 instruction-sysvar parser for verifier signatures
 - Token-2022 `ExtraAccountMetaList` initializer
 - Token-2022 transfer hook fallback router and one-use `TransferGuard`
 - Token-2022 escrow payout CPI from `settle_claim`
 - Token-2022 stake slash CPI from `slash_operator`
+- Full local-validator Token-2022 balance test for `settle_claim`
 - Failure taxonomy for reject-only vs slashable claim failures
 - Program-test instruction coverage for registry bootstrap, lease owner auth, and on-chain PCR16 computation
 - On-chain PCR16 recomputation from `Job`, `Lease`, `Operator`, and claim nonce
@@ -302,8 +303,7 @@ Implemented now:
 - Harbor import-path environment surface: `solrl_harbor.nitro_environment:NitroEnvironment`
 
 Not implemented yet:
-- Full local-validator instruction test that proves Token-2022 calls the hook end-to-end.
-- Full hook-as-verifier mode. Token-2022 hook execute data only carries `amount`, and the mint-wide `ExtraAccountMetaList` can only pass accounts resolvable from source, mint, destination, owner, instruction data, or prior resolved accounts. The current job PDA graph is not derivable from those values. V1 therefore verifies the claim in `settle_claim`, arms a scoped `TransferGuard`, and requires the hook to consume it.
+- Full hook-as-verifier mode. Token-2022 hook execute data only carries `amount`, and the mint-wide `ExtraAccountMetaList` can only pass accounts resolvable from source, mint, destination, owner, instruction data, or prior resolved accounts. The current job PDA graph is not derivable from those values. V1 therefore verifies the claim in `settle_claim` and uses registry PDA authorities over escrow and stake vaults. Same-program `registry -> Token-2022 -> registry hook` reentry is rejected by Solana.
 - Anchor IDL generation. `anchor build --no-idl` passes; full IDL generation currently hits an Anchor `0.30.1` / `proc-macro2` compatibility problem.
 - Production Harbor-over-Nitro execution. The import-path class exists, but AWS mode intentionally errors until the VSOCK worker RPC path is wired.
 - Production Harbor Nitro EIF. The current real AWS gate boots a minimal SolRL worker EIF for NSM attestation smoke.
@@ -496,9 +496,7 @@ Use one atomic transaction.
     CPI: token_2022::transfer_checked
       escrow -> operator payout token account
 
-      Token-2022 invokes transfer hook
-        checks Token-2022 transfer hook `transferring` flag
-        checks mint matches protocol config
+      registry PDA authority signs the escrow payout
 
     after CPI success:
       marks ClaimReceipt paid
@@ -523,9 +521,9 @@ Current SolRL jobs are keyed by `job_id`, not by the escrow token account. That 
 
 V1 chooses the boring path that works:
 - `settle_claim` verifies `ClaimV1` and owns the escrow transfer.
-- `settle_claim` arms a one-use `TransferGuard` PDA for the exact source, mint, destination, owner, and amount.
 - Token-2022 still moves the tokens.
-- The transfer hook rejects raw transfers unless it can consume the matching `TransferGuard`.
+- The registry PDA authority signs escrow and stake vault transfers.
+- The local-validator Token-2022 balance test proves `settle_claim` moves escrow funds to operator payout.
 
 To make the hook itself verify claims later, redesign PDA seeds so the whole graph is derivable from the transfer's source token account:
 
@@ -834,7 +832,7 @@ Current test reality:
 - `scripts/e2e-local-mock.sh` proves the local worker -> verifier -> hook simulator path.
 - `solrl_core.verifier_service` has HTTP tests for valid proof signing and tampered claim rejection.
 - `solrl_harbor.nitro_environment:NitroEnvironment` has tests for start, exec, upload, download, stop, and the unwired AWS-mode failure.
-- A full Token-2022 validator transaction test is still missing. This is the next correctness gap, not a nice-to-have.
+- A local-validator Token-2022 transaction test now proves `settle_claim` moves escrow token balance through the registry PDA authority.
 
 ## Failure Modes To Test
 

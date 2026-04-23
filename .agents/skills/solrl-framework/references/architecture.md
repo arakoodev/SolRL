@@ -66,9 +66,8 @@ programs/solrl-registry::settle_claim
     +--> recompute PCR16 from registered components
     +--> cross-check Job, Lease, Operator, ImagePolicy fields
     +--> create ClaimReceipt / NonceReceipt
-    +--> arm TransferGuard
     +--> Token-2022 transfer_checked CPI
-    +--> transfer hook consumes TransferGuard
+    +--> registry PDA authority signs escrow payout
 ```
 
 Slashing follows the same idea: a signed `SlashClaimV1` moves stake from the operator stake vault to treasury.
@@ -146,7 +145,7 @@ Harbor/RL job context
     |       mock worker -> verifier signature -> hook simulator ledger payout -> replay rejection
     |
     +--> on-chain proof path
-    |       ClaimV1 -> settle_claim -> Token-2022 transfer_checked CPI -> TransferGuard hook
+    |       ClaimV1 -> settle_claim -> Token-2022 transfer_checked CPI -> registry PDA authority
     |       SlashClaimV1 -> slash_operator -> Token-2022 transfer_checked CPI -> treasury
     |
     +--> hardware proof path
@@ -157,12 +156,13 @@ Harbor/RL job context
 What this proves today:
 
 - The local protocol pays once and rejects replay.
-- The registry compiles the Token-2022 CPI paths and rejects common drift through lints and instruction tests.
+- The registry compiles the Token-2022 CPI paths and proves real Token-2022 balance movement through a local-validator test.
 - Real AWS Nitro produces the attestation, PCRs, and PCR16 bridge from an immutable commit-tagged EIF.
 
 What it does not yet prove:
 
-- A single local-validator transaction where Token-2022 invokes the hook and token balances change.
+- Hook-side claim verification. Program-initiated settlement uses registry PDA authorities because same-program
+  `registry -> Token-2022 -> registry hook` reentry is rejected.
 - Production Harbor-over-Nitro execution over VSOCK RPC.
 - A persistent verifier enclave that ingests real AWS COSE attestations and signs on-chain claims.
 

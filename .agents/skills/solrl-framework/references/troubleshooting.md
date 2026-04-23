@@ -62,11 +62,13 @@ If a reviewer asks "where is the token used?", do not point at the Nitro smoke. 
 
 - `artifacts/mock/hook_state.json` for the local payout ledger and replay rejection.
 - `programs/solrl-registry/src/lib.rs` for `settle_claim`, `slash_operator`, and Token-2022 `transfer_checked` CPI.
+- `programs/solrl-registry/tests/registry_flow.rs` for the local-validator Token-2022 balance test.
 - `scripts/check-token2022-wiring.py` for the lint that prevents fake flag-only settlement.
 - `README.md` section `Verification` for the exact proof commands.
 
-If a live Solana balance change is required, say the current gap plainly: the full local-validator Token-2022 balance
-test is not implemented yet. Do not fake this with the Python hook simulator.
+If someone asks whether the transfer hook fires during settlement, say no. V1 settlement uses registry PDA authorities
+over escrow and stake vaults because Solana rejects same-program `registry -> Token-2022 -> registry hook` reentry. The
+live balance proof is `settle_claim_transfers_token2022_balance_with_registry_pda_authority`.
 
 ## AWS Cleanup
 

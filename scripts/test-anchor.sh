@@ -9,5 +9,5 @@ fi
 rustup toolchain install 1.88.0 >/dev/null
 rustup default 1.88.0 >/dev/null
 
-cargo test --workspace
+cargo test --workspace --locked
 anchor build --no-idl

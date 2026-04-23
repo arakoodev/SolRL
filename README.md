@@ -6,7 +6,7 @@ Verify SolRL as a chain of evidence:
 
 ```text
 local claim flow proves: worker output -> verifier signature -> token payout semantics -> replay rejection
-registry build proves: ClaimV1 checks -> Token-2022 transfer_checked CPI -> hook guard wiring -> slashing path
+registry build proves: ClaimV1 checks -> Token-2022 transfer_checked CPI -> registry PDA authority -> slashing path
 real AWS proves: EC2 parent -> Nitro EIF boot -> NSM attestation -> AWS root verification -> PCR16 bridge
 ```
 
@@ -34,7 +34,7 @@ docker compose run --rm --no-deps harbor-runner \
 The Anchor program now compiles the real registry path too:
 
 ```text
-settle_claim -> verify ClaimV1 -> Token-2022 transfer_checked CPI -> hook guard -> ClaimReceipt paid
+settle_claim -> verify ClaimV1 -> Token-2022 transfer_checked CPI -> registry PDA authority -> ClaimReceipt paid
 slash_operator -> Token-2022 transfer_checked CPI -> stake vault to treasury
 ```
 
@@ -171,7 +171,7 @@ Run the full lint gate inside Docker:
 docker compose run --rm lint
 ```
 
-This checks Rust format, clippy, Ruff, Terraform format/validate, schema parity between Rust and Python, signed-field validation in `settle_claim`, PCR16 recomputation, Token-2022 `TransferGuard` wiring, LocalStack honesty, Cargo lockfile compatibility with the SBF builder, neutral public docs language, and the no-Docker-in-Docker boundary.
+This checks Rust format, clippy, Ruff, Terraform format/validate, schema parity between Rust and Python, signed-field validation in `settle_claim`, PCR16 recomputation, Token-2022 CPI wiring, the local-validator Token-2022 balance proof, LocalStack honesty, Cargo lockfile compatibility with the SBF builder, neutral public docs language, and the no-Docker-in-Docker boundary.
 
 For Marlin-style reproducible enclave work, use Nix in its own container:
 
@@ -273,15 +273,15 @@ docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
 This runs:
 
 ```bash
-cargo test --workspace
+cargo test --workspace --locked
 anchor build --no-idl
 ```
 
 `--no-idl` is intentional right now. The SBF program builds, but Anchor `0.30.1` IDL generation currently trips on its `anchor-syn` / `proc-macro2` path under this Solana `1.18` toolchain. Do not pretend the IDL is done. The binary build is real; the IDL is the next tooling fix.
 
-The current Anchor instruction tests cover registry bootstrap, verifier policy binding, operator auth on leases, on-chain PCR16 computation, Token-2022 extra-account metadata initialization, and stake-withdrawal guard rails. The Python mock e2e covers the full off-chain protocol shape, then runs the registry instruction tests in the same Docker entrypoint.
+The current Anchor instruction tests cover registry bootstrap, verifier policy binding, operator auth on leases, on-chain PCR16 computation, Token-2022 extra-account metadata initialization, stake-withdrawal guard rails, and a local-validator Token-2022 balance test. That balance test creates a real Token-2022 mint and token accounts, mints escrow funds, sends an Ed25519 verifier instruction plus `settle_claim`, and asserts escrow goes to zero while the operator payout account receives the claim amount.
 
-One honest remaining gap: there is not yet a full local-validator transaction test proving Token-2022 invokes the hook end-to-end. V1 verifies claims in `settle_claim`, arms a one-use `TransferGuard`, flushes it before the CPI, and requires the hook to consume that guard. Full hook-side claim verification still needs a PDA seed redesign so the hook can derive the job, lease, receipt, and policy graph from the transfer inputs. Treat that as the current shipping boundary, not a buried footnote.
+The Token-2022 transfer hook is intentionally not used for program-initiated settlement in V1. A `registry -> Token-2022 -> registry hook` path is same-program reentrancy, and Solana rejects it. The enforceable settlement boundary is the registry PDA authority over escrow and stake vault transfers; full hook-side claim verification still needs a PDA seed redesign or a separate hook program.
 
 ## Verifier Service
 
@@ -434,18 +434,19 @@ docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
 
 Check:
 
-- `scripts/check-token2022-wiring.py` passes. It rejects regressions where `settle_claim` does not arm a one-use
-  `TransferGuard`, invoke Token-2022 `transfer_checked`, require the hook to consume the guard, and close the guard.
+- `scripts/check-token2022-wiring.py` passes. It rejects regressions where `settle_claim` does not invoke Token-2022
+  `transfer_checked`, where the registry PDA authority path is removed, or where the local-validator Token-2022 balance
+  proof disappears.
 - `scripts/check-registry-claim-checks.py` passes. It rejects signed fields that are never checked against registry state.
 - `programs/solrl-registry/src/lib.rs` contains the real `settle_claim`, `slash_operator`, `withdraw_stake`,
   `transfer_escrow_to_operator`, and `transfer_stake_to_treasury` paths.
 - `programs/solrl-registry/tests/registry_flow.rs` covers registry bootstrap, verifier policy binding, operator auth on
-  leases, PCR16 recomputation, Token-2022 extra account metadata creation, and stake withdrawal guard rails.
+  leases, PCR16 recomputation, Token-2022 extra account metadata creation, stake withdrawal guard rails, and
+  `settle_claim_transfers_token2022_balance_with_registry_pda_authority`.
 
-The current honest boundary: there is not yet a full local-validator test that mints Token-2022 accounts, sends a real
-`settle_claim` transaction, watches the hook fire through the token program, and asserts token balances changed. The code
-path exists and the lints guard the CPI wiring, but the balance-level integration test is the next thing to build if a
-balance-level integration proof is required.
+The current honest boundary: the local-validator test proves real Token-2022 balance movement through `settle_claim`, not
+hook-side claim verification. V1 uses registry-owned PDA authorities for escrow and stake vaults because same-program
+transfer-hook reentry is rejected by Solana. That is the working token settlement proof.
 
 ### 3. Prove Real AWS Nitro Attestation
 
@@ -508,9 +509,9 @@ The protocol token is represented by a Token-2022 mint in the registry config. J
 payout and stake token accounts, verified claims call settle_claim, and settle_claim performs a Token-2022 transfer_checked
 CPI from job escrow to operator payout. Slashing performs the same Token-2022 transfer_checked CPI from operator stake to
 treasury. The local MVP proves the claim-to-payout semantics with a deterministic hook simulator and replay rejection.
-The Anchor program compiles the real Token-2022 CPI paths and lints guard that they cannot silently degrade into flag
-flips. The remaining gap is one full local-validator balance test that proves the Token-2022 hook fires through the real
-token program and updates balances in one transaction.
+The Anchor program now has a local-validator Token-2022 balance test proving `settle_claim` moves real token balances in
+one transaction. The transfer hook is not part of that program-initiated settlement path; the registry PDA authority is the
+token boundary for V1.
 ```
 
 ## Docker-in-Docker
