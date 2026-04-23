@@ -36,14 +36,16 @@ This runs workspace Rust tests and `anchor build --no-idl`. `--no-idl` is curren
 
 ```bash
 docker compose run --rm nix-builder nix --version
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-kernel-bundle
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-root
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
+docker compose run --rm nix-builder nix build --no-link --print-out-paths \
+  .#solrl-nitro-worker \
+  .#solrl-nitro-kernel-bundle \
+  .#solrl-nitro-worker-root \
+  .#solrl-nitro-worker-eif
 ```
 
 This checks the Marlin/Oyster-style Nix EIF path locally in a container. The staged commands mirror GitHub Actions cache
-boundaries: static worker, Marlin/Oyster kernel bundle, app root, final EIF. The real AWS smoke pulls the CI-built EIF
+boundaries: static worker, Marlin/Oyster kernel bundle, app root, final EIF. Locally, use one `nix-builder` container for
+all four targets so the Nix store and Git inputs are reused during that run. The real AWS smoke pulls the CI-built EIF
 from public GHCR instead of rebuilding it on EC2.
 
 The shipped smoke path expects GitHub Actions to publish the raw EIF as a public GHCR OCI artifact. Test the workflow
@@ -128,4 +130,67 @@ docker compose run --rm --no-deps harbor-runner pytest -q tests/test_claim_flow.
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_aws_nitro_runner.py
 docker compose run --rm --no-deps harbor-runner pytest -q tests/test_verifier_service.py tests/test_harbor_nitro_environment.py tests/test_cli.py
 docker compose run --rm --no-deps dev-shell cargo test --workspace
+```
+
+## Competition Proof Commands
+
+Run the local token proof:
+
+```bash
+docker compose run --rm --no-deps harbor-runner \
+  python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
+```
+
+Inspect it:
+
+```bash
+docker compose run --rm --no-deps -T harbor-runner python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("artifacts/mock")
+result = json.loads((root / "mvp_result.json").read_text())
+receipt = json.loads((root / "claim_receipt.json").read_text())
+state = json.loads((root / "hook_state.json").read_text())
+assert result["status"] == "paid"
+assert result["replay_rejected"] is True
+assert len(state["ledger"]) == 1
+assert state["ledger"][0]["claim_hash"] == receipt["claim_hash"]
+print("LOCAL_TOKEN_PROOF_OK")
+PY
+```
+
+Run the on-chain implementation proof:
+
+```bash
+docker compose run --rm lint
+docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
+```
+
+Run the real Nitro proof:
+
+```bash
+docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner audit --scope project
+docker compose run --rm aws-nitro-runner
+```
+
+Inspect it:
+
+```bash
+RUN_ID=<run-id>
+docker compose run --rm --no-deps -T harbor-runner python - <<PY
+import json
+from pathlib import Path
+
+run_id = "$RUN_ID"
+root = Path("artifacts/aws-nitro") / run_id
+markers = json.loads((root / "remote-markers.json").read_text())
+postaudit = json.loads((root / "postaudit-project.json").read_text())
+assert markers["SOLRL_STATUS"] == "OK"
+assert markers["SOLRL_PCR16"] == markers["SOLRL_CLAIM_PCR16"]
+assert len(postaudit["instances"]) == 0
+assert len(postaudit["security_groups"]) == 0
+assert len(postaudit["volumes"]) == 0
+print("REAL_NITRO_PROOF_OK")
+PY
 ```

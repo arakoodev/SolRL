@@ -13,7 +13,8 @@ Use this skill to keep another AI from improvising around the sharp edges. The b
 
 1. Read `README.md` for the current public workflow.
 2. Read `PLAN.md` when changing architecture, AWS, token settlement, PCR16, or test strategy.
-3. Read the focused reference only when needed:
+3. If the user asks for competition readiness or proof that it works, read the README section `How A Judge Verifies This`.
+4. Read the focused reference only when needed:
    - `references/commands.md` for exact Docker commands.
    - `references/architecture.md` for the end-to-end data flow.
    - `references/aws-nitro-safety.md` for real AWS rules.
@@ -58,11 +59,15 @@ docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
 Use this for Nix EIF build checks without touching AWS:
 
 ```bash
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-kernel-bundle
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-root
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
+docker compose run --rm nix-builder nix build --no-link --print-out-paths \
+  .#solrl-nitro-worker \
+  .#solrl-nitro-kernel-bundle \
+  .#solrl-nitro-worker-root \
+  .#solrl-nitro-worker-eif
 ```
+
+Run all local Nix EIF targets in one `nix-builder` container unless debugging one exact stage. Separate Compose
+invocations rehydrate Git inputs and Nix store paths on cold caches. Slow, noisy, and easy to misdiagnose.
 
 Use this for GitHub Actions EIF workflow checks through `act`:
 
@@ -76,6 +81,42 @@ Use this for real AWS only after local gates pass:
 docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner audit --scope project
 docker compose run --rm aws-nitro-runner
 ```
+
+## Competition Evaluation Workflow
+
+When the user asks "prove this works", do not only run the smoke. Produce evidence for three separate claims:
+
+```text
+1. Token settlement semantics: local-mock paid once and rejected replay.
+2. On-chain token implementation: lint + Anchor tests prove Token-2022 CPI wiring and registry checks compile.
+3. Real Nitro attestation: AWS smoke proves NSM attestation, AWS root verification, PCR16 bridge, and cleanup.
+```
+
+Use:
+
+```bash
+docker compose build dev-shell harbor-runner aws-test-runner
+docker compose run --rm lint
+docker compose run --rm --no-deps harbor-runner pytest -q
+docker compose run --rm --no-deps harbor-runner python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
+docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
+docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner audit --scope project
+docker compose run --rm aws-nitro-runner
+```
+
+Report these exact artifacts:
+
+- `artifacts/mock/mvp_result.json`: `status=paid`, `replay_rejected=true`.
+- `artifacts/mock/hook_state.json`: one ledger entry with amount, claim hash, job account, and payout token account.
+- `artifacts/mock/claim_receipt.json`: ClaimV1, verifier signature, token mint, payout account, amount.
+- `artifacts/aws-nitro/<run-id>/remote-markers.json`: `SOLRL_STATUS=OK`, `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`.
+- `artifacts/aws-nitro/<run-id>/run-instances.json`: enclave enabled, IMDSv2 required, exact SolRL tags.
+- `artifacts/aws-nitro/<run-id>/postaudit-project.json`: zero SolRL instances, security groups, and volumes.
+
+Be precise about the token boundary. V1 has real Token-2022 CPI code in `settle_claim` and `slash_operator`, lints that
+reject fake flag-only settlement, and a local payout/replay simulator. It does not yet have a full local-validator
+balance test proving the Token-2022 hook fires through the real token program and changes balances in one transaction.
+Do not oversell this. Judges respect clean boundaries more than magical claims.
 
 ## Edit Rules
 
@@ -124,5 +165,7 @@ Before saying work is done:
 
 1. Show `git status --short`.
 2. State which Docker commands passed.
-3. If real AWS ran, state the AWS account, run id, created resource tags, cleanup result, and post-audit count.
-4. If a command could not be run, say why. No pretend green checkmarks.
+3. If this was a competition/evaluation run, state the local token proof, Anchor/Token-2022 proof, and Nitro proof
+   separately.
+4. If real AWS ran, state the AWS account, run id, created resource tags, cleanup result, and post-audit count.
+5. If a command could not be run, say why. No pretend green checkmarks.

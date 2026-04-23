@@ -70,5 +70,11 @@ After a real run, report:
 - AMI, instance type, VPC/subnet, security group id.
 - Tags used.
 - Whether attestation verified.
+- EIF OCI ref and EIF SHA-384.
+- `SOLRL_PCR0`, `SOLRL_PCR1`, `SOLRL_PCR2`, and `SOLRL_PCR16`.
+- Whether `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`.
 - Whether the instance stopped/terminated.
 - Post-audit counts for SolRL instances, security groups, and volumes.
+
+Do not use real AWS output as token evidence by itself. Nitro proves the hardware rail. Token proof comes from the local
+MVP artifacts plus the registry/Token-2022 build and lint evidence.

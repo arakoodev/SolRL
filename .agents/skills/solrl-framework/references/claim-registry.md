@@ -70,6 +70,31 @@ settle_claim
 
 The hook is not the whole verifier. `settle_claim` owns the full claim graph. The hook is the narrow guard that prevents arbitrary direct transfers around settlement.
 
+## What Counts As Token Evidence
+
+For competition evaluation, separate three levels of token evidence:
+
+```text
+local MVP evidence
+    artifacts/mock/mvp_result.json       status=paid, replay_rejected=true
+    artifacts/mock/hook_state.json       one ledger payout to the operator payout token account
+    artifacts/mock/claim_receipt.json    ClaimV1 amount, token_mint, payout_token_account, signature
+
+implementation evidence
+    programs/solrl-registry/src/lib.rs   settle_claim and slash_operator call Token-2022 transfer_checked
+    scripts/check-token2022-wiring.py    rejects fake flag-only settlement regressions
+    scripts/check-registry-claim-checks.py rejects signed-but-unchecked claim fields
+
+missing V1 evidence
+    no full local-validator balance test yet proving Token-2022 invokes the hook and mutates token balances
+```
+
+Say this plainly if asked whether the token is live: the registry is built around a Token-2022 mint, escrow token account,
+operator payout token account, operator stake token account, and treasury token account. `settle_claim` moves escrow to
+operator payout, and `slash_operator` moves operator stake to treasury. The local MVP proves the claim-to-payout behavior
+with a deterministic simulator. The remaining proof gap is a balance-level local-validator test through the real Token-2022
+program hook path.
+
 ## Lints That Should Catch Past Mistakes
 
 Run:

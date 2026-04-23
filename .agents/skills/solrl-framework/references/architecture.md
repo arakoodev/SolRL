@@ -134,3 +134,36 @@ SolRL follows the useful pieces from Marlin Oyster:
 - Keep the on-chain program focused on lightweight signed claims, PCR/policy matching, replay protection, staking, and settlement.
 
 Do not copy Marlin blindly. SolRL is narrower: Harbor evals and RL settlement, not general-purpose TEE compute.
+
+## Competition Proof Map
+
+Use this map when explaining the project to a judge:
+
+```text
+Harbor/RL job context
+    |
+    +--> local proof path
+    |       mock worker -> verifier signature -> hook simulator ledger payout -> replay rejection
+    |
+    +--> on-chain proof path
+    |       ClaimV1 -> settle_claim -> Token-2022 transfer_checked CPI -> TransferGuard hook
+    |       SlashClaimV1 -> slash_operator -> Token-2022 transfer_checked CPI -> treasury
+    |
+    +--> hardware proof path
+            GHCR EIF -> EC2 Nitro Enclave -> NSM attestation -> AWS root verification
+            -> PCR16 equals registry ClaimV1 PCR16
+```
+
+What this proves today:
+
+- The local protocol pays once and rejects replay.
+- The registry compiles the Token-2022 CPI paths and rejects common drift through lints and instruction tests.
+- Real AWS Nitro produces the attestation, PCRs, and PCR16 bridge from an immutable commit-tagged EIF.
+
+What it does not yet prove:
+
+- A single local-validator transaction where Token-2022 invokes the hook and token balances change.
+- Production Harbor-over-Nitro execution over VSOCK RPC.
+- A persistent verifier enclave that ingests real AWS COSE attestations and signs on-chain claims.
+
+Those are implementation plan items, not claims to make in the competition demo.

@@ -2,6 +2,16 @@
 
 SolRL is a Docker-first scaffold for a Harbor evaluation protocol backed by AWS Nitro attestations and Solana Token-2022 settlement.
 
+For competition review, do not evaluate this as a generic sandbox demo. Evaluate the chain of evidence:
+
+```text
+local claim flow proves: worker output -> verifier signature -> token payout semantics -> replay rejection
+registry build proves: ClaimV1 checks -> Token-2022 transfer_checked CPI -> hook guard wiring -> slashing path
+real AWS proves: EC2 parent -> Nitro EIF boot -> NSM attestation -> AWS root verification -> PCR16 bridge
+```
+
+The current V1 proof is split this way on purpose. LocalStack cannot fake Nitro, and a real Nitro smoke should not also be the first place you debug Solana token accounts.
+
 The local implementation proves the protocol wiring with mocks:
 
 ```text
@@ -120,6 +130,8 @@ If a tool shows both `.agents` and `.gemini` entries, prefer the `.agents/skills
 
 ## Quick Start
 
+For a fast developer check:
+
 ```bash
 docker compose build dev-shell harbor-runner aws-test-runner
 docker compose up -d localstack
@@ -133,6 +145,9 @@ docker compose run --rm aws-test-runner
 ```
 
 `verifier-service` stays running until `docker compose stop verifier-service` or `docker compose down`.
+
+For a competition proof run, use the dedicated section below. The quick start is useful, but judges will ask two sharper
+questions: "did the token rail actually pay or slash?" and "did a real Nitro enclave produce the attestation?"
 
 For the full development shell:
 
@@ -195,11 +210,16 @@ The package must be public for the no-secret EC2 smoke path. If you intentionall
 To inspect the same cacheable stages locally:
 
 ```bash
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-kernel-bundle
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-root
-docker compose run --rm nix-builder nix build --no-link --print-out-paths .#solrl-nitro-worker-eif
+docker compose run --rm nix-builder nix build --no-link --print-out-paths \
+  .#solrl-nitro-worker \
+  .#solrl-nitro-kernel-bundle \
+  .#solrl-nitro-worker-root \
+  .#solrl-nitro-worker-eif
 ```
+
+Run the staged targets in one `nix-builder` container locally. Separate one-off Compose invocations mirror CI stage names,
+but they rehydrate Git inputs and Nix store paths repeatedly on a cold laptop. This is a 200-line config file to prove
+we can build a 9 MB enclave. Use the single-container command unless you are debugging one exact stage.
 
 To test workflow wiring locally with `act`:
 
@@ -353,7 +373,11 @@ SOLRL_NITRO_EIF_OCI=ghcr.io/arakoodev/solrl-nitro-worker-eif:<commit-sha> \
 
 ## How A Judge Verifies This
 
-Run the local path first:
+Use this section as the proof script for a hackathon judge.
+
+### 1. Prove The Token Settlement Semantics
+
+Run the local claim path first:
 
 ```bash
 docker compose run --rm --no-deps harbor-runner python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
@@ -364,17 +388,130 @@ Check:
 - `artifacts/mock/mvp_result.json` has `"status": "paid"` and `"replay_rejected": true`.
 - `artifacts/mock/claim_receipt.json` contains the verifier signature and ClaimV1 hash.
 - `artifacts/mock/claim_context.json` contains `pcr16` and `pcr16_user_data`.
+- `artifacts/mock/hook_state.json` contains one ledger entry with the payout `amount`, `claim_hash`, `job_account`, and
+  operator payout token account.
 
-For real AWS, run the audit and smoke commands in the Real Nitro section, then check:
+Artifact inspection command:
+
+```bash
+docker compose run --rm --no-deps -T harbor-runner python - <<'PY'
+import json
+from pathlib import Path
+
+root = Path("artifacts/mock")
+result = json.loads((root / "mvp_result.json").read_text())
+receipt = json.loads((root / "claim_receipt.json").read_text())
+state = json.loads((root / "hook_state.json").read_text())
+
+assert result["status"] == "paid"
+assert result["replay_rejected"] is True
+assert len(state["ledger"]) == 1
+assert state["ledger"][0]["amount"] == receipt["claim"]["amount"]
+assert state["ledger"][0]["claim_hash"] == receipt["claim_hash"]
+assert state["ledger"][0]["recipient"] == receipt["claim"]["payout_token_account"]
+print("LOCAL_TOKEN_PROOF_OK")
+print(json.dumps({
+    "amount": receipt["claim"]["amount"],
+    "claim_hash": receipt["claim_hash"],
+    "token_mint": receipt["claim"]["token_mint"],
+    "recipient": receipt["claim"]["payout_token_account"],
+    "replay_rejected": result["replay_rejected"],
+}, indent=2))
+PY
+```
+
+This is the local token proof. It is intentionally a simulator, not a fake Solana explorer screenshot. It proves the
+claim, verifier, payout, and replay behavior that the on-chain program is implementing.
+
+### 2. Prove The On-Chain Token-2022 Implementation Exists
+
+Run:
+
+```bash
+docker compose run --rm lint
+docker compose run --rm --no-deps dev-shell ./scripts/test-anchor.sh
+```
+
+Check:
+
+- `scripts/check-token2022-wiring.py` passes. It rejects regressions where `settle_claim` does not arm a one-use
+  `TransferGuard`, invoke Token-2022 `transfer_checked`, require the hook to consume the guard, and close the guard.
+- `scripts/check-registry-claim-checks.py` passes. It rejects signed fields that are never checked against registry state.
+- `programs/solrl-registry/src/lib.rs` contains the real `settle_claim`, `slash_operator`, `withdraw_stake`,
+  `transfer_escrow_to_operator`, and `transfer_stake_to_treasury` paths.
+- `programs/solrl-registry/tests/registry_flow.rs` covers registry bootstrap, verifier policy binding, operator auth on
+  leases, PCR16 recomputation, Token-2022 extra account metadata creation, and stake withdrawal guard rails.
+
+The current honest boundary: there is not yet a full local-validator test that mints Token-2022 accounts, sends a real
+`settle_claim` transaction, watches the hook fire through the token program, and asserts token balances changed. The code
+path exists and the lints guard the CPI wiring, but the balance-level integration test is the next thing to build if a
+judge requires one transaction that proves token movement end-to-end.
+
+### 3. Prove Real AWS Nitro Attestation
+
+Run the audit and smoke commands in the Real Nitro section, then check:
 
 - `artifacts/aws-nitro/<run-id>/remote-markers.json` has `SOLRL_STATUS=OK`.
 - `SOLRL_PCR16` equals `SOLRL_CLAIM_PCR16`.
 - `SOLRL_NITRO_ROOT_SHA256` is present and stable across real Nitro runs.
 - Post-audit reports zero exact-run resources left behind.
 
-That proves the demo chain in two pieces today: local settlement semantics and real Nitro attestation semantics. The
-remaining production hardening item is the full local-validator Token-2022 hook invocation test documented in the Anchor
-section.
+Artifact inspection command:
+
+```bash
+RUN_ID=<run-id>
+docker compose run --rm --no-deps -T harbor-runner python - <<PY
+import json
+from pathlib import Path
+
+run_id = "$RUN_ID"
+root = Path("artifacts/aws-nitro") / run_id
+markers = json.loads((root / "remote-markers.json").read_text())
+instance = json.loads((root / "run-instances.json").read_text())["Instances"][0]
+postaudit = json.loads((root / "postaudit-project.json").read_text())
+
+assert markers["SOLRL_STATUS"] == "OK"
+assert markers["SOLRL_PCR16"] == markers["SOLRL_CLAIM_PCR16"]
+assert markers["SOLRL_EIF_OCI_REF"].endswith(markers["SOLRL_GIT_REF"])
+assert instance["EnclaveOptions"]["Enabled"] is True
+assert instance["MetadataOptions"]["HttpTokens"] == "required"
+tags = {t["Key"]: t["Value"] for t in instance["Tags"]}
+assert tags["Project"] == "SolRL"
+assert tags["SolRLRunId"] == run_id
+assert tags["ManagedBy"] == "SolRL"
+assert len(postaudit["instances"]) == 0
+assert len(postaudit["security_groups"]) == 0
+assert len(postaudit["volumes"]) == 0
+print("REAL_NITRO_PROOF_OK")
+print(json.dumps({
+    "run_id": run_id,
+    "instance_id": instance["InstanceId"],
+    "eif": markers["SOLRL_EIF_OCI_REF"],
+    "nitro_root_sha256": markers["SOLRL_NITRO_ROOT_SHA256"],
+    "pcr0": markers["SOLRL_PCR0"],
+    "pcr1": markers["SOLRL_PCR1"],
+    "pcr2": markers["SOLRL_PCR2"],
+    "pcr16": markers["SOLRL_PCR16"],
+}, indent=2))
+PY
+```
+
+This proves the AWS rail: a Nitro-enabled EC2 parent booted the commit-pinned EIF, got a real NSM attestation, verified
+COSE/AWS root/PCRs/user data, and left no tagged AWS residue.
+
+### 4. What To Say If Asked "Is The Token Live?"
+
+Say this precisely:
+
+```text
+The protocol token is represented by a Token-2022 mint in the registry config. Jobs escrow that token, operators register
+payout and stake token accounts, verified claims call settle_claim, and settle_claim performs a Token-2022 transfer_checked
+CPI from job escrow to operator payout. Slashing performs the same Token-2022 transfer_checked CPI from operator stake to
+treasury. The local MVP proves the claim-to-payout semantics with a deterministic hook simulator and replay rejection.
+The Anchor program compiles the real Token-2022 CPI paths and lints guard that they cannot silently degrade into flag
+flips. The remaining gap is one full local-validator balance test that proves the Token-2022 hook fires through the real
+token program and updates balances in one transaction.
+```
 
 ## Docker-in-Docker
 

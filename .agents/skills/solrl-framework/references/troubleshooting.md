@@ -56,6 +56,18 @@ What already failed:
 Do not bring back tail hacks or chunk protocols. If this path needs richer artifacts, propose a real scoped return
 channel as an explicit architecture decision.
 
+## Competition Proof Problems
+
+If a judge asks "where is the token used?", do not point at the Nitro smoke. Point at:
+
+- `artifacts/mock/hook_state.json` for the local payout ledger and replay rejection.
+- `programs/solrl-registry/src/lib.rs` for `settle_claim`, `slash_operator`, and Token-2022 `transfer_checked` CPI.
+- `scripts/check-token2022-wiring.py` for the lint that prevents fake flag-only settlement.
+- `README.md` section `How A Judge Verifies This` for the exact proof commands.
+
+If they require a live Solana balance change, say the current gap plainly: the full local-validator Token-2022 balance
+test is not implemented yet. Do not fake this with the Python hook simulator.
+
 ## AWS Cleanup
 
 Use:
