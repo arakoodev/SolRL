@@ -2,7 +2,7 @@
 
 SolRL is a Docker-first scaffold for a Harbor evaluation protocol backed by AWS Nitro attestations and Solana Token-2022 settlement.
 
-For competition review, do not evaluate this as a generic sandbox demo. Evaluate the chain of evidence:
+Verify SolRL as a chain of evidence:
 
 ```text
 local claim flow proves: worker output -> verifier signature -> token payout semantics -> replay rejection
@@ -10,7 +10,7 @@ registry build proves: ClaimV1 checks -> Token-2022 transfer_checked CPI -> hook
 real AWS proves: EC2 parent -> Nitro EIF boot -> NSM attestation -> AWS root verification -> PCR16 bridge
 ```
 
-The current V1 proof is split this way on purpose. LocalStack cannot fake Nitro, and a real Nitro smoke should not also be the first place you debug Solana token accounts.
+The current V1 verification path is split this way on purpose. LocalStack cannot fake Nitro, and a real Nitro smoke should not also be the first place you debug Solana token accounts.
 
 The local implementation proves the protocol wiring with mocks:
 
@@ -146,8 +146,8 @@ docker compose run --rm aws-test-runner
 
 `verifier-service` stays running until `docker compose stop verifier-service` or `docker compose down`.
 
-For a competition proof run, use the dedicated section below. The quick start is useful, but judges will ask two sharper
-questions: "did the token rail actually pay or slash?" and "did a real Nitro enclave produce the attestation?"
+For the full verification path, use the dedicated section below. The quick start is useful, but a reviewer should ask two
+sharper questions: "did the token rail actually pay or slash?" and "did a real Nitro enclave produce the attestation?"
 
 For the full development shell:
 
@@ -171,7 +171,7 @@ Run the full lint gate inside Docker:
 docker compose run --rm lint
 ```
 
-This checks Rust format, clippy, Ruff, Terraform format/validate, schema parity between Rust and Python, signed-field validation in `settle_claim`, PCR16 recomputation, Token-2022 `TransferGuard` wiring, LocalStack honesty, Cargo lockfile compatibility with the SBF builder, and the no-Docker-in-Docker boundary.
+This checks Rust format, clippy, Ruff, Terraform format/validate, schema parity between Rust and Python, signed-field validation in `settle_claim`, PCR16 recomputation, Token-2022 `TransferGuard` wiring, LocalStack honesty, Cargo lockfile compatibility with the SBF builder, neutral public docs language, and the no-Docker-in-Docker boundary.
 
 For Marlin-style reproducible enclave work, use Nix in its own container:
 
@@ -371,9 +371,9 @@ SOLRL_NITRO_EIF_OCI=ghcr.io/arakoodev/solrl-nitro-worker-eif:<commit-sha> \
   docker compose run --rm aws-nitro-runner
 ```
 
-## How A Judge Verifies This
+## Verification
 
-Use this section as the proof script for a hackathon judge.
+Use this section as the repeatable verification path for external reviewers and operators.
 
 ### 1. Prove The Token Settlement Semantics
 
@@ -445,7 +445,7 @@ Check:
 The current honest boundary: there is not yet a full local-validator test that mints Token-2022 accounts, sends a real
 `settle_claim` transaction, watches the hook fire through the token program, and asserts token balances changed. The code
 path exists and the lints guard the CPI wiring, but the balance-level integration test is the next thing to build if a
-judge requires one transaction that proves token movement end-to-end.
+balance-level integration proof is required.
 
 ### 3. Prove Real AWS Nitro Attestation
 
@@ -499,9 +499,9 @@ PY
 This proves the AWS rail: a Nitro-enabled EC2 parent booted the commit-pinned EIF, got a real NSM attestation, verified
 COSE/AWS root/PCRs/user data, and left no tagged AWS residue.
 
-### 4. What To Say If Asked "Is The Token Live?"
+### 4. Token Verification Status
 
-Say this precisely:
+The current status is:
 
 ```text
 The protocol token is represented by a Token-2022 mint in the registry config. Jobs escrow that token, operators register

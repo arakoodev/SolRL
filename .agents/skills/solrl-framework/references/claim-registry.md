@@ -72,7 +72,7 @@ The hook is not the whole verifier. `settle_claim` owns the full claim graph. Th
 
 ## What Counts As Token Evidence
 
-For competition evaluation, separate three levels of token evidence:
+For verification, separate three levels of token evidence:
 
 ```text
 local MVP evidence
@@ -111,5 +111,6 @@ Relevant checks:
 - `scripts/check-aws-safety.py`
 - `scripts/check-docker-boundary.sh`
 - `scripts/check-mvp-entrypoints.py`
+- `scripts/check-public-doc-language.py`
 
 When fixing a bug that should never happen again, add a lint or regression test in the same change. This repo already paid the tuition. Do not pay it twice.

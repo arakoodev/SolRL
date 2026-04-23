@@ -132,7 +132,7 @@ docker compose run --rm --no-deps harbor-runner pytest -q tests/test_verifier_se
 docker compose run --rm --no-deps dev-shell cargo test --workspace
 ```
 
-## Competition Proof Commands
+## Verification Commands
 
 Run the local token proof:
 

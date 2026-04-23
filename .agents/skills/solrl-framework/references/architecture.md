@@ -135,9 +135,9 @@ SolRL follows the useful pieces from Marlin Oyster:
 
 Do not copy Marlin blindly. SolRL is narrower: Harbor evals and RL settlement, not general-purpose TEE compute.
 
-## Competition Proof Map
+## Verification Map
 
-Use this map when explaining the project to a judge:
+Use this map when explaining the project to a reviewer or operator:
 
 ```text
 Harbor/RL job context
@@ -166,4 +166,4 @@ What it does not yet prove:
 - Production Harbor-over-Nitro execution over VSOCK RPC.
 - A persistent verifier enclave that ingests real AWS COSE attestations and signs on-chain claims.
 
-Those are implementation plan items, not claims to make in the competition demo.
+Those are implementation plan items, not claims to make in public verification docs.

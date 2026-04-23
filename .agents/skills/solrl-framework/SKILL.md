@@ -13,7 +13,7 @@ Use this skill to keep another AI from improvising around the sharp edges. The b
 
 1. Read `README.md` for the current public workflow.
 2. Read `PLAN.md` when changing architecture, AWS, token settlement, PCR16, or test strategy.
-3. If the user asks for competition readiness or proof that it works, read the README section `How A Judge Verifies This`.
+3. If the user asks for release readiness, verification, or proof that it works, read the README section `Verification`.
 4. Read the focused reference only when needed:
    - `references/commands.md` for exact Docker commands.
    - `references/architecture.md` for the end-to-end data flow.
@@ -82,9 +82,9 @@ docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner 
 docker compose run --rm aws-nitro-runner
 ```
 
-## Competition Evaluation Workflow
+## Verification Workflow
 
-When the user asks "prove this works", do not only run the smoke. Produce evidence for three separate claims:
+When the user asks to verify the system, do not only run the smoke. Produce evidence for three separate claims:
 
 ```text
 1. Token settlement semantics: local-mock paid once and rejected replay.
@@ -116,7 +116,7 @@ Report these exact artifacts:
 Be precise about the token boundary. V1 has real Token-2022 CPI code in `settle_claim` and `slash_operator`, lints that
 reject fake flag-only settlement, and a local payout/replay simulator. It does not yet have a full local-validator
 balance test proving the Token-2022 hook fires through the real token program and changes balances in one transaction.
-Do not oversell this. Judges respect clean boundaries more than magical claims.
+Do not oversell this. Reviewers trust clean boundaries more than inflated claims.
 
 ## Edit Rules
 
@@ -137,7 +137,7 @@ When touching ClaimV1, PCR16, settlement, or slashing:
 
 When touching the MVP command surface, verifier API, or Harbor import path:
 
-1. Keep the local demo on `python -m solrl_core.cli local-mock`.
+1. Keep the local verification path on `python -m solrl_core.cli local-mock`.
 2. Keep the verifier API on `python -m solrl_core.verifier_service`.
 3. Keep the Harbor import path `solrl_harbor.nitro_environment:NitroEnvironment` documented.
 4. Update `scripts/check-mvp-entrypoints.py` if the shape intentionally changes.
@@ -165,7 +165,7 @@ Before saying work is done:
 
 1. Show `git status --short`.
 2. State which Docker commands passed.
-3. If this was a competition/evaluation run, state the local token proof, Anchor/Token-2022 proof, and Nitro proof
+3. If this was a verification run, state the local token proof, Anchor/Token-2022 proof, and Nitro proof
    separately.
 4. If real AWS ran, state the AWS account, run id, created resource tags, cleanup result, and post-audit count.
 5. If a command could not be run, say why. No pretend green checkmarks.
