@@ -1,550 +1,130 @@
 # Why SolRL
 
-## Slide 1: The Point
+SolRL is the verifiable compute layer for reinforcement-learning agent training.
 
-SolRL is a protocol for verifiable AI agent evaluation.
+## Slide 1: The Billion-Dollar Human Monopoly
 
-It runs Harbor evals and RL reward jobs inside AWS Nitro Enclaves, proves what happened with hardware attestations, and settles payment on Solana with a Token-2022 based registry.
+Frontier AI labs are bleeding capital on human-graded evals. RL companies have exploded to enormous scale by throwing hundreds of thousands of human contractors at AI agent evaluations — coders, doctors, lawyers, mathematicians grading agent outputs one at a time, in spreadsheets and labeling tools. The economics are real: paying a domain expert thirty dollars an hour to evaluate one agent run, multiplied by tens of thousands of runs per release, multiplied by every model checkpoint and every prompt change, is the largest line item in a modern AI lab's training budget after the GPUs themselves.
 
-The user gets a simple thing:
+Humans are slow. A human grader produces dozens of evaluations a day. An RL training loop wants millions per checkpoint. Humans are expensive — a team of contractors costs orders of magnitude more than the same evaluations on automated infrastructure. Humans are also fundamentally insecure: the catastrophic supply-chain data breaches that centralized human-annotation businesses are currently suffering have already exposed proprietary prompts, agent trajectories, and customer interactions that were supposed to stay inside the lab.
 
-```text
-submit eval -> get verified reward result -> pay only when the proof checks out
+Human-in-the-loop training was a transitional phase. It is a dead end now.
+
+## Slide 2: The Hard Pivot to RLVR
+
+The smartest AI labs already know human feedback does not scale. The entire industry is aggressively shifting to Reinforcement Learning from Verifiable Rewards — RLVR. Instead of paying humans to score agent outputs, the lab writes one verifier script and runs an agent inside an isolated sandbox millions of times against thousands of variations of the task. The agent's actions, the environment's state, the test outputs, and the reward number are all produced by code. The lab trains the agent against that signal directly.
+
+This shift is creating new infrastructure companies. RL sandbox companies generate massive revenue today by hosting the millions of isolated rollouts required to train these agents. They sell the same primitive over and over: spin up a clean container, hand it the task, run the verifier, return the reward. Their bill grows linearly with every training run.
+
+But every Web2 sandbox shares one fatal flaw: the host has full control over the kernel boundary. The container sees what the host wants it to see, the rollout produces what the host says it produced, and the reward is whatever number the host returns. For a centralized lab running its own infrastructure, that is acceptable — they trust themselves. For a decentralized compute network where any node operator can offer capacity, it is fatal.
+
+## Slide 3: The Missing Crypto Infrastructure
+
+AI labs want to crowdsource these massive RL workloads to a cost-effective, decentralized compute network. The economics are obvious: a global pool of operators with idle EC2 capacity, willing to undercut centralized providers in exchange for a cut of the bounty. The lab posts a task, the operator runs the rollout, the lab pays for verified work.
+
+In a trustless network, this immediately breaks. A random node operator will simply fake the evaluation reward, return whatever number maximizes the bounty, and pocket the compute fee without doing the work. The lab cannot tell the difference because the lab does not have access to the kernel of the operator's machine. Every participant assumes the worst about every other participant — which is correct.
+
+What breaks the cycle is hardware-rooted attestation. If the operator can prove cryptographically — with a signature rooted in a key burned into silicon — that an exact image ran an exact task and produced an exact reward, then the lab can pay safely. AWS Nitro Enclaves provide that hardware root. But there is no TEE-based RL sandbox provider on the market today, and no compute network with a token engineered specifically for RL workloads. Until now.
+
+## Slide 4: SolRL on Solana Token-2022
+
+We built SolRL to capture this market. We took Harbor — the industry-standard open framework for agent evaluation that already speaks tasks, environments, verifier scripts, trajectories, and rewards — and locked it inside AWS Nitro Enclaves. The hardware isolation guarantees that the RL rollout actually executed end-to-end and that the reward was produced by the verifier script, not invented after the fact.
+
+Bounties settle on Solana through Token-2022 escrow. A researcher funds a job by depositing tokens into a per-job escrow PDA. A staked operator accepts a lease, runs the rollout in a Nitro enclave, and produces an NSM attestation that binds the rollout, the reward, the operator, and the protocol context into a single signed document. A verifier enclave checks the attestation against the AWS root certificate and the protocol's PCR policy, then countersigns a canonical ClaimV1 with Ed25519. The SolRL Anchor program on Solana settles the claim atomically: it verifies the Ed25519 signature, recomputes the bound hardware measurement from on-chain state, and releases the escrow to the operator's payout account through a Token-2022 `transfer_checked` CPI signed by the registry's escrow PDA.
+
+The same rail handles failure. A separate `SlashClaimV1` path lets verifiers prove replay, forged context, or wrong-policy claims and move stake from the operator's stake vault to the treasury through the same Token-2022 `transfer_checked` CPI under a stake PDA. Bad operators lose money on the rail they earn money on.
+
+## Slide 5: Architecture
+
+A SolRL job flows through three cooperating layers — the researcher and operator setting up the bounty on-chain, an AWS Nitro enclave producing a hardware-attested reward, and one atomic Solana transaction that releases the escrow.
+
+```mermaid
+flowchart TB
+    subgraph offchain["AWS Nitro — off-chain"]
+        EC2["Tagged EC2 parent<br/>no SSH, no inbound SG,<br/>no instance profile"]
+        EIF["Public GHCR EIF<br/>solrl-nitro-worker-eif:&lt;sha&gt;"]
+        WORKER["Worker enclave<br/>static Rust, /app only,<br/>no shell, no busybox"]
+        ATT["NSM Attestation<br/>COSE / AWS root signed"]
+        VERIFIER["Verifier enclave<br/>checks AWS root + PCR0/1/2<br/>+ PCR16 + user_data + worker key<br/>signs ClaimV1 with Ed25519"]
+        EC2 -->|"ORAS pull<br/>+ sha384 verify"| EIF
+        EIF -->|"nitro-cli run-enclave"| WORKER
+        WORKER -->|"ExtendPCR16 with pcr16_user_data,<br/>LockPCR16,<br/>request Attestation"| ATT
+        ATT -->|"VSOCK 5005"| VERIFIER
+    end
+
+    subgraph onchain["Solana — SolRL Anchor program"]
+        ESCROW["Job Escrow PDA<br/>Token-2022 account"]
+        STAKE["Operator Stake PDA<br/>Token-2022 account"]
+        SETTLE["settle_claim<br/>1. verify Ed25519 ix<br/>2. recompute PCR16 from registry state<br/>3. cross-check every signed field<br/>vs Job, Lease, Operator,<br/>VerifierPolicy, ImagePolicy"]
+        RECEIPT["init ClaimReceipt PDA<br/>+ NonceReceipt PDA<br/>(replay collides on second TX)"]
+        TC["Token-2022 transfer_checked CPI<br/>signed by escrow_authority PDA"]
+        PAYOUT["Operator Payout<br/>Token-2022 account"]
+        TREASURY["Treasury<br/>Token-2022 account"]
+        SLASH["slash_operator<br/>(SlashClaimV1)"]
+        SETTLE --> RECEIPT
+        RECEIPT --> TC
+        TC -->|"drains"| ESCROW
+        TC -->|"funds"| PAYOUT
+        SLASH -->|"drains via stake_authority PDA"| STAKE
+        SLASH -->|"funds"| TREASURY
+    end
+
+    R["Researcher"] -->|"fund Token-2022 bounty"| ESCROW
+    OW["Operator owner"] -->|"lock Token-2022 stake"| STAKE
+    OW -->|"launch tagged EC2 parent"| EC2
+    VERIFIER -->|"submit TX:<br/>ed25519 verify ix + settle_claim ix"| SETTLE
 ```
 
-The operator gets a simple thing:
+The load-bearing invariant is the **PCR16 bridge**. The Nitro worker extends PCR16 with `pcr16_user_data = sha384(domain || borsh(Pcr16Components))`, locks PCR16, and requests the attestation. The verifier checks that the AWS-signed PCR16 in the attestation equals `pcr16_digest = sha384(zeros48 || pcr16_user_data)`. The registry on Solana recomputes the same `pcr16_digest` from `Job`, `Lease`, `Operator`, and the claim nonce — every input lives on-chain or comes from the signed ClaimV1 — and rejects the claim if the value the verifier endorsed disagrees by even one byte. That is the single wire that ties the hardware proof to the token settlement; everything else is plumbing.
 
-```text
-stake token -> run Nitro job -> submit proof -> get paid
-```
+## Slide 6: Implementation
 
-That is the whole game.
+SolRL ships today as a Docker-first scaffold. No Rust, Anchor, Solana CLI, Node, Python, Nix, Terraform, or AWS CLI on the laptop. Everything runs through `docker compose` services with named caches.
 
-## Slide 2: The Problem
+The Anchor program in `programs/solrl-registry` compiles to SBF and contains the full registry — `Config`, `VerifierPolicy`, `Verifier`, `ImagePolicy` (PCR0/1/2 only — never PCR16), `Operator`, `Job`, `Lease`, `ClaimReceipt`, `NonceReceipt`, and `TransferGuard`. `settle_claim` performs an Ed25519 instruction-sysvar parse, recomputes PCR16 from registered components, cross-checks every signed ClaimV1 field against on-chain state, creates the receipt PDAs, and executes a Token-2022 `transfer_checked` CPI from the escrow PDA to the operator's payout account in a single atomic instruction. `slash_operator` does the same for stake-to-treasury under a separate stake PDA. `withdraw_stake` lets operators exit safely once they have no active leases.
 
-AI agents are becoming useful, but evaluating them is still too easy to fake.
+A local-validator integration test (`settle_claim_transfers_token2022_balance_with_registry_pda_authority`) creates a real Token-2022 mint, real escrow and payout token accounts, mints `claim.amount` into escrow, sends one transaction with an Ed25519 verifier instruction plus `settle_claim`, and asserts that the escrow drains to zero and the payout receives the bounty — through the actual `spl_token_2022` processor, not a mock.
 
-Today an AI lab or agent builder can run thousands of evals in Docker, Daytona, Modal, or their own cloud scripts. That works when the evaluator and the compute provider are the same trusted party.
+A real AWS gate launches a tagged EC2 parent with no SSH key, no inbound security group rules, no instance profile, and no SSM dependency. The parent uses ORAS to pull a CI-built EIF from public GHCR, verifies its SHA-384 sidecar, boots a Nix-built Nitro enclave with a static Rust worker, requests a real NSM attestation over VSOCK, and verifies the COSE signature, AWS root certificate, PCR0/1/2/16, attestation `user_data`, and worker public key on the EC2 parent before declaring success. EIFs are produced by GitHub Actions with Magic Nix Cache and published as `application/vnd.aws.nitro.eif` OCI artifacts to GHCR — the laptop never builds the real EIF.
 
-It breaks when you want a market.
+A guardrail lint suite (`docker compose run --rm lint`) enforces ClaimV1 byte-for-byte parity between Rust and Python, signed-field coverage in `settle_claim`, Token-2022 wiring (no flag-only settlement), AWS safety (no IAM, no SSH, no inbound SG, no debug-mode enclaves, exact-tag cleanup), Docker-only execution, and Python 3.7 compatibility on the EC2-parent runtime path. Every past mistake has a regression check behind it.
 
-In a decentralized eval network, the operator has a direct incentive to lie:
+## Slide 7: The Token
 
-```text
-claim the agent passed -> collect bounty -> skip the expensive compute
-```
+SolRL needs a token because the protocol needs more than a payment rail — it needs a control plane. The Token-2022 mint does four jobs:
 
-For RL, this is worse than a bad leaderboard. Bad rewards train bad models.
+1. **Escrow.** Researchers fund jobs by transferring tokens into a per-job escrow PDA before any work starts. Without a funded escrow, no operator can claim a lease. The escrow is owned by an `escrow_authority` PDA derived from the job account, so the registry alone can move it.
+2. **Staking.** Operators must lock tokens before they can accept any lease. Stake is the collateral that makes lying expensive: an operator who fakes a reward forfeits more than the bounty they tried to steal. Stake lives in an `Operator` PDA-owned token account and cannot be withdrawn while any lease is active.
+3. **Settlement.** A verified ClaimV1 releases escrow to the operator's payout account through a Token-2022 `transfer_checked` CPI signed by the escrow PDA. The transfer happens in the same atomic instruction that creates the `ClaimReceipt` and `NonceReceipt` — settlement and replay protection share one transaction. Replaying a settled claim collides with two existing PDAs and the runtime aborts the second transaction.
+4. **Slashing.** A separate `SlashClaimV1` path lets a verifier prove replay, malicious duplicate, wrong-policy, wrong-job, lease abuse, or forged-context attacks. The registry decrements the operator's stake counter, marks the lease slashed, and moves stake from the operator's stake vault to the treasury PDA — again through Token-2022 `transfer_checked`. Bad operators lose money on the same rail they earn money on.
 
-Garbage rewards in, garbage agent out. Very expensive garbage.
+V1 settlement uses the registry PDA authority over escrow and stake vaults. The Token-2022 transfer-hook program is wired and deployed as a narrow guard for direct user transfers — it checks the mint, the pause flag, and a single-slot `TransferGuard` PDA — but it is not the settlement verifier. Solana rejects same-program reentry from the registry into its own hook (the registry calling Token-2022, which would call the registry's hook, in one transaction), so V1 keeps full claim verification inside `settle_claim` and uses PDA authorities to move tokens. Hook-only settlement requires a PDA seed redesign so the entire job graph derives from the source token account; that is a v2 item.
 
-## Slide 3: Why Normal Containers Are Not Enough
+## Slide 8: What's Not Built Yet
 
-Normal containers prove almost nothing to a buyer.
+V1 proves the hard technical claim: an RL rollout produces a Nitro-attested ClaimV1 that settles on Solana via Token-2022, with replay protection and slashing on the same rail. Several pieces of the production network are deliberately not in V1:
 
-Docker, Sysbox, and similar sandboxing tools are useful for density and developer experience. They are not enough for trustless reward markets because the host still controls the kernel boundary.
+- **Production Harbor-over-Nitro execution.** The Harbor `import_path` class (`solrl_harbor.nitro_environment:NitroEnvironment`) exists and runs locally; AWS mode intentionally errors until the VSOCK worker RPC for running real Harbor tasks inside the worker enclave is wired.
+- **Production Harbor worker EIF.** The current AWS gate boots a minimal SolRL Nitro worker EIF that proves NSM attestation and the PCR16 bridge — not yet a Harbor-bearing EIF that runs full evaluation tasks against a researcher's task bundle.
+- **Persistent verifier enclave.** The mock verifier service runs as an HTTP service for development. The production Marlin/Oyster-style verifier enclave that ingests real AWS COSE attestations and signs on-chain claims continuously is not deployed yet.
+- **Hook-side claim verification.** Solana rejects same-program registry → Token-2022 → registry-hook reentry, so V1 settles in `settle_claim` under the registry PDA authority. Hook-only settlement requires a PDA seed redesign so the full job graph derives from the source token account.
+- **Anchor IDL.** `anchor build --no-idl` ships and the SBF binary is real; full IDL generation hits an Anchor 0.30.1 / proc-macro2 toolchain compatibility issue. This is a tooling fix, not a protocol change.
+- **Operator and researcher UIs.** No buyer-facing job submission UI. No operator marketplace scheduler. CLI and on-chain flows are present.
+- **Reliable AWS result return channel.** The smoke parses one `SOLRL_RESULT_BEGIN` block from EC2 console output. A scoped tagged channel (a minimal IAM-bounded role, SSM Parameter Store, or similar) is post-V1.
+- **Token mint deployment and operational mint authority.** V1 specifies the mint shape; production mint authority, multisig, and emission policy are post-V1.
+- **Reputation routing.** Operators carry slash counters; routing leases by reputation is post-V1.
+- **Dispute and refund policy.** V1 has only the slashable / reject-only / dispute-only failure taxonomy. Full dispute adjudication is post-V1.
+- **Threshold verifier signatures.** V1 uses `VerifierPolicy::AnyActive { family, version }` — any single registered active verifier in a policy can sign. `Threshold` is in the schema but not yet implemented.
+- **Open-internet Harbor tasks.** V1 network policy is `DenyAll`. Future allowlists must extend PCR16 and ClaimV1 to include the policy hash.
 
-If the host operator is malicious, the host can tamper with the runtime, logs, task result, network, or filesystem.
+This is the real gap list. Anything not in this slide and not in the implementation slide is something we have not started yet.
 
-For centralized CI, that may be acceptable.
+## Slide 9: The Vision & Ask
 
-For paid RL rollouts, no.
+With SolRL, AI labs no longer need to pay RL companies billions for human guesswork, nor do they need to rely on expensive, unverified Web2 sandboxes. We are bringing the massive revenue of RL agent evaluation directly on-chain. We are building the first trustless, decentralized compute economy for the future of AI, and we are looking to scale it through the Colosseum Accelerator.
 
-## Slide 4: Why AWS Nitro
+---
 
-AWS Nitro Enclaves give us a hardware root of trust.
+## References
 
-An enclave has no external network, no SSH, no persistent disk, and no normal host access. It talks to the parent EC2 instance through VSOCK. The Nitro Security Module signs an attestation document that includes PCR measurements and caller-provided data.
-
-That means SolRL can bind the reward to the exact environment that produced it:
-
-```text
-Harbor task + worker image + operator + nonce + reward
-        |
-        v
-PCR16 + ClaimV1
-        |
-        v
-Nitro attestation
-        |
-        v
-Verifier signature
-        |
-        v
-Solana settlement
-```
-
-The parent EC2 instance can relay messages. It cannot forge the Nitro attestation.
-
-## Slide 5: Why Harbor
-
-Harbor is the right wedge because evals are the bottleneck.
-
-Agent builders do not need another generic compute marketplace first. They need a reliable way to run tasks, collect trajectories, score results, and feed those results back into product and RL loops.
-
-Harbor already speaks the language of agent evals:
-
-- task definitions
-- environment setup
-- verifier scripts
-- trajectories
-- repeated rollouts
-- RL reward outputs
-
-SolRL does not replace Harbor.
-
-SolRL makes Harbor jobs economically and cryptographically verifiable.
-
-## Slide 6: The Solution
-
-SolRL is a Solana settlement and AWS Nitro execution layer for Harbor.
-
-The product surface:
-
-```text
-AI builder
-  creates Harbor task
-  funds bounty
-  waits for verified result
-
-Operator
-  stakes SolRL token
-  receives lease
-  runs AWS Nitro enclave
-  submits signed claim
-  gets paid if proof checks out
-
-SolRL registry
-  verifies claim
-  checks PCR policy
-  prevents replay
-  releases escrow
-  slashes bad operators
-```
-
-The user outcome is simple: more eval throughput without trusting random operators.
-
-## Slide 7: Who Uses It
-
-### AI agent teams
-
-Teams building coding agents, browser agents, research agents, and internal automation agents.
-
-They need reliable evals for every model, prompt, tool, and environment change.
-
-### AI labs and RL teams
-
-Teams running RLVR-style training loops.
-
-They need reward signals that are not silently corrupted by flaky or dishonest compute.
-
-### Benchmark maintainers
-
-People running Terminal-Bench, SWE-Bench style tasks, private eval suites, or customer-specific benchmarks.
-
-They need repeatable execution, artifact integrity, and clean provenance.
-
-### Web3 AI protocols
-
-Protocols that pay for off-chain AI work.
-
-They need a proof that work happened before tokens move.
-
-### Compute operators
-
-People or companies with AWS capacity and operational skill.
-
-They need a market where good execution earns money and bad execution loses stake.
-
-## Slide 8: The Buyer Pain
-
-The first buyer is not buying "TEE containers."
-
-They are buying confidence that an eval result is real.
-
-Their current pain:
-
-- eval infra is brittle
-- model changes need constant regression testing
-- RL reward pipelines are expensive
-- outsourced compute is hard to trust
-- benchmark results are easy to game
-- private evals need auditability
-
-SolRL should sell the boring sentence:
-
-```text
-Pay only for evals that produce a valid proof.
-```
-
-That is a real job to be done.
-
-## Slide 9: Potential Market
-
-Do not start with a giant fake TAM slide. This market is early.
-
-Start with the wedge:
-
-```text
-agent evals + RL reward rollouts + verifiable off-chain compute
-```
-
-The market expands in layers:
-
-1. Agent teams running CI-style evals for every release.
-2. RL teams paying for large batches of verified rollouts.
-3. Benchmark platforms that want trusted third-party execution.
-4. Web3 AI networks that need proof-of-work-style settlement without pretending GPUs can self-report honestly.
-5. Enterprises that want audit logs for high-stakes agent behavior.
-
-The first useful market is not "all cloud compute."
-
-It is the subset of compute where the result moves money, updates a model, or affects trust.
-
-That subset is small enough to win and valuable enough to matter.
-
-## Slide 10: Why Solana
-
-Solana is a good settlement layer for this because the protocol needs cheap, frequent state transitions.
-
-Each job may need:
-
-- job creation
-- escrow funding
-- operator registration
-- lease creation
-- claim settlement
-- replay receipt
-- slashing claim
-- reputation or performance updates later
-
-These are not once-a-month governance events.
-
-They are high-frequency marketplace operations.
-
-Solana is also a natural fit for Token-2022, transfer hooks, and fast escrow settlement.
-
-## Slide 11: The Token
-
-SolRL needs a token because the protocol needs more than payment.
-
-It needs a control plane.
-
-The token does four jobs:
-
-1. **Escrow:** buyers fund Harbor eval jobs before work starts.
-2. **Staking:** operators lock tokens before they can receive leases.
-3. **Settlement:** verified claims release escrow to operators.
-4. **Slashing:** forged, replayed, stale, or policy-breaking claims can burn or move operator stake.
-
-No tokenomics needed here.
-
-The important part is utility inside the execution loop.
-
-## Slide 12: How The Token Affects Nitro Containers
-
-The token does not run inside the enclave.
-
-The enclave produces attestable facts. The chain moves tokens.
-
-The binding looks like this:
-
-```text
-Job escrow
-  token amount locked by buyer
-        |
-        v
-Lease
-  assigned to staked operator
-        |
-        v
-Nitro worker
-  runs Harbor eval
-  extends PCR16 with job/operator/task context
-  returns attestation
-        |
-        v
-Verifier
-  checks AWS Nitro proof
-  signs ClaimV1
-        |
-        v
-Solana registry
-  verifies ClaimV1
-  checks job + lease + PCR16 + nonce
-  transfers escrow to operator
-```
-
-Implementation detail that matters: the Nitro worker does not invent a separate PCR16 meaning. It receives
-`pcr16_user_data = sha384(Pcr16Components)`, extends PCR16 once, and the registry signs/checks the resulting locked PCR16.
-Same input, same proof, same payout path. This is the whole game.
-
-The token changes operator behavior because bad execution has a cost.
-
-Without stake, a fake operator just disappears.
-
-With stake, a fake operator loses money.
-
-## Slide 13: Token Flow For Users
-
-### Buyer flow
-
-```text
-1. Buyer creates job with Harbor task hash, image policy, timeout, reward amount.
-2. Buyer deposits SolRL tokens into job escrow.
-3. Protocol assigns or accepts a staked operator lease.
-4. Buyer receives verified result and artifacts.
-5. If the claim verifies, escrow pays the operator.
-6. If the claim fails, escrow stays locked, refunds, or moves through dispute rules.
-```
-
-Buyer experience:
-
-```text
-I pay for verified eval output, not promises.
-```
-
-### Operator flow
-
-```text
-1. Operator stakes SolRL tokens.
-2. Operator registers payout and stake token accounts.
-3. Operator accepts a lease.
-4. Operator launches AWS Nitro parent and enclave.
-5. Operator submits verifier-signed ClaimV1.
-6. Registry releases payment or rejects/slashes.
-```
-
-Operator experience:
-
-```text
-I monetize reliable Nitro execution.
-```
-
-## Slide 14: What Is Implemented Now
-
-The repo already has the skeleton that matters.
-
-Implemented:
-
-- Docker-first local workflow.
-- Mock Harbor-style worker, mock attestation, mock verifier, and mock hook.
-- Canonical `ClaimV1` schema shared across Rust and Python.
-- Canonical `SlashClaimV1` schema.
-- PCR16 component hashing shared across Rust and Python.
-- Anchor registry program that compiles.
-- Operator registration with minimum stake checks.
-- Job and lease accounts.
-- Claim receipt and nonce receipt replay protection.
-- Verifier policy and image policy accounts.
-- Token-2022 `transfer_checked` CPI for payouts.
-- Token-2022 transfer hook guard shape.
-- Slashing path that moves stake to treasury.
-- Stake withdrawal guard rails.
-- First-class local MVP command: `python -m solrl_core.cli local-mock`.
-- Long-running mock verifier service: `python -m solrl_core.verifier_service`.
-- Harbor import path: `solrl_harbor.nitro_environment:NitroEnvironment`.
-- Docker lints for AWS safety, schema parity, Token-2022 wiring, and no Docker-in-Docker.
-- Real AWS Nitro smoke runner that launches tagged Nitro-enabled EC2 and boots a Nix-built EIF path.
-
-This is not just a pitch deck.
-
-There is code.
-
-## Slide 15: What Is Not Done Yet
-
-The production network is not done.
-
-Not done:
-
-- Production Harbor-over-Nitro execution.
-- Production Harbor Nitro EIF.
-- Persistent verifier enclave service.
-- Full Token-2022 local-validator transaction proving hook invocation end-to-end.
-- Published Anchor IDL.
-- Operator marketplace scheduler.
-- Buyer-facing job submission UI/API.
-- Reliable real AWS result return channel beyond EC2 console output.
-- Token mint deployment and operational mint authority policy.
-- Reputation routing.
-- Dispute/refund policy.
-
-This is fine for the current stage.
-
-The MVP should prove the hard technical claim first:
-
-```text
-Harbor eval result -> Nitro proof -> verifier signature -> Solana token settlement
-```
-
-## Slide 16: Implementation Plan For The Tokenized Network
-
-### Phase 1: Make the token real on devnet
-
-Deliverables:
-
-- Create Token-2022 mint.
-- Configure transfer hook to point at `solrl-registry`.
-- Create treasury token account.
-- Create buyer escrow token accounts.
-- Create operator stake vault token accounts.
-- Publish a minimal setup script that runs inside Docker.
-
-Success condition:
-
-```text
-devnet token mint exists and registry config points at it
-```
-
-### Phase 2: Prove end-to-end Token-2022 settlement
-
-Deliverables:
-
-- Add local-validator test for Token-2022 hook invocation.
-- Prove `settle_claim` transfers escrow to operator payout.
-- Prove direct transfer without `TransferGuard` fails.
-- Prove replayed claim fails.
-- Prove slash claim transfers stake to treasury.
-
-Success condition:
-
-```text
-one test creates mint, funds escrow, settles claim, verifies balances
-```
-
-### Phase 3: Make Harbor run inside the enclave path
-
-Deliverables:
-
-- Implement Harbor environment plugin.
-- Package minimal Harbor worker into EIF.
-- Bind Harbor task hash, verifier script hash, artifact policy, operator, payout token account, and nonce into PCR16.
-- Emit `ClaimV1` from the worker flow.
-
-Success condition:
-
-```text
-real Harbor task produces a verifier-signed claim
-```
-
-### Phase 4: Make AWS Nitro smoke reliable
-
-Deliverables:
-
-- Keep no-SSH, no-inbound-SG, exact-tag cleanup.
-- Keep EC2 rebuild of the EIF from a public git ref.
-- Replace console-output-only completion with a user-approved scoped return channel.
-- Keep all AWS actions in the main runner, not sidecar scripts.
-
-Success condition:
-
-```text
-AWS smoke can run repeatedly without orphaned resources or missing final status
-```
-
-### Phase 5: Launch the first useful market
-
-Deliverables:
-
-- Job API.
-- Operator CLI.
-- Buyer CLI.
-- Devnet deployment docs.
-- One real eval suite.
-- Dashboard showing jobs, leases, claims, payouts, and slashes.
-
-Success condition:
-
-```text
-an external user funds a job and an external operator gets paid for a verified eval
-```
-
-## Slide 17: Why This Can Win
-
-Most infra projects start too broad.
-
-SolRL starts with a painful, narrow use case:
-
-```text
-verified Harbor evals for AI agents
-```
-
-That focus matters.
-
-General TEE compute is a giant surface area. Every workload wants different networking, storage, secrets, scheduling, and billing.
-
-Agent evals are constrained enough to ship:
-
-- known task format
-- known verifier script
-- known reward output
-- known artifact bundle
-- known settlement action
-
-Narrow beats vague.
-
-## Slide 18: The Demo That Matters
-
-The demo should not be a dashboard pretending to be infrastructure.
-
-The demo should show:
-
-```text
-1. Create Harbor task.
-2. Fund Solana escrow with SolRL token.
-3. Assign staked operator.
-4. Launch Nitro enclave.
-5. Run eval.
-6. Show attestation/PCR16.
-7. Verifier signs ClaimV1.
-8. Registry settles escrow to operator.
-9. Replay fails.
-10. Bad claim slashes or rejects.
-```
-
-That demo tells the truth.
-
-It shows the thing people will pay for.
-
-## Slide 19: The Business
-
-The business is a verified eval marketplace.
-
-Revenue paths later:
-
-- protocol fee on settled jobs
-- enterprise hosted coordinator
-- private eval network for labs
-- operator tooling
-- premium verifier policy registry
-- audit and compliance exports
-
-But the first business question is simpler:
-
-```text
-Can we make one AI team trust evals from one external operator?
-```
-
-If yes, scale follows.
-
-If no, no token design saves it.
-
-## Slide 20: The Ask
-
-Build the smallest real loop:
-
-```text
-one Harbor task
-one Nitro worker
-one verifier
-one Token-2022 mint
-one escrow
-one staked operator
-one verified payout
-one replay failure
-one slash path
-```
-
-Then put it in front of agent teams.
-
-The feedback loop is the company.
+See `README.md` for the Docker-first verification path, `PLAN.md` for the on-chain protocol architecture, and `.agents/skills/solrl-framework/` for the operating rules used by AI coding agents on this repo.
