@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
+import tarfile
 from pathlib import Path
 
 import botocore.exceptions
@@ -29,9 +31,11 @@ from solrl_core.aws_nitro_runner import (
     remote_smoke_script,
     tags_match,
     validate_oci_ref,
+    build_submission_proof,
+    write_submission_proof_bundle,
 )
 from solrl_core.claim import claim_hash, verify_claim
-from solrl_core.claim_context import build_aws_smoke_artifacts, build_claim_context
+from solrl_core.claim_context import build_aws_smoke_artifacts, build_claim_context, claim_context_hash
 from solrl_core.config import load_config
 
 
@@ -462,6 +466,186 @@ def test_persist_remote_outputs_writes_nitro_backed_claim_receipt(tmp_path: Path
     assert receipt["claim"]["trajectory_hash"] == compute_artifacts["compute_output_hash"]
     assert receipt["claim_hash"] == claim_hash(receipt["claim"])
     assert verify_claim(receipt["claim"], receipt["signature"], receipt["verifier_public_key"])
+
+
+def write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def make_submission_artifacts(tmp_path: Path) -> Path:
+    config = make_config("solrl-test", tmp_path)
+    artifact_dir = config.artifact_dir
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    solrl_config = load_config()
+    compute_artifacts = build_aws_smoke_artifacts(config.run_id)
+    claim_context = build_claim_context(solrl_config, compute_artifacts, config.run_id)
+    git_ref = "abcdef1234567890abcdef1234567890abcdef12"
+    eif_ref = f"ghcr.io/arakoodev/solrl-nitro-worker-eif:{git_ref}"
+    eif_sha384 = "a" * 96
+    markers = parse_remote_markers(
+        final_block(
+            SOLRL_RUN_ID=config.run_id,
+            SOLRL_GIT_REF=git_ref,
+            SOLRL_EIF_OCI_REF=eif_ref,
+            SOLRL_EIF_SHA384=eif_sha384,
+            SOLRL_PCR16=claim_context["pcr16"],
+            SOLRL_CLAIM_PCR16=claim_context["pcr16"],
+            SOLRL_CLAIM_CONTEXT_HASH=claim_context_hash(claim_context),
+            SOLRL_COMPUTE_INPUT_HASH=compute_artifacts["compute_input_hash"],
+            SOLRL_COMPUTE_OUTPUT_HASH=compute_artifacts["compute_output_hash"],
+            SOLRL_ATTESTATION_DOCUMENT_HASH="b" * 64,
+        )
+    )
+    runner = AwsNitroRunner.__new__(AwsNitroRunner)
+    runner.config = config
+    runner._write_json("claim-context.json", claim_context)
+    runner._write_json("generic-compute.json", compute_artifacts)
+    runner._persist_remote_outputs(markers)
+    write_json(artifact_dir / "caller.json", {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/test"})
+    write_json(artifact_dir / "git-source.json", {"url": "https://github.com/arakoodev/SolRL.git", "ref": git_ref})
+    write_json(artifact_dir / "eif-source.json", {"oci_ref": eif_ref})
+    write_json(
+        artifact_dir / "run-instances.json",
+        {
+            "Instances": [
+                {
+                    "InstanceId": "i-test",
+                    "ImageId": "ami-test",
+                    "InstanceType": "m5.xlarge",
+                    "EnclaveOptions": {"Enabled": True},
+                    "MetadataOptions": {"HttpTokens": "required"},
+                    "Placement": {"AvailabilityZone": "us-east-1a"},
+                    "VpcId": "vpc-test",
+                    "SubnetId": "subnet-test",
+                    "SecurityGroups": [{"GroupId": "sg-test"}],
+                    "Tags": resource_tags(config),
+                }
+            ]
+        },
+    )
+    empty_audit = {"scope": {"project": "SolRL"}, "instances": [], "security_groups": [], "volumes": []}
+    empty_run_audit = {"scope": {"run_id": config.run_id}, "instances": [], "security_groups": [], "volumes": []}
+    write_json(artifact_dir / "preflight-project-audit.json", empty_audit)
+    write_json(artifact_dir / "postaudit-run.json", empty_run_audit)
+    write_json(artifact_dir / "postaudit-project.json", empty_audit)
+    (artifact_dir / "console-output.txt").write_text(
+        "\n".join(
+            [
+                "SOLRL_PHASE_START=attestation",
+                final_block(
+                    SOLRL_RUN_ID=config.run_id,
+                    SOLRL_GIT_REF=git_ref,
+                    SOLRL_EIF_OCI_REF=eif_ref,
+                    SOLRL_EIF_SHA384=eif_sha384,
+                    SOLRL_PCR16=claim_context["pcr16"],
+                    SOLRL_CLAIM_PCR16=claim_context["pcr16"],
+                    SOLRL_CLAIM_CONTEXT_HASH=claim_context_hash(claim_context),
+                    SOLRL_COMPUTE_INPUT_HASH=compute_artifacts["compute_input_hash"],
+                    SOLRL_COMPUTE_OUTPUT_HASH=compute_artifacts["compute_output_hash"],
+                    SOLRL_ATTESTATION_DOCUMENT_HASH="b" * 64,
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "run.log").write_text("run log\n", encoding="utf-8")
+    (artifact_dir / "user-data.sh").write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+    return artifact_dir
+
+
+def test_submission_proof_bundle_contains_self_contained_evidence(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+
+    bundle = write_submission_proof_bundle(artifact_dir)
+
+    proof = json.loads((artifact_dir / "submission-proof.json").read_text(encoding="utf-8"))
+    assert proof["status"] == "passed"
+    assert proof["checks"]["all"] is True
+    assert proof["console_trace"]["result_markers_present"] is True
+    assert proof["token_settlement_evidence"]["claim_ready_for_settlement"] is True
+    assert (artifact_dir / "submission-proof-bundle.sha256").read_text(encoding="utf-8").startswith(
+        hashlib.sha256(bundle.read_bytes()).hexdigest()
+    )
+    with tarfile.open(bundle, "r:gz") as tar:
+        names = set(tar.getnames())
+        assert "submission-proof.json" in names
+        assert "MANIFEST.sha256" in names
+        assert "README.txt" in names
+        assert "evidence/console-output.txt" in names
+        assert "evidence/run-instances.json" in names
+        assert "evidence/nitro-claim-receipt.json" in names
+        bundled_proof = json.loads(tar.extractfile("submission-proof.json").read().decode("utf-8"))  # type: ignore[union-attr]
+        manifest = tar.extractfile("MANIFEST.sha256").read().decode("utf-8")  # type: ignore[union-attr]
+    assert bundled_proof["schema_version"] == "solrl.submission_proof.v1"
+    assert "evidence/console-output.txt" in manifest
+
+
+def test_submission_proof_rejects_missing_console_output(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    (artifact_dir / "console-output.txt").unlink()
+
+    with pytest.raises(AwsNitroRunnerError, match="console-output.txt"):
+        build_submission_proof(artifact_dir)
+
+
+def test_submission_proof_rejects_pcr16_mismatch(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    markers = json.loads((artifact_dir / "remote-markers.json").read_text(encoding="utf-8"))
+    markers["SOLRL_CLAIM_PCR16"] = "9" * 96
+    write_json(artifact_dir / "remote-markers.json", markers)
+
+    with pytest.raises(AwsNitroRunnerError, match="pcr16"):
+        build_submission_proof(artifact_dir)
+
+
+def test_submission_proof_rejects_compute_hash_mismatch(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    receipt = json.loads((artifact_dir / "nitro-claim-receipt.json").read_text(encoding="utf-8"))
+    receipt["claim"]["trajectory_hash"] = "9" * 64
+    write_json(artifact_dir / "nitro-claim-receipt.json", receipt)
+
+    with pytest.raises(AwsNitroRunnerError, match="compute_output_matches_claim_trajectory"):
+        build_submission_proof(artifact_dir)
+
+
+def test_submission_proof_rejects_attestation_hash_mismatch(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    receipt = json.loads((artifact_dir / "nitro-claim-receipt.json").read_text(encoding="utf-8"))
+    receipt["claim"]["attestation_document_hash"] = "9" * 64
+    write_json(artifact_dir / "nitro-claim-receipt.json", receipt)
+
+    with pytest.raises(AwsNitroRunnerError, match="attestation_hash_matches_claim"):
+        build_submission_proof(artifact_dir)
+
+
+def test_submission_proof_rejects_missing_exact_tags(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    launched = json.loads((artifact_dir / "run-instances.json").read_text(encoding="utf-8"))
+    launched["Instances"][0]["Tags"] = [{"Key": "Project", "Value": "SolRL"}]
+    write_json(artifact_dir / "run-instances.json", launched)
+
+    with pytest.raises(AwsNitroRunnerError, match="exact_solrl_tags_present"):
+        build_submission_proof(artifact_dir)
+
+
+def test_submission_proof_rejects_nonzero_project_cleanup(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    write_json(
+        artifact_dir / "postaudit-project.json",
+        {"scope": {"project": "SolRL"}, "instances": [{"id": "i-left"}], "security_groups": [], "volumes": []},
+    )
+
+    with pytest.raises(AwsNitroRunnerError, match="project_cleanup_zero"):
+        build_submission_proof(artifact_dir)
+
+
+def test_submission_proof_rejects_credential_like_evidence(tmp_path: Path) -> None:
+    artifact_dir = make_submission_artifacts(tmp_path)
+    with (artifact_dir / "run.log").open("a", encoding="utf-8") as handle:
+        handle.write("AWS_SECRET_ACCESS_KEY=not-for-submission\n")
+
+    with pytest.raises(AwsNitroRunnerError, match="credential-like"):
+        build_submission_proof(artifact_dir)
 
 
 def test_remote_script_configures_allocator_before_start() -> None:

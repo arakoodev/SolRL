@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import gzip
 import hashlib
+import io
 import json
 import os
 import secrets
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -66,6 +69,36 @@ FINAL_RESULT_REQUIRED_FIELDS = {
     "SOLRL_COMPUTE_INPUT_HASH",
     "SOLRL_COMPUTE_OUTPUT_HASH",
 }
+SUBMISSION_PROOF_SCHEMA_VERSION = "solrl.submission_proof.v1"
+SUBMISSION_PROOF_JSON = "submission-proof.json"
+SUBMISSION_PROOF_BUNDLE = "submission-proof-bundle.tar.gz"
+SUBMISSION_PROOF_BUNDLE_SHA256 = "submission-proof-bundle.sha256"
+SUBMISSION_PROOF_MANIFEST = "MANIFEST.sha256"
+SUBMISSION_PROOF_README = "README.txt"
+SUBMISSION_EVIDENCE_FILES = [
+    "caller.json",
+    "git-source.json",
+    "eif-source.json",
+    "eif-sha384.txt",
+    "run-instances.json",
+    "console-output.txt",
+    "remote-markers.json",
+    "generic-compute.json",
+    "claim-context.json",
+    "nitro-claim-receipt.json",
+    "preflight-project-audit.json",
+    "postaudit-run.json",
+    "postaudit-project.json",
+    "run.log",
+    "user-data.sh",
+]
+SECRET_SUBSTRINGS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_ACCESS_KEY=",
+    "AWS_SECRET_KEY=",
+)
 
 
 class AwsNitroRunnerError(RuntimeError):
@@ -285,6 +318,14 @@ def audit_lines(audit: dict[str, Any]) -> list[str]:
     return lines
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _resource_tags_by_id(ec2: Any, resource_type: str, resource_id: str) -> list[dict[str, str]]:
     if resource_type == "instance":
         response = ec2.describe_instances(InstanceIds=[resource_id])
@@ -428,6 +469,304 @@ def _extract_remote_error_tail(block: list[str]) -> str:
         if collecting:
             lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _load_artifact_json(artifact_dir: Path, name: str) -> Any:
+    path = artifact_dir / name
+    if not path.exists():
+        raise AwsNitroRunnerError(f"submission proof is missing required artifact: {name}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_artifact_text(artifact_dir: Path, name: str) -> str:
+    path = artifact_dir / name
+    if not path.exists():
+        raise AwsNitroRunnerError(f"submission proof is missing required artifact: {name}")
+    return path.read_text(encoding="utf-8")
+
+
+def _artifact_entry(artifact_dir: Path, name: str) -> dict[str, Any]:
+    path = artifact_dir / name
+    if not path.exists():
+        raise AwsNitroRunnerError(f"submission proof is missing required artifact: {name}")
+    return {
+        "path": name,
+        "bundle_member_path": f"evidence/{name}",
+        "sha256": file_sha256(path),
+        "bytes": path.stat().st_size,
+        "content_type": "text/plain" if name.endswith((".txt", ".log", ".sh")) else "application/json",
+        "required": True,
+    }
+
+
+def _assert_no_secret_markers(artifact_dir: Path) -> None:
+    leaked: list[str] = []
+    for name in SUBMISSION_EVIDENCE_FILES:
+        text = _load_artifact_text(artifact_dir, name)
+        for marker in SECRET_SUBSTRINGS:
+            if marker in text:
+                leaked.append(f"{name}:{marker}")
+    if leaked:
+        raise AwsNitroRunnerError(
+            "submission proof evidence contains credential-like markers: " + ", ".join(sorted(leaked))
+        )
+
+
+def _audit_total(audit: dict[str, Any]) -> int:
+    counts = audit_counts(audit)
+    return counts["instances"] + counts["security_groups"] + counts["volumes"]
+
+
+def _tag_map(tags: list[dict[str, str]]) -> dict[str, str]:
+    return {tag.get("Key", ""): tag.get("Value", "") for tag in tags}
+
+
+def _console_trace(console_text: str) -> dict[str, Any]:
+    lines = console_text.splitlines()
+    phase_events = [
+        line
+        for line in lines
+        if line.startswith("SOLRL_PHASE")
+        or line in {"SOLRL_RESULT_BEGIN", "SOLRL_RESULT_END"}
+        or line.startswith("SOLRL_STATUS=")
+    ]
+    return {
+        "bytes": len(console_text.encode("utf-8")),
+        "sha256": hashlib.sha256(console_text.encode("utf-8")).hexdigest(),
+        "result_markers_present": "SOLRL_RESULT_BEGIN" in console_text and "SOLRL_RESULT_END" in console_text,
+        "phase_events": phase_events,
+        "tail_excerpt": lines[-120:],
+    }
+
+
+def _instance_security_group_ids(instance: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for group in instance.get("SecurityGroups", []):
+        group_id = group.get("GroupId")
+        if group_id and group_id not in ids:
+            ids.append(group_id)
+    for interface in instance.get("NetworkInterfaces", []):
+        for group in interface.get("Groups", []):
+            group_id = group.get("GroupId")
+            if group_id and group_id not in ids:
+                ids.append(group_id)
+    return ids
+
+
+def _instance_vpc_subnet(instance: dict[str, Any]) -> tuple[str, str]:
+    vpc_id = instance.get("VpcId", "")
+    subnet_id = instance.get("SubnetId", "")
+    for interface in instance.get("NetworkInterfaces", []):
+        vpc_id = vpc_id or interface.get("VpcId", "")
+        subnet_id = subnet_id or interface.get("SubnetId", "")
+    return vpc_id, subnet_id
+
+
+def build_submission_proof(artifact_dir: Path) -> dict[str, Any]:
+    artifact_dir = Path(artifact_dir)
+    missing = [name for name in SUBMISSION_EVIDENCE_FILES if not (artifact_dir / name).exists()]
+    if missing:
+        raise AwsNitroRunnerError(
+            "submission proof is missing required artifacts: " + ", ".join(sorted(missing))
+        )
+    _assert_no_secret_markers(artifact_dir)
+
+    caller = _load_artifact_json(artifact_dir, "caller.json")
+    git_source = _load_artifact_json(artifact_dir, "git-source.json")
+    eif_source = _load_artifact_json(artifact_dir, "eif-source.json")
+    eif_sha384 = _load_artifact_text(artifact_dir, "eif-sha384.txt").strip()
+    run_instances = _load_artifact_json(artifact_dir, "run-instances.json")
+    markers = _load_artifact_json(artifact_dir, "remote-markers.json")
+    compute = _load_artifact_json(artifact_dir, "generic-compute.json")
+    receipt = _load_artifact_json(artifact_dir, "nitro-claim-receipt.json")
+    preflight_project = _load_artifact_json(artifact_dir, "preflight-project-audit.json")
+    postaudit_run = _load_artifact_json(artifact_dir, "postaudit-run.json")
+    postaudit_project = _load_artifact_json(artifact_dir, "postaudit-project.json")
+    console_text = _load_artifact_text(artifact_dir, "console-output.txt")
+
+    instances = run_instances.get("Instances", [])
+    if len(instances) != 1:
+        raise AwsNitroRunnerError("submission proof expected run-instances.json to contain exactly one instance")
+    instance = instances[0]
+    tags = _tag_map(instance.get("Tags", []))
+    run_id = markers["SOLRL_RUN_ID"]
+    vpc_id, subnet_id = _instance_vpc_subnet(instance)
+    security_group_ids = _instance_security_group_ids(instance)
+    claim = receipt["claim"]
+
+    checks = {
+        "aws_caller_present": bool(caller.get("Account") and caller.get("Arn")),
+        "immutable_git_ref": is_full_git_sha(markers["SOLRL_GIT_REF"]),
+        "git_source_matches_remote_marker": git_source.get("ref") == markers["SOLRL_GIT_REF"],
+        "eif_source_matches_remote_marker": eif_source.get("oci_ref") == markers["SOLRL_EIF_OCI_REF"],
+        "eif_ref_uses_git_commit": markers["SOLRL_EIF_OCI_REF"].lower().endswith(markers["SOLRL_GIT_REF"].lower()),
+        "eif_sha384_matches_remote_marker": eif_sha384.lower() == markers["SOLRL_EIF_SHA384"].lower(),
+        "ec2_enclave_enabled": instance.get("EnclaveOptions", {}).get("Enabled") is True,
+        "imds_v2_required": instance.get("MetadataOptions", {}).get("HttpTokens") == "required",
+        "exact_solrl_tags_present": tags.get("Project") == "SolRL"
+        and tags.get("SolRLRunId") == run_id
+        and tags.get("ManagedBy") == "SolRL",
+        "remote_status_ok": markers["SOLRL_STATUS"] == "OK",
+        "console_result_markers_present": "SOLRL_RESULT_BEGIN" in console_text and "SOLRL_RESULT_END" in console_text,
+        "pcr16_matches_claim": markers["SOLRL_PCR16"].lower() == markers["SOLRL_CLAIM_PCR16"].lower(),
+        "claim_receipt_pcr16_matches_remote": receipt["pcr16"].lower() == markers["SOLRL_CLAIM_PCR16"].lower()
+        and claim["pcr16"].lower() == markers["SOLRL_CLAIM_PCR16"].lower(),
+        "compute_output_matches_claim_trajectory": markers["SOLRL_COMPUTE_OUTPUT_HASH"].lower()
+        == claim["trajectory_hash"].lower(),
+        "compute_artifact_matches_claim_trajectory": compute["trajectory_hash"].lower()
+        == claim["trajectory_hash"].lower(),
+        "attestation_hash_matches_claim": markers["SOLRL_ATTESTATION_DOCUMENT_HASH"].lower()
+        == claim["attestation_document_hash"].lower(),
+        "receipt_attestation_hash_matches_claim": receipt["attestation_document_hash"].lower()
+        == claim["attestation_document_hash"].lower(),
+        "exact_run_cleanup_zero": _audit_total(postaudit_run) == 0,
+        "project_cleanup_zero": _audit_total(postaudit_project) == 0,
+    }
+    checks["all"] = all(checks.values())
+    if not checks["all"]:
+        failed = [key for key, value in checks.items() if not value]
+        raise AwsNitroRunnerError("submission proof checks failed: " + ", ".join(failed))
+
+    return {
+        "schema_version": SUBMISSION_PROOF_SCHEMA_VERSION,
+        "status": "passed",
+        "generated_at_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scope": "generic_attested_compute_v1",
+        "run_id": run_id,
+        "source": {
+            "git_url": git_source["url"],
+            "git_ref": markers["SOLRL_GIT_REF"],
+            "eif_oci_ref": markers["SOLRL_EIF_OCI_REF"],
+            "eif_sha384": markers["SOLRL_EIF_SHA384"],
+        },
+        "aws_trace": {
+            "account_id": caller["Account"],
+            "caller_arn": caller["Arn"],
+            "region": instance.get("Placement", {}).get("AvailabilityZone", "")[:-1] or DEFAULT_REGION,
+            "instance_id": instance["InstanceId"],
+            "instance_type": instance["InstanceType"],
+            "ami": instance["ImageId"],
+            "vpc_id": vpc_id,
+            "subnet_id": subnet_id,
+            "security_group_ids": security_group_ids,
+            "enclave_enabled": instance.get("EnclaveOptions", {}).get("Enabled") is True,
+            "imds_v2_required": instance.get("MetadataOptions", {}).get("HttpTokens") == "required",
+            "tags": tags,
+        },
+        "console_trace": {
+            "path": "evidence/console-output.txt",
+            **_console_trace(console_text),
+        },
+        "nitro_attestation": {
+            "verified": True,
+            "nitro_root_sha256": markers["SOLRL_NITRO_ROOT_SHA256"],
+            "pcr0": markers["SOLRL_PCR0"],
+            "pcr1": markers["SOLRL_PCR1"],
+            "pcr2": markers["SOLRL_PCR2"],
+            "pcr16": markers["SOLRL_PCR16"],
+            "claim_pcr16": markers["SOLRL_CLAIM_PCR16"],
+            "attestation_document_hash": markers["SOLRL_ATTESTATION_DOCUMENT_HASH"],
+        },
+        "generic_compute": {
+            "artifact_uri": compute["artifact_uri"],
+            "input_hash": markers["SOLRL_COMPUTE_INPUT_HASH"],
+            "output_hash": markers["SOLRL_COMPUTE_OUTPUT_HASH"],
+            "reward_value": compute["reward_value"],
+        },
+        "claim_v1": {
+            "claim_hash": receipt["claim_hash"],
+            "signature": receipt["signature"],
+            "verifier_public_key": receipt["verifier_public_key"],
+            "amount": claim["amount"],
+            "token_mint": claim["token_mint"],
+            "job_account": claim["job_account"],
+            "payout_token_account": claim["payout_token_account"],
+            "trajectory_hash": claim["trajectory_hash"],
+            "attestation_document_hash": claim["attestation_document_hash"],
+            "pcr16": claim["pcr16"],
+        },
+        "token_settlement_evidence": {
+            "claim_ready_for_settlement": True,
+            "local_validator_test": "settle_claim_transfers_token2022_balance_with_registry_pda_authority",
+            "public_devnet_status": "not_in_v1",
+        },
+        "cleanup_trace": {
+            "preflight_project_resources": audit_counts(preflight_project),
+            "exact_run_resources_after_cleanup": audit_counts(postaudit_run),
+            "project_resources_after_cleanup": audit_counts(postaudit_project),
+        },
+        "checks": checks,
+        "artifact_integrity": [_artifact_entry(artifact_dir, name) for name in SUBMISSION_EVIDENCE_FILES],
+        "bundle": {
+            "filename": SUBMISSION_PROOF_BUNDLE,
+            "sha256_filename": SUBMISSION_PROOF_BUNDLE_SHA256,
+            "manifest": SUBMISSION_PROOF_MANIFEST,
+            "readme": SUBMISSION_PROOF_README,
+            "evidence_prefix": "evidence/",
+        },
+    }
+
+
+def _submission_proof_readme(proof: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "SolRL submission proof bundle",
+            "",
+            f"Run id: {proof['run_id']}",
+            f"Schema: {proof['schema_version']}",
+            "",
+            "Open submission-proof.json first. It contains the machine-readable verdict, proof checks, and hashes.",
+            "The evidence/ directory contains the raw AWS traces, console output, ClaimV1 receipt, and audits.",
+            "Verify MANIFEST.sha256 against the bundle contents before trusting the JSON.",
+            "",
+            "This V1 bundle proves generic attested compute on AWS Nitro and a ClaimV1 receipt ready for the",
+            "Token-2022 settlement path. It does not claim production Harbor execution or public devnet settlement.",
+            "",
+        ]
+    )
+
+
+def _tar_add_bytes(tar: tarfile.TarFile, arcname: str, data: bytes) -> None:
+    info = tarfile.TarInfo(arcname)
+    info.size = len(data)
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mode = 0o644
+    tar.addfile(info, io.BytesIO(data))
+
+
+def write_submission_proof_bundle(artifact_dir: Path) -> Path:
+    artifact_dir = Path(artifact_dir)
+    proof = build_submission_proof(artifact_dir)
+    proof_bytes = (json.dumps(proof, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    readme_bytes = _submission_proof_readme(proof).encode("utf-8")
+    entries: list[tuple[str, bytes]] = [
+        (SUBMISSION_PROOF_JSON, proof_bytes),
+        (SUBMISSION_PROOF_README, readme_bytes),
+    ]
+    for name in SUBMISSION_EVIDENCE_FILES:
+        entries.append((f"evidence/{name}", (artifact_dir / name).read_bytes()))
+    manifest_lines = [f"{hashlib.sha256(data).hexdigest()}  {arcname}" for arcname, data in entries]
+    manifest_bytes = ("\n".join(manifest_lines) + "\n").encode("utf-8")
+
+    (artifact_dir / SUBMISSION_PROOF_JSON).write_bytes(proof_bytes)
+    bundle_path = artifact_dir / SUBMISSION_PROOF_BUNDLE
+    with bundle_path.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                _tar_add_bytes(tar, SUBMISSION_PROOF_JSON, proof_bytes)
+                _tar_add_bytes(tar, SUBMISSION_PROOF_MANIFEST, manifest_bytes)
+                _tar_add_bytes(tar, SUBMISSION_PROOF_README, readme_bytes)
+                for arcname, data in entries[2:]:
+                    _tar_add_bytes(tar, arcname, data)
+    (artifact_dir / SUBMISSION_PROOF_BUNDLE_SHA256).write_text(
+        f"{file_sha256(bundle_path)}  {SUBMISSION_PROOF_BUNDLE}\n",
+        encoding="utf-8",
+    )
+    return bundle_path
 
 
 def _load_cose_sign1(document: bytes) -> tuple[bytes, bytes, bytes, dict[str, Any]]:
@@ -683,6 +1022,9 @@ class AwsNitroRunner:
             if isinstance(run_error, botocore.exceptions.WaiterError):
                 raise AwsNitroRunnerError(f"AWS waiter failed: {run_error}") from run_error
             raise run_error
+        self.log("writing submission proof bundle")
+        bundle_path = write_submission_proof_bundle(self.config.artifact_dir)
+        self.log(f"submission proof bundle: {bundle_path}")
 
     def _preflight_audit(self) -> None:
         audit = audit_resources(self.ec2)
@@ -1124,6 +1466,15 @@ def run_cleanup(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_proof(args: argparse.Namespace) -> int:
+    artifact_dir = Path(args.artifact_dir)
+    bundle_path = write_submission_proof_bundle(artifact_dir)
+    print(f"SUBMISSION_PROOF_JSON={artifact_dir / SUBMISSION_PROOF_JSON}")
+    print(f"SUBMISSION_PROOF_BUNDLE={bundle_path}")
+    print(f"SUBMISSION_PROOF_BUNDLE_SHA256={artifact_dir / SUBMISSION_PROOF_BUNDLE_SHA256}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SolRL AWS Nitro runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1153,6 +1504,9 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--run-id", required=True)
     cleanup.add_argument("--artifact-root", default=os.environ.get("SOLRL_AWS_ARTIFACT_ROOT", "artifacts/aws-nitro"))
     cleanup.set_defaults(func=run_cleanup)
+    proof = subparsers.add_parser("proof", help="build the self-contained submission proof bundle from run artifacts")
+    proof.add_argument("--artifact-dir", required=True)
+    proof.set_defaults(func=run_proof)
     return parser
 
 

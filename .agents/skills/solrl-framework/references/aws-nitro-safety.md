@@ -67,6 +67,9 @@ Do not sneak this in. The user previously rejected extra IAM as overkill. Bring 
 
 After a real run, report:
 
+- `submission-proof-bundle.tar.gz` and `submission-proof-bundle.sha256`.
+- `submission-proof.json` inside the bundle, with `status=passed` and `checks.all=true`.
+- `MANIFEST.sha256` inside the bundle, covering every bundled evidence file.
 - AWS account id and caller ARN.
 - Run id.
 - AMI, instance type, VPC/subnet, security group id.
@@ -82,3 +85,7 @@ After a real run, report:
 Do not use real AWS output as token evidence by itself. Nitro proves the hardware rail and writes a ClaimV1 receipt tied to
 the verified document hash. Token proof comes from the local MVP artifacts plus the registry/Token-2022 build and
 local-validator balance evidence.
+
+Do not submit a proof JSON that points at loose files. The portable artifact is the tarball. It must contain the raw
+`console-output.txt`, `run-instances.json`, `remote-markers.json`, `generic-compute.json`, `nitro-claim-receipt.json`,
+pre/post audits, `run.log`, and `user-data.sh`.

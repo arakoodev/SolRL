@@ -119,6 +119,9 @@ Report these exact artifacts:
   generic compute output hash as `trajectory_hash`, and the locked PCR16.
 - `artifacts/aws-nitro/<run-id>/run-instances.json`: enclave enabled, IMDSv2 required, exact SolRL tags.
 - `artifacts/aws-nitro/<run-id>/postaudit-project.json`: zero SolRL instances, security groups, and volumes.
+- `artifacts/aws-nitro/<run-id>/submission-proof-bundle.tar.gz`: self-contained reviewer artifact containing
+  `submission-proof.json`, `MANIFEST.sha256`, console output, AWS launch traces, ClaimV1 receipt, audits, `run.log`, and
+  `user-data.sh`.
 
 Be precise about the token boundary. V1 has real Token-2022 CPI code in `settle_claim` and `slash_operator`, lints that
 reject fake flag-only settlement, a local payout/replay simulator, and a local-validator Token-2022 balance test. Do not
@@ -134,6 +137,8 @@ When touching AWS Nitro:
 3. Update `scripts/check-aws-safety.py` when a safety invariant should never regress.
 4. Add or update `tests/test_aws_nitro_runner.py`.
 5. Run `docker compose run --rm lint` and focused pytest.
+6. Keep submission proof generation in the main runner path. Do not add sidecar proof scripts or JSON that points at files
+   outside `submission-proof-bundle.tar.gz`.
 
 When touching ClaimV1, PCR16, settlement, or slashing:
 
@@ -174,5 +179,6 @@ Before saying work is done:
 2. State which Docker commands passed.
 3. If this was a verification run, state the local token proof, Anchor/Token-2022 proof, and Nitro proof
    separately.
-4. If real AWS ran, state the AWS account, run id, created resource tags, cleanup result, and post-audit count.
+4. If real AWS ran, state the AWS account, run id, created resource tags, cleanup result, post-audit count, and
+   `submission-proof-bundle.tar.gz` path plus SHA256.
 5. If a command could not be run, say why. No pretend green checkmarks.

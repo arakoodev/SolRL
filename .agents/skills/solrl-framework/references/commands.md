@@ -182,11 +182,26 @@ Inspect it:
 ```bash
 RUN_ID=<run-id>
 docker compose run --rm --no-deps -T harbor-runner python - <<PY
+import hashlib
 import json
+import tarfile
 from pathlib import Path
 
 run_id = "$RUN_ID"
 root = Path("artifacts/aws-nitro") / run_id
+bundle = root / "submission-proof-bundle.tar.gz"
+expected_bundle_hash = (root / "submission-proof-bundle.sha256").read_text().split()[0]
+assert hashlib.sha256(bundle.read_bytes()).hexdigest() == expected_bundle_hash
+with tarfile.open(bundle, "r:gz") as tar:
+    names = set(tar.getnames())
+    assert "submission-proof.json" in names
+    assert "MANIFEST.sha256" in names
+    assert "evidence/console-output.txt" in names
+    assert "evidence/run-instances.json" in names
+    assert "evidence/nitro-claim-receipt.json" in names
+    proof = json.loads(tar.extractfile("submission-proof.json").read().decode("utf-8"))
+assert proof["status"] == "passed"
+assert proof["checks"]["all"] is True
 markers = json.loads((root / "remote-markers.json").read_text())
 receipt = json.loads((root / "nitro-claim-receipt.json").read_text())
 postaudit = json.loads((root / "postaudit-project.json").read_text())
@@ -199,4 +214,12 @@ assert len(postaudit["security_groups"]) == 0
 assert len(postaudit["volumes"]) == 0
 print("REAL_NITRO_PROOF_OK")
 PY
+```
+
+Regenerate the self-contained proof bundle from an existing successful run without making AWS calls:
+
+```bash
+RUN_ID=<run-id>
+docker compose run --rm --no-deps harbor-runner \
+  python -m solrl_core.aws_nitro_runner proof --artifact-dir artifacts/aws-nitro/$RUN_ID
 ```

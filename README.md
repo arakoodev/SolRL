@@ -350,6 +350,9 @@ run-id resources remain.
 Expected duration is about 3-4 minutes when the GHCR EIF artifact exists for the commit. On the default `m5.xlarge`,
 that is roughly cents per run. If it fails, start with `artifacts/aws-nitro/<run-id>/console-output.txt` and the last
 `SOLRL_PHASE_*` marker. More failure notes live in `.agents/skills/solrl-framework/references/troubleshooting.md`.
+On success, the runner writes `artifacts/aws-nitro/<run-id>/submission-proof-bundle.tar.gz`. That bundle is the portable
+review artifact. It contains `submission-proof.json`, `MANIFEST.sha256`, `console-output.txt`, AWS launch traces, ClaimV1
+receipt, generic compute output, preflight audit, post-audit, `run.log`, and the exact `user-data.sh` that ran on EC2.
 
 The smoke has the EC2 parent clone the configured public Git ref, pull the matching public GHCR EIF artifact with ORAS,
 verify its SHA-384 sidecar, boot the EIF, request a real NSM attestation over VSOCK, and verify the COSE signature, AWS
@@ -459,6 +462,8 @@ transfer-hook reentry is rejected by Solana. That is the working token settlemen
 
 Run the audit and smoke commands in the Real Nitro section, then check:
 
+- `submission-proof-bundle.tar.gz` exists and `submission-proof-bundle.sha256` matches it.
+- The bundle contains `submission-proof.json`, `MANIFEST.sha256`, and the raw evidence under `evidence/`.
 - `artifacts/aws-nitro/<run-id>/remote-markers.json` has `SOLRL_STATUS=OK`.
 - `SOLRL_PCR16` equals `SOLRL_CLAIM_PCR16`.
 - `SOLRL_COMPUTE_OUTPUT_HASH` equals the ClaimV1 `trajectory_hash` in `nitro-claim-receipt.json`.
@@ -474,11 +479,26 @@ Artifact inspection command:
 ```bash
 RUN_ID=<run-id>
 docker compose run --rm --no-deps -T harbor-runner python - <<PY
+import hashlib
 import json
+import tarfile
 from pathlib import Path
 
 run_id = "$RUN_ID"
 root = Path("artifacts/aws-nitro") / run_id
+bundle = root / "submission-proof-bundle.tar.gz"
+expected_bundle_hash = (root / "submission-proof-bundle.sha256").read_text().split()[0]
+assert hashlib.sha256(bundle.read_bytes()).hexdigest() == expected_bundle_hash
+with tarfile.open(bundle, "r:gz") as tar:
+    names = set(tar.getnames())
+    assert "submission-proof.json" in names
+    assert "MANIFEST.sha256" in names
+    assert "evidence/console-output.txt" in names
+    assert "evidence/run-instances.json" in names
+    assert "evidence/nitro-claim-receipt.json" in names
+    proof = json.loads(tar.extractfile("submission-proof.json").read().decode("utf-8"))
+assert proof["status"] == "passed"
+assert proof["checks"]["all"] is True
 markers = json.loads((root / "remote-markers.json").read_text())
 receipt = json.loads((root / "nitro-claim-receipt.json").read_text())
 instance = json.loads((root / "run-instances.json").read_text())["Instances"][0]
@@ -501,6 +521,8 @@ assert len(postaudit["volumes"]) == 0
 print("REAL_NITRO_PROOF_OK")
 print(json.dumps({
     "run_id": run_id,
+    "submission_proof_bundle": str(bundle),
+    "submission_proof_bundle_sha256": expected_bundle_hash,
     "instance_id": instance["InstanceId"],
     "eif": markers["SOLRL_EIF_OCI_REF"],
     "nitro_root_sha256": markers["SOLRL_NITRO_ROOT_SHA256"],
@@ -512,6 +534,14 @@ print(json.dumps({
     "claim_hash": receipt["claim_hash"],
 }, indent=2))
 PY
+```
+
+To regenerate the bundle from an existing successful run without touching AWS:
+
+```bash
+RUN_ID=<run-id>
+docker compose run --rm --no-deps harbor-runner \
+  python -m solrl_core.aws_nitro_runner proof --artifact-dir artifacts/aws-nitro/$RUN_ID
 ```
 
 This proves the AWS rail: a Nitro-enabled EC2 parent booted the commit-pinned EIF, ran deterministic generic compute inside
