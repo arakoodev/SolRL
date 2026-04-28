@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 DOC_PATHS = (
     ROOT / "README.md",
+    ROOT / "why.md",
     ROOT / ".agents/skills/solrl-framework/SKILL.md",
     ROOT / ".agents/skills/solrl-framework/agents/openai.yaml",
     ROOT / ".agents/skills/solrl-framework/references/architecture.md",
