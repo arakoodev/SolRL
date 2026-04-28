@@ -11,6 +11,7 @@ from solrl_core.claim import (
     sha256_hex,
     write_json,
 )
+from solrl_core.generic_compute import build_compute_artifacts
 
 
 def build_mock_artifacts(out_dir: Path, job_id: str) -> dict[str, Any]:
@@ -32,16 +33,10 @@ def build_mock_artifacts(out_dir: Path, job_id: str) -> dict[str, Any]:
 
 
 def build_aws_smoke_artifacts(run_id: str) -> dict[str, Any]:
-    trajectory = {
-        "kind": "aws-nitro-smoke",
-        "run_id": run_id,
-        "reward": 1,
-    }
-    return {
-        "artifact_uri": f"aws-nitro-smoke://{run_id}",
-        "trajectory_hash": sha256_hex(trajectory),
-        "reward_value": 1,
-    }
+    # The real Nitro smoke is no longer only "attestation exists". It binds a
+    # deterministic generic computation result into ClaimV1. The nonce is still
+    # run_id-derived here because the on-chain proof runner uses one lease per run.
+    return build_compute_artifacts(run_id, hex32(run_id))
 
 
 def build_pcr16_components(config: dict[str, Any], artifacts: dict[str, Any], nonce: str) -> dict[str, Any]:

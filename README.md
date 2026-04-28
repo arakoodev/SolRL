@@ -1,13 +1,13 @@
 # SolRL
 
-SolRL is a Docker-first scaffold for a Harbor evaluation protocol backed by AWS Nitro attestations and Solana Token-2022 settlement.
+SolRL is a Docker-first scaffold for hardware-attested compute backed by AWS Nitro attestations and Solana Token-2022 settlement.
 
 Verify SolRL as a chain of evidence:
 
 ```text
 local claim flow proves: worker output -> verifier signature -> token payout semantics -> replay rejection
 registry build proves: ClaimV1 checks -> Token-2022 transfer_checked CPI -> registry PDA authority -> slashing path
-real AWS proves: EC2 parent -> Nitro EIF boot -> NSM attestation -> AWS root verification -> PCR16 bridge
+real AWS proves: EC2 parent -> Nitro EIF boot -> generic compute output -> NSM attestation -> AWS root verification -> PCR16 bridge -> ClaimV1 receipt
 ```
 
 The current V1 verification path is split this way on purpose. LocalStack cannot fake Nitro, and a real Nitro smoke should not also be the first place you debug Solana token accounts.
@@ -333,6 +333,11 @@ docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner 
 docker compose run --rm aws-nitro-runner
 ```
 
+The runner refuses to launch from a dirty worktree when it derives the default GitHub source and GHCR EIF artifact. Commit
+and push first, wait for `.github/workflows/build-nitro-eif.yml` to publish
+`ghcr.io/<owner>/solrl-nitro-worker-eif:<commit-sha>`, then run the smoke. Otherwise AWS would verify yesterday's pushed
+EIF while you stare at today's uncommitted code. Classic distributed systems prank.
+
 The runner does a read-only preflight audit before launch. By default it refuses to start if active/stopped
 `Project=SolRL` EC2 resources already exist in the account. Use `--allow-existing-solrl` only when you intentionally
 want overlapping SolRL runs.
@@ -355,9 +360,11 @@ under `/var/log/solrl`; EC2 console is not used as an artifact transport. It onl
 final result block. LocalStack cannot emulate `/dev/nsm`, PCRs, EIF
 boot, VSOCK, or real Nitro attestations.
 
-The Nitro `user_data` is derived from the same `Pcr16Components` used by the registry. The worker extends PCR16 once
-with that digest, locks PCR16, and the parent verifies `SOLRL_PCR16 == SOLRL_CLAIM_PCR16` before declaring success. That
-is the connecting wire between the AWS attestation rail and the Solana settlement rail.
+The Nitro worker handles two separate bindings. It extends PCR16 once with `pcr16_user_data` derived from the same
+`Pcr16Components` used by the registry, then places the deterministic generic compute output hash in attestation
+`user_data`. The parent verifies `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`, verifies attestation `user_data` against
+`SOLRL_COMPUTE_OUTPUT_HASH`, and writes `nitro-claim-receipt.json`. That is the connecting wire between the AWS
+attestation rail and the Solana settlement rail.
 
 The EC2 cloud-init script has bounded phases and a hard overall watchdog. A stuck package install, ORAS pull, VSOCK
 connect, or verifier call emits a typed failed result block with the current phase and a capped log tail, then shuts the
@@ -454,8 +461,13 @@ Run the audit and smoke commands in the Real Nitro section, then check:
 
 - `artifacts/aws-nitro/<run-id>/remote-markers.json` has `SOLRL_STATUS=OK`.
 - `SOLRL_PCR16` equals `SOLRL_CLAIM_PCR16`.
+- `SOLRL_COMPUTE_OUTPUT_HASH` equals the ClaimV1 `trajectory_hash` in `nitro-claim-receipt.json`.
+- `SOLRL_ATTESTATION_DOCUMENT_HASH` equals the ClaimV1 `attestation_document_hash` in `nitro-claim-receipt.json`.
 - `SOLRL_NITRO_ROOT_SHA256` is present and stable across real Nitro runs.
 - Post-audit reports zero exact-run resources left behind.
+- `nitro-claim-receipt.json` is the bridge artifact: the real Nitro smoke verified the raw NSM document on EC2, then the
+  local runner signs a ClaimV1 receipt whose `pcr16`, `trajectory_hash`, and `attestation_document_hash` are copied from
+  the verified remote result markers.
 
 Artifact inspection command:
 
@@ -468,11 +480,14 @@ from pathlib import Path
 run_id = "$RUN_ID"
 root = Path("artifacts/aws-nitro") / run_id
 markers = json.loads((root / "remote-markers.json").read_text())
+receipt = json.loads((root / "nitro-claim-receipt.json").read_text())
 instance = json.loads((root / "run-instances.json").read_text())["Instances"][0]
 postaudit = json.loads((root / "postaudit-project.json").read_text())
 
 assert markers["SOLRL_STATUS"] == "OK"
 assert markers["SOLRL_PCR16"] == markers["SOLRL_CLAIM_PCR16"]
+assert markers["SOLRL_COMPUTE_OUTPUT_HASH"] == receipt["claim"]["trajectory_hash"]
+assert markers["SOLRL_ATTESTATION_DOCUMENT_HASH"] == receipt["claim"]["attestation_document_hash"]
 assert markers["SOLRL_EIF_OCI_REF"].endswith(markers["SOLRL_GIT_REF"])
 assert instance["EnclaveOptions"]["Enabled"] is True
 assert instance["MetadataOptions"]["HttpTokens"] == "required"
@@ -493,12 +508,16 @@ print(json.dumps({
     "pcr1": markers["SOLRL_PCR1"],
     "pcr2": markers["SOLRL_PCR2"],
     "pcr16": markers["SOLRL_PCR16"],
+    "compute_output_hash": markers["SOLRL_COMPUTE_OUTPUT_HASH"],
+    "claim_hash": receipt["claim_hash"],
 }, indent=2))
 PY
 ```
 
-This proves the AWS rail: a Nitro-enabled EC2 parent booted the commit-pinned EIF, got a real NSM attestation, verified
-COSE/AWS root/PCRs/user data, and left no tagged AWS residue.
+This proves the AWS rail: a Nitro-enabled EC2 parent booted the commit-pinned EIF, ran deterministic generic compute inside
+the enclave, got a real NSM attestation with the compute output in `user_data`, verified COSE/AWS root/PCRs/user data, and
+left no tagged AWS residue. The resulting ClaimV1 receipt is ready to feed into the same settlement shape tested by the
+local Token-2022 registry test.
 
 ### 4. Token Verification Status
 

@@ -115,6 +115,8 @@ def main() -> int:
     require(runner, "resolve_eif_artifact_source(", "AWS runner must resolve the GHCR EIF artifact source")
     require(runner, "SOLRL_NITRO_EIF_OCI", "AWS runner must allow an explicit EIF OCI artifact override")
     require(runner, "derive_ghcr_eif_ref(", "AWS runner must derive the default EIF artifact from the git commit")
+    require(runner, "refusing real AWS Nitro smoke from a dirty worktree", "AWS runner must not test stale pushed code")
+    require(runner, 'status", "--porcelain"', "AWS runner must check worktree cleanliness before deriving default git ref")
     require(runner, "40-character commit SHA", "AWS runner must reject branch refs for default EIF artifacts")
     require(runner, "public_clone_url(", "AWS runner must convert GitHub SSH remotes to public HTTPS clone URLs")
     require(runner, "verify-attestation", "EC2 parent must verify the Nitro attestation before printing OK")
@@ -127,6 +129,11 @@ def main() -> int:
         runner,
         "claim_context[\"pcr16_user_data\"]",
         "AWS smoke must send PCR16 user_data derived from Pcr16Components, not run-id filler",
+    )
+    require(
+        runner,
+        "compute_artifacts[\"trajectory_hash\"]",
+        "AWS smoke must bind attestation user_data to the generic compute output used as ClaimV1 trajectory_hash",
     )
     require(
         runner,
@@ -281,6 +288,26 @@ def main() -> int:
             fail(f"AWS worker must issue Request::{request} against PCR16")
     require(remote, "verify-attestation", "AWS remote smoke must run the EC2-side attestation verifier")
     require(remote, "--expected-pcr16-hex", "AWS remote smoke must pass the registry ClaimV1 PCR16 to attestation verify")
+    require(
+        remote,
+        "--expected-pcr16-user-data-hex",
+        "AWS remote smoke must verify PCR16 against ClaimV1 pcr16_user_data separately from attestation user_data",
+    )
+    require(remote, "PCR16_USER_DATA_HEX", "AWS worker request must pass PCR16 extension input explicitly")
+    require(remote, "COMPUTE_INPUT_HEX", "AWS worker request must pass the generic compute input")
+    require(remote, "OUTPUT_HASH_HEX", "AWS remote smoke must parse the worker's generic compute output")
+    require(remote, "ATTESTATION_HEX", "AWS remote smoke must parse the worker's attestation separately")
+    require(
+        remote,
+        "attestation_document_hash",
+        "AWS remote smoke must publish a 32-byte hash linking ClaimV1 to the verified raw Nitro document",
+    )
+    require(
+        runner,
+        "nitro-claim-receipt.json",
+        "AWS runner must write a ClaimV1 receipt tied to the real Nitro attestation document hash",
+    )
+    require(remote, "SOLRL_COMPUTE_OUTPUT_HASH", "AWS remote smoke must print the generic compute output hash")
     require(remote, "SOLRL_CLAIM_PCR16", "AWS remote smoke must print the registry ClaimV1 PCR16 beside Nitro PCR16")
     require(
         remote,

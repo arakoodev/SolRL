@@ -1,6 +1,6 @@
 ---
 name: solrl-framework
-description: Operate and modify the SolRL repository safely. Use when working on SolRL Docker workflows, Harbor mock evals, Anchor/Token-2022 registry code, verification proof runs, ClaimV1 schema parity, PCR16 hashing, LocalStack tests, real AWS Nitro smoke tests, Marlin/Oyster Nix EIF builds, AWS tagging and cleanup, or docs for this framework.
+description: Operate and modify the SolRL repository safely. Use when working on SolRL Docker workflows, generic compute proofs, Harbor mock evals, Anchor/Token-2022 registry code, verification proof runs, ClaimV1 schema parity, PCR16 hashing, LocalStack tests, real AWS Nitro smoke tests, Marlin/Oyster Nix EIF builds, AWS tagging and cleanup, or docs for this framework.
 ---
 
 # SolRL Framework
@@ -82,6 +82,9 @@ docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner 
 docker compose run --rm aws-nitro-runner
 ```
 
+The real AWS runner refuses the default path from a dirty worktree. Commit and push first so the EC2 source checkout and
+the GHCR EIF artifact are the same commit.
+
 ## Verification Workflow
 
 When the user asks to verify the system, do not only run the smoke. Produce evidence for three separate claims:
@@ -89,7 +92,7 @@ When the user asks to verify the system, do not only run the smoke. Produce evid
 ```text
 1. Token settlement semantics: local-mock paid once and rejected replay.
 2. On-chain token implementation: lint + Anchor tests prove Token-2022 CPI wiring, registry checks, and local-validator balance movement.
-3. Real Nitro attestation: AWS smoke proves NSM attestation, AWS root verification, PCR16 bridge, and cleanup.
+3. Real Nitro attestation: AWS smoke proves generic compute output, NSM attestation, AWS root verification, PCR16 bridge, ClaimV1 receipt, and cleanup.
 ```
 
 Use:
@@ -110,7 +113,10 @@ Report these exact artifacts:
 - `artifacts/mock/hook_state.json`: one ledger entry with amount, claim hash, job account, and payout token account.
 - `artifacts/mock/claim_receipt.json`: ClaimV1, verifier signature, token mint, payout account, amount.
 - `programs/solrl-registry/tests/registry_flow.rs`: `settle_claim_transfers_token2022_balance_with_registry_pda_authority` proves real Token-2022 balance movement.
-- `artifacts/aws-nitro/<run-id>/remote-markers.json`: `SOLRL_STATUS=OK`, `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`.
+- `artifacts/aws-nitro/<run-id>/remote-markers.json`: `SOLRL_STATUS=OK`, `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`,
+  `SOLRL_COMPUTE_OUTPUT_HASH`, and `SOLRL_ATTESTATION_DOCUMENT_HASH`.
+- `artifacts/aws-nitro/<run-id>/nitro-claim-receipt.json`: ClaimV1 signed over the verified Nitro attestation document hash,
+  generic compute output hash as `trajectory_hash`, and the locked PCR16.
 - `artifacts/aws-nitro/<run-id>/run-instances.json`: enclave enabled, IMDSv2 required, exact SolRL tags.
 - `artifacts/aws-nitro/<run-id>/postaudit-project.json`: zero SolRL instances, security groups, and volumes.
 

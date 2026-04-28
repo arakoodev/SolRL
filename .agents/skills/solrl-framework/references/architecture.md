@@ -3,7 +3,7 @@
 ## Local Mock Flow
 
 ```text
-Harbor-style task
+Generic local task
     |
     v
 python/solrl_core/mock_worker.py
@@ -132,14 +132,14 @@ SolRL follows the useful pieces from Marlin Oyster:
 - Treat raw AWS Nitro attestation verification as off-chain work.
 - Keep the on-chain program focused on lightweight signed claims, PCR/policy matching, replay protection, staking, and settlement.
 
-Do not copy Marlin blindly. SolRL is narrower: Harbor evals and RL settlement, not general-purpose TEE compute.
+Do not copy Marlin blindly. SolRL is narrower: hardware-attested compute and Token-2022 settlement, not general-purpose TEE hosting.
 
 ## Verification Map
 
 Use this map when explaining the project to a reviewer or operator:
 
 ```text
-Harbor/RL job context
+Generic compute job context
     |
     +--> local proof path
     |       mock worker -> verifier signature -> hook simulator ledger payout -> replay rejection
@@ -149,15 +149,17 @@ Harbor/RL job context
     |       SlashClaimV1 -> slash_operator -> Token-2022 transfer_checked CPI -> treasury
     |
     +--> hardware proof path
-            GHCR EIF -> EC2 Nitro Enclave -> NSM attestation -> AWS root verification
+            GHCR EIF -> EC2 Nitro Enclave -> deterministic compute output
+            -> NSM attestation -> AWS root verification
             -> PCR16 equals registry ClaimV1 PCR16
+            -> nitro-claim-receipt.json binds attestation hash + compute output + PCR16
 ```
 
 What this proves today:
 
 - The local protocol pays once and rejects replay.
 - The registry compiles the Token-2022 CPI paths and proves real Token-2022 balance movement through a local-validator test.
-- Real AWS Nitro produces the attestation, PCRs, and PCR16 bridge from an immutable commit-tagged EIF.
+- Real AWS Nitro produces the compute output, attestation, PCRs, PCR16 bridge, and ClaimV1 receipt from an immutable commit-tagged EIF.
 
 What it does not yet prove:
 

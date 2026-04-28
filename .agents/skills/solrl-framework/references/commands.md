@@ -188,9 +188,12 @@ from pathlib import Path
 run_id = "$RUN_ID"
 root = Path("artifacts/aws-nitro") / run_id
 markers = json.loads((root / "remote-markers.json").read_text())
+receipt = json.loads((root / "nitro-claim-receipt.json").read_text())
 postaudit = json.loads((root / "postaudit-project.json").read_text())
 assert markers["SOLRL_STATUS"] == "OK"
 assert markers["SOLRL_PCR16"] == markers["SOLRL_CLAIM_PCR16"]
+assert markers["SOLRL_COMPUTE_OUTPUT_HASH"] == receipt["claim"]["trajectory_hash"]
+assert markers["SOLRL_ATTESTATION_DOCUMENT_HASH"] == receipt["claim"]["attestation_document_hash"]
 assert len(postaudit["instances"]) == 0
 assert len(postaudit["security_groups"]) == 0
 assert len(postaudit["volumes"]) == 0

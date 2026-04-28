@@ -210,7 +210,7 @@ phase_run_enclave() {
 }
 
 phase_attestation() {
-  python3 - <<'PY' > /tmp/solrl-attestation.hex
+  python3 - <<'PY' > /tmp/solrl-worker-response.txt
 import socket
 import time
 
@@ -225,9 +225,10 @@ else:
     raise SystemExit("could not connect to SolRL worker enclave over VSOCK")
 
 payload = "\n".join([
-    "USER_DATA_HEX=__USER_DATA_HEX__",
+    "PCR16_USER_DATA_HEX=__PCR16_USER_DATA_HEX__",
     "PUBLIC_KEY_HEX=__PUBLIC_KEY_HEX__",
     "NONCE_HEX=__NONCE_HEX__",
+    "COMPUTE_INPUT_HEX=__COMPUTE_INPUT_HEX__",
     "",
 ])
 sock.sendall(payload.encode("ascii"))
@@ -240,13 +241,21 @@ while True:
     chunks.append(data)
 print(b"".join(chunks).decode("ascii").strip())
 PY
+  output_hash="$(awk -F= '$1 == "OUTPUT_HASH_HEX" { print $2 }' /tmp/solrl-worker-response.txt)"
+  if [ "$output_hash" != "__COMPUTE_OUTPUT_HASH_HEX__" ]; then
+    echo "generic compute output hash mismatch: $output_hash != __COMPUTE_OUTPUT_HASH_HEX__" >&2
+    exit 1
+  fi
+  awk -F= '$1 == "ATTESTATION_HEX" { print $2 }' /tmp/solrl-worker-response.txt > /tmp/solrl-attestation.hex
+  test -s /tmp/solrl-attestation.hex
 }
 
 phase_verify_attestation() {
   PYTHONPATH="$SRC_DIR/python" python3 -m solrl_core.aws_nitro_runner verify-attestation \
     --attestation-hex-path /tmp/solrl-attestation.hex \
-    --expected-user-data-hex __USER_DATA_HEX__ \
+    --expected-user-data-hex __ATTESTATION_USER_DATA_HEX__ \
     --expected-public-key-hex __PUBLIC_KEY_HEX__ \
+    --expected-pcr16-user-data-hex __PCR16_USER_DATA_HEX__ \
     --expected-pcr16-hex __CLAIM_PCR16_HEX__ \
     --summary-json /tmp/solrl-attestation-summary.json
 }
@@ -282,6 +291,7 @@ pcr1="$(jq -r '.pcrs["1"]' "$summary")"
 pcr2="$(jq -r '.pcrs["2"]' "$summary")"
 pcr16="$(jq -r '.pcrs["16"]' "$summary")"
 root_sha="$(jq -r '.root_public_key_sha256' "$summary")"
+attestation_document_hash="$(jq -r '.attestation_document_hash' "$summary")"
 
 touch "$DONE_FILE"
 if [ -n "$WATCHDOG_PID" ]; then
@@ -302,6 +312,9 @@ fi
   echo SOLRL_PCR16="$pcr16"
   echo SOLRL_CLAIM_PCR16=__CLAIM_PCR16_HEX__
   echo SOLRL_CLAIM_CONTEXT_HASH=__CLAIM_CONTEXT_HASH_HEX__
+  echo SOLRL_ATTESTATION_DOCUMENT_HASH="$attestation_document_hash"
+  echo SOLRL_COMPUTE_INPUT_HASH=__COMPUTE_INPUT_HASH_HEX__
+  echo SOLRL_COMPUTE_OUTPUT_HASH=__COMPUTE_OUTPUT_HASH_HEX__
   echo SOLRL_RESULT_END
 } >/run/solrl-result.txt
 

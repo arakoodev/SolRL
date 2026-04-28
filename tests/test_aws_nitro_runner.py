@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 from pathlib import Path
 
@@ -29,6 +30,9 @@ from solrl_core.aws_nitro_runner import (
     tags_match,
     validate_oci_ref,
 )
+from solrl_core.claim import claim_hash, verify_claim
+from solrl_core.claim_context import build_aws_smoke_artifacts, build_claim_context
+from solrl_core.config import load_config
 
 
 class FakeEc2:
@@ -145,6 +149,40 @@ def example_eif_source(ref: str = "abcdef1234567890abcdef1234567890abcdef12") ->
 
 CLAIM_PCR16 = "d" * 96
 CLAIM_CONTEXT_HASH = "e" * 64
+ATTESTATION_DOCUMENT_HASH = "f" * 64
+COMPUTE_INPUT_HASH = "1" * 64
+COMPUTE_OUTPUT_HASH = "2" * 64
+
+
+def example_remote_script(
+    config: RunnerConfig,
+    source: GitSource | None = None,
+    eif_source: EifArtifactSource | None = None,
+    *,
+    pcr16_user_data: str = "aa",
+    attestation_user_data: str = COMPUTE_OUTPUT_HASH,
+    public_key: str = "bb",
+    nonce: str = "cc",
+    claim_pcr16: str = CLAIM_PCR16,
+    claim_context_hash: str = CLAIM_CONTEXT_HASH,
+    compute_input: str = "ff",
+    compute_input_hash: str = COMPUTE_INPUT_HASH,
+    compute_output_hash: str = COMPUTE_OUTPUT_HASH,
+) -> str:
+    return remote_smoke_script(
+        config,
+        pcr16_user_data,
+        attestation_user_data,
+        public_key,
+        nonce,
+        claim_pcr16,
+        claim_context_hash,
+        compute_input,
+        compute_input_hash,
+        compute_output_hash,
+        source or example_git_source(),
+        eif_source or example_eif_source(),
+    )
 
 
 def test_normalise_aws_env_accepts_existing_env_names(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,6 +219,25 @@ def test_resolve_git_source_prefers_explicit_env(monkeypatch: pytest.MonkeyPatch
     source = resolve_git_source()
 
     assert source == example_git_source()
+
+
+def test_resolve_git_source_rejects_dirty_worktree_for_default_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOLRL_NITRO_GIT_URL", raising=False)
+    monkeypatch.delenv("SOLRL_NITRO_GIT_REF", raising=False)
+
+    def fake_git_output(*args: str) -> str:
+        if args == ("remote", "get-url", "origin"):
+            return "git@github.com:arakoodev/SolRL.git"
+        if args == ("status", "--porcelain"):
+            return " M python/solrl_core/aws_nitro_runner.py"
+        if args == ("rev-parse", "HEAD"):
+            return "abcdef1234567890abcdef1234567890abcdef12"
+        raise AssertionError(args)
+
+    monkeypatch.setattr("solrl_core.aws_nitro_runner._git_output", fake_git_output)
+
+    with pytest.raises(AwsNitroRunnerError, match="dirty worktree"):
+        resolve_git_source()
 
 
 def test_default_eif_oci_ref_is_derived_from_github_commit() -> None:
@@ -266,6 +323,9 @@ def final_block(**overrides: str) -> str:
         "SOLRL_PCR16": CLAIM_PCR16,
         "SOLRL_CLAIM_PCR16": CLAIM_PCR16,
         "SOLRL_CLAIM_CONTEXT_HASH": CLAIM_CONTEXT_HASH,
+        "SOLRL_ATTESTATION_DOCUMENT_HASH": ATTESTATION_DOCUMENT_HASH,
+        "SOLRL_COMPUTE_INPUT_HASH": COMPUTE_INPUT_HASH,
+        "SOLRL_COMPUTE_OUTPUT_HASH": COMPUTE_OUTPUT_HASH,
     }
     markers.update(overrides)
     return "\n".join(
@@ -331,6 +391,7 @@ def test_remote_python_files_parse_as_python37() -> None:
         Path("python/solrl_core/claim.py"),
         Path("python/solrl_core/claim_context.py"),
         Path("python/solrl_core/config.py"),
+        Path("python/solrl_core/generic_compute.py"),
     ):
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 7))
 
@@ -377,11 +438,37 @@ def test_wait_for_final_console_result_handles_delayed_console_output(
     assert (runner.config.artifact_dir / "console-output.txt").read_text(encoding="utf-8") == output
 
 
+def test_persist_remote_outputs_writes_nitro_backed_claim_receipt(tmp_path: Path) -> None:
+    config = make_config("solrl-test", tmp_path)
+    solrl_config = load_config()
+    compute_artifacts = build_aws_smoke_artifacts(config.run_id)
+    claim_context = build_claim_context(solrl_config, compute_artifacts, config.run_id)
+    markers = parse_remote_markers(
+        final_block(
+            SOLRL_PCR16=claim_context["pcr16"],
+            SOLRL_CLAIM_PCR16=claim_context["pcr16"],
+            SOLRL_COMPUTE_OUTPUT_HASH=claim_context["trajectory_hash"],
+            SOLRL_ATTESTATION_DOCUMENT_HASH="a" * 64,
+        )
+    )
+    runner = AwsNitroRunner.__new__(AwsNitroRunner)
+    runner.config = config
+    runner._write_json("claim-context.json", claim_context)
+
+    runner._persist_remote_outputs(markers)
+
+    receipt = json.loads((config.artifact_dir / "nitro-claim-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["claim"]["attestation_document_hash"] == "a" * 64
+    assert receipt["claim"]["trajectory_hash"] == compute_artifacts["compute_output_hash"]
+    assert receipt["claim_hash"] == claim_hash(receipt["claim"])
+    assert verify_claim(receipt["claim"], receipt["signature"], receipt["verifier_public_key"])
+
+
 def test_remote_script_configures_allocator_before_start() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
     source = example_git_source()
 
-    script = remote_smoke_script(config, "aa", "bb", "cc", CLAIM_PCR16, CLAIM_CONTEXT_HASH, source, example_eif_source())
+    script = example_remote_script(config, source, example_eif_source())
 
     assert "systemctl enable --now nitro-enclaves-allocator.service" not in script
     assert "exec >\"$LOG_DIR/user-data.log\" 2>&1" in script
@@ -423,12 +510,21 @@ def test_remote_script_configures_allocator_before_start() -> None:
     assert "git clone \"$git_url\" \"$SRC_DIR\"" in script
     assert "git checkout --detach \"abcdef1234567890abcdef1234567890abcdef12\"" in script
     assert "--build-arg SOLRL_USER_DATA_HEX" not in script
-    assert "USER_DATA_HEX=aa" in script
+    assert "PCR16_USER_DATA_HEX=aa" in script
+    assert f"--expected-user-data-hex {COMPUTE_OUTPUT_HASH}" in script
     assert "PUBLIC_KEY_HEX=bb" in script
     assert "NONCE_HEX=cc" in script
+    assert "COMPUTE_INPUT_HEX=ff" in script
+    assert "OUTPUT_HASH_HEX" in script
+    assert "/tmp/solrl-worker-response.txt" in script
+    assert f"!= \"{COMPUTE_OUTPUT_HASH}\"" in script
     assert f"--expected-pcr16-hex {CLAIM_PCR16}" in script
+    assert "--expected-pcr16-user-data-hex aa" in script
     assert f"SOLRL_CLAIM_PCR16={CLAIM_PCR16}" in script
     assert f"SOLRL_CLAIM_CONTEXT_HASH={CLAIM_CONTEXT_HASH}" in script
+    assert "SOLRL_ATTESTATION_DOCUMENT_HASH=\"$attestation_document_hash\"" in script
+    assert f"SOLRL_COMPUTE_INPUT_HASH={COMPUTE_INPUT_HASH}" in script
+    assert f"SOLRL_COMPUTE_OUTPUT_HASH={COMPUTE_OUTPUT_HASH}" in script
     assert "sock.sendall(payload.encode(\"ascii\"))" in script
     assert "verify-attestation" in script
     assert script.index("verify-attestation") < script.index("SOLRL_STATUS=OK")
@@ -451,19 +547,25 @@ def test_remote_script_rejects_shell_unsafe_run_id() -> None:
     source = example_git_source()
 
     with pytest.raises(AwsNitroRunnerError, match="run_id"):
-        remote_smoke_script(config, "aa", "bb", "cc", CLAIM_PCR16, CLAIM_CONTEXT_HASH, source, example_eif_source())
+        example_remote_script(config, source, example_eif_source())
 
 
 def test_remote_script_rejects_non_hex_template_values() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
     source = example_git_source()
 
-    with pytest.raises(AwsNitroRunnerError, match="user_data_hex"):
-        remote_smoke_script(config, "aa;rm", "bb", "cc", CLAIM_PCR16, CLAIM_CONTEXT_HASH, source, example_eif_source())
+    with pytest.raises(AwsNitroRunnerError, match="pcr16_user_data_hex"):
+        example_remote_script(config, source, example_eif_source(), pcr16_user_data="aa;rm")
+    with pytest.raises(AwsNitroRunnerError, match="attestation_user_data_hex"):
+        example_remote_script(config, source, example_eif_source(), attestation_user_data="not-hex")
     with pytest.raises(AwsNitroRunnerError, match="public_key_hex"):
-        remote_smoke_script(config, "aa", "not-hex", "cc", CLAIM_PCR16, CLAIM_CONTEXT_HASH, source, example_eif_source())
+        example_remote_script(config, source, example_eif_source(), public_key="not-hex")
     with pytest.raises(AwsNitroRunnerError, match="nonce_hex"):
-        remote_smoke_script(config, "aa", "bb", "c", CLAIM_PCR16, CLAIM_CONTEXT_HASH, source, example_eif_source())
+        example_remote_script(config, source, example_eif_source(), nonce="c")
+    with pytest.raises(AwsNitroRunnerError, match="compute_input_hex"):
+        example_remote_script(config, source, example_eif_source(), compute_input="not-hex")
+    with pytest.raises(AwsNitroRunnerError, match="compute_output_hash_hex"):
+        example_remote_script(config, source, example_eif_source(), compute_output_hash="z" * 64)
 
 
 def test_remote_script_rejects_private_git_source() -> None:
@@ -471,7 +573,7 @@ def test_remote_script_rejects_private_git_source() -> None:
     source = GitSource("https://token@github.com/arakoodev/SolRL.git", "abcdef1234567890abcdef1234567890abcdef12")
 
     with pytest.raises(AwsNitroRunnerError, match="public HTTPS"):
-        remote_smoke_script(config, "aa", "bb", "cc", CLAIM_PCR16, CLAIM_CONTEXT_HASH, source, example_eif_source())
+        example_remote_script(config, source, example_eif_source())
 
 
 def test_remote_script_rejects_invalid_vsock_port() -> None:
@@ -485,29 +587,15 @@ def test_remote_script_rejects_invalid_vsock_port() -> None:
     )
 
     with pytest.raises(AwsNitroRunnerError, match="vsock_port"):
-        remote_smoke_script(
-            config,
-            "aa",
-            "bb",
-            "cc",
-            CLAIM_PCR16,
-            CLAIM_CONTEXT_HASH,
-            example_git_source(),
-            example_eif_source(),
-        )
+        example_remote_script(config)
 
 
 def test_remote_script_rejects_shell_unsafe_eif_oci_ref() -> None:
     config = make_config("solrl-test", Path("artifacts/test"))
 
     with pytest.raises(AwsNitroRunnerError, match="SOLRL_NITRO_EIF_OCI"):
-        remote_smoke_script(
+        example_remote_script(
             config,
-            "aa",
-            "bb",
-            "cc",
-            CLAIM_PCR16,
-            CLAIM_CONTEXT_HASH,
             example_git_source(),
             EifArtifactSource("ghcr.io/arakoodev/solrl-nitro-worker-eif:abc;rm"),
         )

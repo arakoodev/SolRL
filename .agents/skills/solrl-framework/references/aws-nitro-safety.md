@@ -49,9 +49,11 @@ one final result block. It is not an artifact transport.
 The EIF is built by GitHub Actions and published as a public GHCR OCI artifact. The EC2 parent pulls it with ORAS and
 verifies the `.sha384` sidecar before booting it. Do not put GHCR credentials in EC2 user-data for the default smoke path.
 
-The final result must include `SOLRL_PCR16`, `SOLRL_CLAIM_PCR16`, and `SOLRL_CLAIM_CONTEXT_HASH`. `SOLRL_PCR16` and
-`SOLRL_CLAIM_PCR16` must be equal. This is the regression check that proves the real Nitro smoke is using the same PCR16
-meaning as the registry.
+The final result must include `SOLRL_PCR16`, `SOLRL_CLAIM_PCR16`, `SOLRL_CLAIM_CONTEXT_HASH`,
+`SOLRL_ATTESTATION_DOCUMENT_HASH`, and `SOLRL_COMPUTE_OUTPUT_HASH`. `SOLRL_PCR16` and `SOLRL_CLAIM_PCR16` must be equal.
+`SOLRL_COMPUTE_OUTPUT_HASH` must match ClaimV1 `trajectory_hash` in `nitro-claim-receipt.json`. This is the regression
+check that proves the real Nitro smoke is using the same PCR16 model as the registry and the same generic compute output
+that settlement signs.
 
 If asked to make real AWS smoke reliable, propose a scoped return channel instead of adding more tail parsing:
 
@@ -73,8 +75,10 @@ After a real run, report:
 - EIF OCI ref and EIF SHA-384.
 - `SOLRL_PCR0`, `SOLRL_PCR1`, `SOLRL_PCR2`, and `SOLRL_PCR16`.
 - Whether `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`.
+- `SOLRL_COMPUTE_OUTPUT_HASH` and `SOLRL_ATTESTATION_DOCUMENT_HASH`.
 - Whether the instance stopped/terminated.
 - Post-audit counts for SolRL instances, security groups, and volumes.
 
-Do not use real AWS output as token evidence by itself. Nitro proves the hardware rail. Token proof comes from the local
-MVP artifacts plus the registry/Token-2022 build and lint evidence.
+Do not use real AWS output as token evidence by itself. Nitro proves the hardware rail and writes a ClaimV1 receipt tied to
+the verified document hash. Token proof comes from the local MVP artifacts plus the registry/Token-2022 build and
+local-validator balance evidence.

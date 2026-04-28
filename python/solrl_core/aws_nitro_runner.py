@@ -22,7 +22,13 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
 
-from solrl_core.claim_context import build_aws_smoke_artifacts, build_claim_context, claim_context_hash
+from solrl_core.claim import claim_hash, private_key_from_seed, sign_claim, verifier_identity
+from solrl_core.claim_context import (
+    build_aws_smoke_artifacts,
+    build_claim_context,
+    claim_context_hash,
+    claim_fields_from_context,
+)
 
 
 AWS_ROOT_KEY_HEX = (
@@ -56,6 +62,9 @@ FINAL_RESULT_REQUIRED_FIELDS = {
     "SOLRL_PCR16",
     "SOLRL_CLAIM_PCR16",
     "SOLRL_CLAIM_CONTEXT_HASH",
+    "SOLRL_ATTESTATION_DOCUMENT_HASH",
+    "SOLRL_COMPUTE_INPUT_HASH",
+    "SOLRL_COMPUTE_OUTPUT_HASH",
 }
 
 
@@ -388,9 +397,15 @@ def parse_remote_markers(stdout: str) -> dict[str, str]:
         value = markers[key]
         if len(value) != 96 or any(char not in "0123456789abcdefABCDEF" for char in value):
             raise AwsNitroRunnerError(f"remote Nitro marker {key} must be 48-byte hex")
-    context_hash = markers["SOLRL_CLAIM_CONTEXT_HASH"]
-    if len(context_hash) != 64 or any(char not in "0123456789abcdefABCDEF" for char in context_hash):
-        raise AwsNitroRunnerError("remote Nitro claim context hash marker must be 32-byte hex")
+    for key in (
+        "SOLRL_CLAIM_CONTEXT_HASH",
+        "SOLRL_ATTESTATION_DOCUMENT_HASH",
+        "SOLRL_COMPUTE_INPUT_HASH",
+        "SOLRL_COMPUTE_OUTPUT_HASH",
+    ):
+        value = markers[key]
+        if len(value) != 64 or any(char not in "0123456789abcdefABCDEF" for char in value):
+            raise AwsNitroRunnerError(f"remote Nitro marker {key} must be 32-byte hex")
     if markers["SOLRL_PCR16"].lower() != markers["SOLRL_CLAIM_PCR16"].lower():
         raise AwsNitroRunnerError("remote Nitro PCR16 does not match ClaimV1 PCR16")
     root_sha = markers["SOLRL_NITRO_ROOT_SHA256"]
@@ -502,6 +517,7 @@ def verify_attestation_document(
     document: bytes,
     expected_user_data: bytes,
     expected_public_key: bytes,
+    expected_pcr16_user_data: bytes | None = None,
     expected_pcr16: bytes | None = None,
 ) -> DecodedAttestation:
     protected, payload, signature, payload_map = _load_cose_sign1(document)
@@ -518,7 +534,8 @@ def verify_attestation_document(
             raise AwsNitroRunnerError(f"PCR{index} must be 48 bytes")
         if pcrs[index] == bytes(48):
             raise AwsNitroRunnerError(f"PCR{index} is all zero; non-debug Nitro smoke required")
-    computed_pcr16 = hashlib.sha384(bytes(48) + expected_user_data).digest()
+    pcr16_user_data = expected_pcr16_user_data if expected_pcr16_user_data is not None else expected_user_data
+    computed_pcr16 = hashlib.sha384(bytes(48) + pcr16_user_data).digest()
     if expected_pcr16 is not None and expected_pcr16 != computed_pcr16:
         raise AwsNitroRunnerError("expected ClaimV1 PCR16 does not match Nitro ExtendPCR(user_data)")
     if pcrs[16] != computed_pcr16:
@@ -527,7 +544,7 @@ def verify_attestation_document(
     user_data = payload_map.get("user_data") or b""
     public_key = payload_map.get("public_key") or b""
     if user_data != expected_user_data:
-        raise AwsNitroRunnerError("attestation user_data does not match ClaimV1 context hash")
+        raise AwsNitroRunnerError("attestation user_data does not match expected compute output")
     if public_key != expected_public_key:
         raise AwsNitroRunnerError("attestation public_key does not match expected worker key")
 
@@ -609,7 +626,15 @@ def resolve_eif_artifact_source(git_source: GitSource) -> EifArtifactSource:
 
 def resolve_git_source() -> GitSource:
     url = os.environ.get("SOLRL_NITRO_GIT_URL") or public_clone_url(_git_output("remote", "get-url", "origin"))
-    ref = os.environ.get("SOLRL_NITRO_GIT_REF") or _git_output("rev-parse", "HEAD")
+    ref = os.environ.get("SOLRL_NITRO_GIT_REF")
+    if ref is None:
+        dirty = _git_output("status", "--porcelain")
+        if dirty:
+            raise AwsNitroRunnerError(
+                "refusing real AWS Nitro smoke from a dirty worktree; commit and push first so the EC2 source checkout "
+                "and GHCR EIF artifact prove the code you are looking at"
+            )
+        ref = _git_output("rev-parse", "HEAD")
     source = GitSource(url=url, ref=ref)
     validate_git_source(source)
     return source
@@ -770,19 +795,21 @@ class AwsNitroRunner:
         from solrl_core.config import load_config
 
         protocol_config = load_config()
-        claim_context = build_claim_context(
-            protocol_config,
-            build_aws_smoke_artifacts(self.config.run_id),
-            self.config.run_id,
-        )
+        compute_artifacts = build_aws_smoke_artifacts(self.config.run_id)
+        claim_context = build_claim_context(protocol_config, compute_artifacts, self.config.run_id)
         self._write_json("claim-context.json", claim_context)
+        self._write_json("generic-compute.json", compute_artifacts)
         user_data = remote_smoke_script(
             self.config,
             claim_context["pcr16_user_data"],
+            compute_artifacts["trajectory_hash"],
             claim_context["worker_public_key_hash"],
             claim_context["nonce"],
             claim_context["pcr16"],
             claim_context_hash(claim_context),
+            compute_artifacts["compute_input_hex"],
+            compute_artifacts["compute_input_hash"],
+            compute_artifacts["compute_output_hash"],
             git_source,
             eif_source,
         )
@@ -894,6 +921,35 @@ class AwsNitroRunner:
     def _persist_remote_outputs(self, markers: dict[str, str]) -> None:
         self._write_json("remote-markers.json", markers)
         self._write_text("eif-sha384.txt", markers["SOLRL_EIF_SHA384"] + "\n")
+        self._write_nitro_claim_receipt(markers)
+
+    def _write_nitro_claim_receipt(self, markers: dict[str, str]) -> None:
+        claim_context_path = self.config.artifact_dir / "claim-context.json"
+        if not claim_context_path.exists():
+            raise AwsNitroRunnerError("claim-context.json missing; cannot write Nitro-backed ClaimV1 receipt")
+        claim_context = json.loads(claim_context_path.read_text(encoding="utf-8"))
+        if claim_context["pcr16"].lower() != markers["SOLRL_CLAIM_PCR16"].lower():
+            raise AwsNitroRunnerError("claim-context.json PCR16 does not match remote ClaimV1 PCR16 marker")
+        if claim_context["trajectory_hash"].lower() != markers["SOLRL_COMPUTE_OUTPUT_HASH"].lower():
+            raise AwsNitroRunnerError("claim-context.json trajectory_hash does not match remote compute output marker")
+
+        claim = claim_fields_from_context(claim_context)
+        claim["attestation_document_hash"] = markers["SOLRL_ATTESTATION_DOCUMENT_HASH"].lower()
+        identity = verifier_identity("solrl-local-verifier")
+        signature = sign_claim(claim, private_key_from_seed("solrl-local-verifier"))
+        self._write_json(
+            "nitro-claim-receipt.json",
+            {
+                "claim": claim,
+                "claim_hash": claim_hash(claim),
+                "signature": signature,
+                "verifier_public_key": identity.public_key_hex,
+                "source": "aws-nitro-smoke",
+                "attestation_document_hash": markers["SOLRL_ATTESTATION_DOCUMENT_HASH"].lower(),
+                "compute_output_hash": markers["SOLRL_COMPUTE_OUTPUT_HASH"].lower(),
+                "pcr16": markers["SOLRL_CLAIM_PCR16"].lower(),
+            },
+        )
 
     def cleanup(self) -> None:
         self.log(f"cleanup starting for run id {self.config.run_id}")
@@ -939,20 +995,28 @@ def validate_vsock_port(port: int) -> None:
 
 def remote_smoke_script(
     config: RunnerConfig,
-    user_data_hex: str,
+    pcr16_user_data_hex: str,
+    attestation_user_data_hex: str,
     public_key_hex: str,
     nonce_hex: str,
     claim_pcr16_hex: str,
     claim_context_hash_hex: str,
+    compute_input_hex: str,
+    compute_input_hash_hex: str,
+    compute_output_hash_hex: str,
     git_source: GitSource,
     eif_source: EifArtifactSource,
 ) -> str:
     validate_remote_token("run_id", config.run_id)
-    validate_remote_hex("user_data_hex", user_data_hex)
+    validate_remote_hex("pcr16_user_data_hex", pcr16_user_data_hex)
+    validate_remote_hex("attestation_user_data_hex", attestation_user_data_hex)
     validate_remote_hex("public_key_hex", public_key_hex)
     validate_remote_hex("nonce_hex", nonce_hex)
     validate_remote_hex("claim_pcr16_hex", claim_pcr16_hex)
     validate_remote_hex("claim_context_hash_hex", claim_context_hash_hex)
+    validate_remote_hex("compute_input_hex", compute_input_hex)
+    validate_remote_hex("compute_input_hash_hex", compute_input_hash_hex)
+    validate_remote_hex("compute_output_hash_hex", compute_output_hash_hex)
     validate_git_source(git_source)
     validate_remote_ref("git_ref", git_source.ref)
     validate_oci_ref(eif_source.oci_ref)
@@ -962,11 +1026,15 @@ def remote_smoke_script(
         "__GIT_REF__": git_source.ref,
         "__EIF_OCI_REF_B64__": base64.b64encode(eif_source.oci_ref.encode("utf-8")).decode("ascii"),
         "__ORAS_VERSION__": ORAS_VERSION,
-        "__USER_DATA_HEX__": user_data_hex,
+        "__PCR16_USER_DATA_HEX__": pcr16_user_data_hex,
+        "__ATTESTATION_USER_DATA_HEX__": attestation_user_data_hex,
         "__PUBLIC_KEY_HEX__": public_key_hex,
         "__NONCE_HEX__": nonce_hex,
         "__CLAIM_PCR16_HEX__": claim_pcr16_hex,
         "__CLAIM_CONTEXT_HASH_HEX__": claim_context_hash_hex,
+        "__COMPUTE_INPUT_HEX__": compute_input_hex,
+        "__COMPUTE_INPUT_HASH_HEX__": compute_input_hash_hex,
+        "__COMPUTE_OUTPUT_HASH_HEX__": compute_output_hash_hex,
         "__VSOCK_PORT__": str(config.vsock_port),
         "__RUN_ID__": config.run_id,
     }
@@ -986,13 +1054,16 @@ def remote_smoke_script(
 
 def run_verify_attestation(args: argparse.Namespace) -> int:
     document = Path(args.attestation_hex_path).read_text(encoding="utf-8").strip()
+    document_bytes = bytes.fromhex(document)
     decoded = verify_attestation_document(
-        bytes.fromhex(document),
+        document_bytes,
         bytes.fromhex(args.expected_user_data_hex),
         bytes.fromhex(args.expected_public_key_hex),
+        bytes.fromhex(args.expected_pcr16_user_data_hex) if args.expected_pcr16_user_data_hex else None,
         bytes.fromhex(args.expected_pcr16_hex) if args.expected_pcr16_hex else None,
     )
     summary = decoded.to_summary()
+    summary["attestation_document_hash"] = hashlib.sha256(document_bytes).hexdigest()
     Path(args.summary_json).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
@@ -1060,6 +1131,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--attestation-hex-path", required=True)
     verify.add_argument("--expected-user-data-hex", required=True)
     verify.add_argument("--expected-public-key-hex", required=True)
+    verify.add_argument("--expected-pcr16-user-data-hex")
     verify.add_argument("--expected-pcr16-hex")
     verify.add_argument("--summary-json", required=True)
     verify.set_defaults(func=run_verify_attestation)
