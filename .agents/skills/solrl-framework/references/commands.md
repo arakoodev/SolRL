@@ -110,6 +110,23 @@ docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner 
 docker compose run --rm aws-nitro-runner
 ```
 
+Manual GitHub-hosted run:
+
+```text
+Actions -> Real AWS Nitro Smoke -> Run workflow
+```
+
+Required GitHub setup:
+
+```text
+Repository environment: aws-gl
+Environment secret: ENV
+Secret contents: same key/value lines as local .env
+```
+
+The workflow writes `secrets.ENV` to `.env`, runs the same Docker audit and smoke path, validates the proof bundle, uploads
+`artifacts/aws-nitro/<run-id>/`, runs exact-run cleanup as a safety net, and runs a final read-only project audit.
+
 Use cleanup only for a known run id:
 
 ```bash

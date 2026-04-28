@@ -333,6 +333,12 @@ docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner 
 docker compose run --rm aws-nitro-runner
 ```
 
+You can also run the same path from GitHub Actions. Create a repository environment named `aws-gl`, add an environment
+secret named `ENV` with the same contents as local `.env`, then run the manual workflow `Real AWS Nitro Smoke` from the
+Actions tab. The workflow writes `secrets.ENV` to `.env` inside the GitHub runner, runs the project audit, runs
+`docker compose run --rm aws-nitro-runner`, validates `submission-proof-bundle.tar.gz`, uploads the run artifacts, and
+runs a final read-only audit. It does not add IAM, SSM, S3, SSH, or broad cleanup.
+
 The runner refuses to launch from a dirty worktree when it derives the default GitHub source and GHCR EIF artifact. Commit
 and push first, wait for `.github/workflows/build-nitro-eif.yml` to publish
 `ghcr.io/<owner>/solrl-nitro-worker-eif:<commit-sha>`, then run the smoke. Otherwise AWS would verify yesterday's pushed

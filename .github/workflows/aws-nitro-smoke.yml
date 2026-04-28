@@ -1,0 +1,158 @@
+name: Real AWS Nitro Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-nitro-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  aws-nitro-smoke:
+    name: Run real AWS Nitro smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: aws-gl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Materialize aws-gl ENV secret
+        env:
+          SOLRL_ENV_FILE: ${{ secrets.ENV }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOLRL_ENV_FILE:-}" ]; then
+            echo "aws-gl environment secret ENV is empty or unavailable" >&2
+            exit 1
+          fi
+          while IFS= read -r line; do
+            [ -n "$line" ] && printf '::add-mask::%s\n' "$line"
+          done <<< "$SOLRL_ENV_FILE"
+          umask 077
+          printf '%s\n' "$SOLRL_ENV_FILE" > .env
+          unset SOLRL_ENV_FILE
+          if ! grep -Eq '^(AWS_ACCESS_KEY_ID|AWS_ACCESS_KEY)=' .env; then
+            echo "ENV must contain AWS_ACCESS_KEY_ID=... or AWS_ACCESS_KEY=..." >&2
+            exit 1
+          fi
+          if ! grep -Eq '^(AWS_SECRET_ACCESS_KEY|AWS_SECRET_KEY)=' .env; then
+            echo "ENV must contain AWS_SECRET_ACCESS_KEY=... or AWS_SECRET_KEY=..." >&2
+            exit 1
+          fi
+          if ! grep -Eq '^AWS_DEFAULT_REGION=' .env; then
+            printf 'AWS_DEFAULT_REGION=us-east-1\n' >> .env
+          fi
+
+      - name: Generate exact run id
+        id: run_id
+        run: |
+          set -euo pipefail
+          run_id="solrl-$(date -u +%Y%m%d%H%M%S)-$(openssl rand -hex 4)"
+          printf 'SOLRL_RUN_ID=%s\n' "$run_id" >> "$GITHUB_ENV"
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+          printf '### SolRL AWS Nitro Smoke\n\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'Run id: `%s`\n\n' "$run_id" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Commit: `%s`\n\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show Docker versions
+        run: |
+          set -euo pipefail
+          docker version
+          docker compose version
+
+      - name: Build AWS Nitro runner container
+        run: |
+          set -euo pipefail
+          docker compose build aws-nitro-runner
+
+      - name: Preflight audit
+        run: |
+          set -euo pipefail
+          docker compose run --rm aws-nitro-runner \
+            python3 -m solrl_core.aws_nitro_runner audit --scope project
+
+      - name: Run real AWS Nitro smoke
+        run: |
+          set -euo pipefail
+          docker compose run --rm -e SOLRL_RUN_ID="$SOLRL_RUN_ID" aws-nitro-runner
+
+      - name: Exact-run cleanup safety net
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -n "${SOLRL_RUN_ID:-}" ] && [ -f .env ]; then
+            docker compose run --rm aws-nitro-runner \
+              python3 -m solrl_core.aws_nitro_runner cleanup --run-id "$SOLRL_RUN_ID"
+          fi
+
+      - name: Final read-only audit
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f .env ]; then
+            docker compose run --rm aws-nitro-runner \
+              python3 -m solrl_core.aws_nitro_runner audit --scope project
+          fi
+
+      - name: Validate submission proof bundle
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import tarfile
+          from pathlib import Path
+
+          run_id = os.environ["SOLRL_RUN_ID"]
+          root = Path("artifacts/aws-nitro") / run_id
+          bundle = root / "submission-proof-bundle.tar.gz"
+          expected = (root / "submission-proof-bundle.sha256").read_text().split()[0]
+          actual = hashlib.sha256(bundle.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"bundle sha mismatch: {actual} != {expected}")
+          with tarfile.open(bundle, "r:gz") as tar:
+              names = set(tar.getnames())
+              required = {
+                  "submission-proof.json",
+                  "MANIFEST.sha256",
+                  "README.txt",
+                  "evidence/console-output.txt",
+                  "evidence/run-instances.json",
+                  "evidence/remote-markers.json",
+                  "evidence/generic-compute.json",
+                  "evidence/nitro-claim-receipt.json",
+                  "evidence/postaudit-project.json",
+                  "evidence/user-data.sh",
+              }
+              missing = sorted(required - names)
+              if missing:
+                  raise SystemExit(f"bundle missing evidence: {missing}")
+              proof = json.loads(tar.extractfile("submission-proof.json").read().decode("utf-8"))
+          if proof["status"] != "passed" or proof["checks"]["all"] is not True:
+              raise SystemExit("submission proof did not pass all checks")
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("Submission proof bundle validated.\\n\\n")
+              handle.write(f"Bundle: `{bundle}`\\n\\n")
+              handle.write(f"Bundle SHA256: `{actual}`\\n\\n")
+              handle.write(f"AWS account: `{proof['aws_trace']['account_id']}`\\n\\n")
+              handle.write(f"Instance: `{proof['aws_trace']['instance_id']}`\\n\\n")
+              handle.write(f"EIF: `{proof['source']['eif_oci_ref']}`\\n\\n")
+              handle.write(f"ClaimV1 hash: `{proof['claim_v1']['claim_hash']}`\\n\\n")
+          PY
+
+      - name: Upload AWS Nitro artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solrl-aws-nitro-${{ steps.run_id.outputs.run_id || github.run_id }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: artifacts/aws-nitro/

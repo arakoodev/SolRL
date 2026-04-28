@@ -23,6 +23,7 @@ WORKER = ROOT / "crates/solrl-nitro-worker/src/main.rs"
 WORKER_CARGO = ROOT / "crates/solrl-nitro-worker/Cargo.toml"
 FLAKE = ROOT / "flake.nix"
 WORKFLOW = ROOT / ".github/workflows/build-nitro-eif.yml"
+AWS_WORKFLOW = ROOT / ".github/workflows/aws-nitro-smoke.yml"
 ACTRC = ROOT / ".actrc"
 REMOTE_PYTHON_FILES = (
     ROOT / "python/solrl_core/aws_nitro_runner.py",
@@ -66,9 +67,13 @@ def main() -> int:
         or not WORKER_CARGO.exists()
         or not FLAKE.exists()
         or not WORKFLOW.exists()
+        or not AWS_WORKFLOW.exists()
         or not ACTRC.exists()
     ):
-        fail("AWS Nitro runner must keep remote template, worker crate, flake source, GitHub EIF workflow, and act config")
+        fail(
+            "AWS Nitro runner must keep remote template, worker crate, flake source, GitHub EIF workflow, "
+            "manual AWS workflow, and act config"
+        )
     e2e = E2E.read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     remote = remote_path.read_text(encoding="utf-8")
@@ -76,6 +81,7 @@ def main() -> int:
     worker_cargo = WORKER_CARGO.read_text(encoding="utf-8")
     flake = FLAKE.read_text(encoding="utf-8")
     workflow = WORKFLOW.read_text(encoding="utf-8")
+    aws_workflow = AWS_WORKFLOW.read_text(encoding="utf-8")
     combined_runner = runner + "\n" + templates
 
     for path in REMOTE_PYTHON_FILES:
@@ -316,6 +322,35 @@ def main() -> int:
     for floating_action in ("DeterminateSystems/nix-installer-action@main", "DeterminateSystems/magic-nix-cache-action@main"):
         if floating_action in workflow:
             fail(f"GitHub Actions must not float Actions on @main: found {floating_action}")
+    require(aws_workflow, "workflow_dispatch:", "real AWS Nitro GitHub workflow must be manually triggered only")
+    require(aws_workflow, "environment: aws-gl", "real AWS Nitro GitHub workflow must use the aws-gl environment")
+    require(aws_workflow, "SOLRL_ENV_FILE: ${{ secrets.ENV }}", "real AWS Nitro workflow must use aws-gl secret ENV")
+    require(aws_workflow, 'printf \'%s\\n\' "$SOLRL_ENV_FILE" > .env', "real AWS Nitro workflow must write ENV to .env")
+    require(
+        aws_workflow,
+        "docker compose run --rm aws-nitro-runner",
+        "real AWS Nitro workflow must use the same Docker runner path",
+    )
+    require(
+        aws_workflow,
+        "python3 -m solrl_core.aws_nitro_runner audit --scope project",
+        "real AWS Nitro workflow must run the read-only project audit",
+    )
+    require(
+        aws_workflow,
+        'docker compose run --rm -e SOLRL_RUN_ID="$SOLRL_RUN_ID" aws-nitro-runner',
+        "real AWS Nitro workflow must run the main smoke with an exact run id",
+    )
+    require(
+        aws_workflow,
+        'python3 -m solrl_core.aws_nitro_runner cleanup --run-id "$SOLRL_RUN_ID"',
+        "real AWS Nitro workflow must keep an exact-run cleanup safety net",
+    )
+    require(aws_workflow, "actions/upload-artifact@v4", "real AWS Nitro workflow must upload run artifacts")
+    require(aws_workflow, "submission-proof-bundle.tar.gz", "real AWS Nitro workflow must validate the proof bundle")
+    require(aws_workflow, "submission-proof-bundle.sha256", "real AWS Nitro workflow must validate the bundle checksum")
+    if "--allow-existing-solrl" in aws_workflow:
+        fail("real AWS Nitro workflow must not allow overlapping Project=SolRL resources by default")
     for request in ("ExtendPCR", "LockPCR", "DescribePCR"):
         if not re.search(rf"Request::{request}\s*\{{[^}}]*\bindex:\s*16\b", worker, re.DOTALL):
             fail(f"AWS worker must issue Request::{request} against PCR16")

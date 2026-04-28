@@ -82,6 +82,9 @@ docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner 
 docker compose run --rm aws-nitro-runner
 ```
 
+Use `.github/workflows/aws-nitro-smoke.yml` for the manual GitHub-hosted version of the same run. It must use repository
+environment `aws-gl` and environment secret `ENV`, which contains the same key/value lines as local `.env`.
+
 The real AWS runner refuses the default path from a dirty worktree. Commit and push first so the EC2 source checkout and
 the GHCR EIF artifact are the same commit.
 
