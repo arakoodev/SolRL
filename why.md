@@ -178,6 +178,45 @@ flowchart LR
 
 For SolRL, Nitro enters because the operator cannot be the source of truth. The enclave gives the reward worker a boundary the parent host cannot inspect from the outside or rewrite after launch without changing measurements.
 
+What this means in the current SolRL run:
+
+```mermaid
+flowchart TB
+    GHA["GitHub Actions<br/>build commit-pinned EIF"] --> GHCR["GHCR OCI artifact<br/>raw EIF + sha384"]
+    GHCR --> Parent["Tagged EC2 parent<br/>operator-controlled"]
+    Parent --> Pull["ORAS pull EIF<br/>sha384 verification"]
+    Pull --> Allocator["Nitro allocator<br/>vCPU + memory carveout"]
+    Allocator --> Hypervisor["Nitro Hypervisor"]
+    Hypervisor --> Enclave["Enclave VM<br/>no network, no shell, no disk"]
+    Parent <-->|"VSOCK only"| Enclave
+    Enclave --> Worker["SolRL reward worker"]
+    Worker --> NSM["Nitro Security Module"]
+    NSM --> Attestation["COSE_Sign1 attestation<br/>PCRs + user_data + nonce"]
+    Attestation --> Verify["Parent verifies AWS root<br/>then emits ClaimV1 receipt"]
+```
+
+The parent EC2 instance is treated as the untrusted transport layer. It can fetch the EIF, start the enclave, pass inputs over VSOCK, and submit the final claim. It should not be trusted for the reward itself.
+
+The enclave is the measured execution layer. It runs the reward worker with no normal network path, no SSH, and no persistent disk. If the worker, kernel, bootstrap, or image changes, the PCRs change.
+
+The Nitro Security Module is the evidence layer. It signs an attestation document that includes measurements and caller-provided fields. SolRL verifies the AWS Nitro Attestation PKI, the COSE signature, PCR values, nonce, and output binding before turning the result into a ClaimV1 receipt.
+
+| Part | What it does | SolRL trust assumption |
+|---|---|---|
+| Parent EC2 | Downloads EIF, starts enclave, relays VSOCK, submits claim | Untrusted operator surface |
+| EIF | Immutable enclave image built from the commit-pinned worker | If bytes change, PCRs change |
+| Nitro Hypervisor | Partitions vCPU and memory away from parent instance | AWS Nitro isolation boundary |
+| VSOCK | Only local parent-enclave communication channel | Transport, not source of truth |
+| NSM | Produces signed attestation document | Hardware-rooted evidence source |
+| PCR0 | Enclave image measurement | Proves which EIF booted |
+| PCR1 | Kernel and bootstrap measurement | Proves boot layer did not drift |
+| PCR2 | Application measurement | Proves reward worker layer did not drift |
+| PCR16 | SolRL job and claim context measurement | Binds run to job, operator, payout, policy, nonce |
+| `user_data` | Output hash bound into attestation | Binds reward result to evidence |
+| `nonce` | Freshness input | Blocks stale attestation replay |
+
+This does not remove trust in AWS. It moves the trust boundary from "trust this third-party operator's host" to "verify an AWS-signed hardware attestation, then use Solana to pay or reject the claim." That is a much smaller and cleaner assumption.
+
 ## Slide 7: What Attestation Adds
 
 Isolation helps, but the settlement layer needs proof.
@@ -463,7 +502,65 @@ flowchart LR
 
 SolRL's wedge is reward integrity for third-party RL. Container speed matters, but it does not answer the incentive or trust question by itself.
 
-## Slide 16: Risks
+## Slide 16: Market Size
+
+The market is still early, so the honest move is to size it in layers.
+
+Market reports disagree on exact numbers, but they agree on direction:
+
+- Grand View Research estimates the reinforcement learning market at **$12.43B in 2025** and **$111.11B by 2033**, a **31.6% CAGR**.
+- Grand View Research estimates the AI agents market at **$7.63B in 2025** and **$182.97B by 2033**, a **49.6% CAGR**.
+- MarketsandMarkets estimates the AI agents market at **$7.84B in 2025** and **$52.62B by 2030**, a **46.3% CAGR**.
+
+Those are not SolRL's revenue numbers. They are the envelope.
+
+SolRL's wedge is narrower: verifiable reward generation for third-party RL and agent evaluation runs. The spend that matters is the part of RL where teams need to buy reward rollouts from infrastructure they do not directly control.
+
+```mermaid
+flowchart TB
+    AI["AI infrastructure spend"] --> Agents["AI agents"]
+    AI --> RL["Reinforcement learning"]
+    Agents --> EvalRuns["Executable evals + agent rollouts"]
+    RL --> RewardRuns["Reward generation + verifier calls"]
+    EvalRuns --> SolRL["SolRL wedge<br/>verifiable third-party reward production"]
+    RewardRuns --> SolRL
+```
+
+A simple way to think about the market:
+
+| Layer | 2025-2026 signal | Why it matters for SolRL |
+|---|---:|---|
+| Reinforcement learning market | ~$12B 2025 reported market size | Broad budget category for training agents from reward |
+| AI agents market | ~$5B-$8B 2024-2025 reported market size | Agent systems create repeated eval and rollout demand |
+| Executable evals | Terminal-Bench, SWE-Bench, Harbor-style datasets | Rewards can be checked by code, not opinion |
+| Verifiable reward production | Small subset today | The category SolRL can define |
+
+The wedge math is small enough to be believable and still large enough to matter.
+
+Using the Grand View RL estimate of **$111.11B in 2033**:
+
+| Assumption | Verifiable reward share of RL spend | Annual verifiable reward spend | SolRL captured GMV at 5% share |
+|---|---:|---:|---:|
+| Conservative | 1% | ~$1.11B | ~$55.6M |
+| Base | 3% | ~$3.33B | ~$166.7M |
+| Aggressive | 5% | ~$5.56B | ~$277.8M |
+
+This is not a promise. It is the shape of the opportunity if reward integrity becomes a normal requirement for third-party RL.
+
+There is also a buyer-level way to see it:
+
+```text
+10,000 executable tasks
+5 agent variants
+3 seeds per variant
+= 150,000 reward rollouts per evaluation cycle
+```
+
+At an illustrative **$0.02-$0.20 per verified rollout**, that is **$3,000-$30,000 per evaluation cycle**. A serious team running that weekly becomes **$156,000-$1.56M per year** in verified reward demand before large-scale training rollouts.
+
+That is why the first market is not "all AI compute." It is teams whose model quality depends on reward data they can trust.
+
+## Slide 17: Risks
 
 The risks are real. They should be named clearly.
 
@@ -478,7 +575,7 @@ The risks are real. They should be named clearly.
 
 The key technical roadmap is straightforward: connect the real AWS proof bundle to public settlement, then replace the generic worker with production RL workload execution.
 
-## Slide 17: The Investment Case
+## Slide 18: The Investment Case
 
 AI teams need more reward data. RL makes that demand repetitive. Agent environments make it expensive. Third-party infrastructure makes it hard to trust.
 
@@ -501,9 +598,14 @@ That is the business case: a network for producing reward signals that buyers ca
 - [Harbor dataset docs](https://www.harborframework.com/docs/datasets) describe tasks and datasets for evals and training.
 - [Harbor registry](https://registry.harborframework.com/) shows the kind of task market SolRL targets: Terminal-Bench, SWE-Bench Verified, MedAgentBench, LawBench, and other published datasets.
 - [RLVR reference](https://rlvrbook.com/) frames RLVR as learning from checkable task outcomes, executable feedback, formal validation, and agent environments.
+- [Grand View Research reinforcement learning market report](https://www.grandviewresearch.com/industry-analysis/reinforcement-learning-market-report) estimates the reinforcement learning market at $12.43B in 2025 and $111.11B by 2033.
+- [Grand View Research AI agents market report](https://www.grandviewresearch.com/industry-analysis/ai-agents-market-report) estimates the AI agents market at $7.63B in 2025 and $182.97B by 2033.
+- [MarketsandMarkets AI agents forecast](https://www.marketsandmarkets.com/Market-Reports/ai-agents-market-15761548.html) estimates the AI agents market at $7.84B in 2025 and $52.62B by 2030.
+- [MarketsandMarkets 2024 AI agents release](https://www.prnewswire.com/news-releases/ai-agents-market-worth-47-1-billion-by-2030---exclusive-report-by-marketsandmarkets-302246356.html) estimated the AI agents market at $5.1B in 2024 and $47.1B by 2030.
 - [AWS Nitro Enclaves docs](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html) describe enclaves as isolated, hardened VMs with no persistent storage, no interactive access, and no external networking.
 - [AWS Nitro attestation docs](https://docs.aws.amazon.com/enclaves/latest/user/set-up-attestation.html) describe signed attestation documents and PCR measurements.
 - [AWS Nitro root verification docs](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html) describe CBOR/COSE attestation documents signed by AWS Nitro Attestation PKI, including `public_key`, `user_data`, and `nonce`.
+- [AWS Nitro System security design](https://docs.aws.amazon.com/whitepapers/latest/security-design-of-aws-nitro-system/no-aws-operator-access.html) describes Nitro's no-operator-access model.
 - [Marlin Oyster repository](https://github.com/marlinprotocol/oyster-monorepo) is the closest open-source architectural precedent for TEE-backed coprocessor infrastructure.
 - [Solana Token-2022 docs](https://www.solana-program.com/docs/token-2022) describe Token-2022 as Solana's extensible token program.
 - [Solana token transfer docs](https://solana.com/docs/tokens/basics/transfer-tokens) describe `TransferChecked`, the checked transfer primitive SolRL uses through CPI.
