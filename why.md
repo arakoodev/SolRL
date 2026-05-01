@@ -1,94 +1,112 @@
 # Why SolRL
 
-SolRL is infrastructure for verifiable RL reward generation.
+SolRL is infrastructure for verifiable reinforcement learning reward generation.
 
-AI teams are moving from evals as reporting to evals as training infrastructure. Every agent rollout can produce a reward signal, and that reward can become training data.
+AI agents are moving from static benchmarks to continuous training loops. A model is evaluated, an agent runs in an environment, a verifier produces a reward, and that reward can become training data. The quality of the reward now matters as much as the quality of the model.
 
-SolRL makes those reward rollouts verifiable, payable, and auditable across operators the buyer does not have to trust.
+SolRL makes reward rollouts verifiable, payable, and auditable across operators the buyer does not have to trust.
 
-If the reward is fake, the model learns from a lie. SolRL is built to make that failure expensive and detectable.
+If the reward is fake, the model learns from a lie. SolRL exists to make that failure expensive, detectable, and eventually slashable.
 
 ## Slide 1: The Shift
 
-Agent evaluation is becoming part of the training loop.
+Evals are becoming training infrastructure.
 
-In reinforcement learning, the reward is not a dashboard metric. It is the signal the model trains against. For coding agents, web agents, and tool-using systems, that reward often comes from an executable environment.
+For agent systems, reinforcement learning is not just a model update. It is a loop:
 
-The loop looks like this:
-
-- give the agent an instruction
-- drop it into a sandbox
-- let it use tools
+- define a task
+- place the agent in an environment
+- let it act
 - collect the trajectory
-- run a verifier script
-- turn the result into a scalar reward
+- run a verifier
+- turn the outcome into a reward
+- feed the reward back into evaluation or training
 
 ```mermaid
 flowchart LR
     Task["Task<br/>instruction + environment"] --> Agent["Agent rollout"]
-    Agent --> Trajectory["Trajectory<br/>tool calls + file changes + stdout"]
-    Trajectory --> Verifier["Verifier script"]
+    Agent --> Trajectory["Trajectory<br/>actions + tool calls + state changes"]
+    Trajectory --> Verifier["Verifier"]
     Verifier --> Reward["Reward"]
-    Reward --> Training["Model update"]
+    Reward --> Train["Eval, prompt tuning, or RL update"]
 ```
 
-This is why RLVR matters. Reinforcement Learning from Verifiable Rewards replaces human judgment with reward signals from checkable outcomes: tests, executable feedback, formal validation, tool results, or environment state.
+This is why RLVR matters. Reinforcement Learning from Verifiable Rewards replaces subjective judgment with rewards from checkable outcomes: tests, executable feedback, formal validation, tool results, or environment state.
 
-That shift creates a new infrastructure requirement: the training system has to trust the reward source.
+The bottleneck is no longer only model inference. It is trusted reward production.
 
-## Slide 2: The Bottleneck
+## Slide 2: Why This Is Hard On-Chain
 
-Harbor shows the shape of the workload clearly.
+Solana is excellent at deterministic settlement. It is not where you run high-memory, long-running, stochastic RL environments.
 
-A Harbor task is an instruction, a container environment, and a test script. A dataset is a group of those tasks for evals, training, and prompt tuning. A run produces trials, trajectories, verifier output, and rewards.
-
-Agent teams need to run this loop repeatedly across model checkpoints, prompts, scaffolds, tool policies, and datasets:
+On-chain programs need bounded compute, deterministic execution, and small state transitions. RL rollouts need the opposite: large environments, many steps, tool access, retries, logs, artifacts, and sometimes private state.
 
 ```mermaid
 flowchart TB
-    Dataset["Dataset<br/>Terminal-Bench, SWE-Bench, custom tasks"] --> Tasks["Many tasks"]
-    Tasks --> Rollouts["Many agent rollouts"]
-    Rollouts --> Rewards["Verifier rewards"]
-    Rewards --> Compare["Evaluate agents"]
-    Rewards --> Optimize["Optimize prompts"]
-    Rewards --> Train["Train with RL"]
+    Chain["Solana<br/>deterministic settlement"] --> Good["Escrow, stake, payout, slashing"]
+    Chain --> Bad["Bad fit for<br/>containers, model runtimes, long rollouts"]
+
+    Offchain["Off-chain compute"] --> Good2["Good fit for<br/>agent environments and simulations"]
+    Offchain --> Bad2["Bad fit for trust<br/>if the operator controls the host"]
 ```
 
-These rollouts are not cheap API calls. They can involve full containers, package installs, repos, test suites, long terminal sessions, tool failures, retries, and artifact collection.
+The architectural gap is simple: the RL workload belongs off-chain, but the payment and enforcement layer belongs on-chain.
 
-The customer is paying for trustworthy reward data, not raw CPU cycles.
+SolRL bridges that gap.
 
-## Slide 3: The Market Failure
+## Slide 3: The RL Workload
 
-Centralized labs can run rollouts on their own infrastructure because they trust their own machines.
+In reinforcement learning, the agent repeatedly moves through an environment. At each step, it sees state, takes an action, receives feedback, and produces a trajectory.
 
-A decentralized operator market has a different trust model.
+For SolRL's market, the important part is not the equation. It is the workload shape:
 
-If an operator is paid per successful rollout, the easiest attack is obvious:
+- many independent rollouts
+- many environment steps
+- many verifier calls
+- many artifacts
+- many repeated runs across model checkpoints, prompts, tools, and datasets
+
+```mermaid
+flowchart LR
+    State["State"] --> Action["Action"]
+    Action --> Environment["Environment transition"]
+    Environment --> Reward["Reward"]
+    Reward --> Trajectory["Trajectory"]
+    Trajectory --> Policy["Policy update or model comparison"]
+    Policy --> State
+```
+
+This is different from buying generic CPU time. The customer wants trusted reward data that can influence model behavior.
+
+That is the wedge.
+
+## Slide 4: The Market Failure
+
+Centralized labs can trust their own machines. A decentralized operator market cannot.
+
+If an operator gets paid per successful rollout, the lowest-cost attack is obvious: skip the real work and return a passing reward.
 
 ```mermaid
 flowchart TD
-    Job["RL rollout bounty"] --> Operator["Untrusted operator"]
-    Operator --> Honest["Run agent + verifier<br/>earn payout"]
+    Job["RL reward bounty"] --> Operator["Untrusted operator"]
+    Operator --> Honest["Run rollout + verifier<br/>earn payout"]
     Operator --> Cheat["Skip compute<br/>return reward=1"]
     Honest --> Cost["Pays compute cost"]
-    Cheat --> Profit["Keeps bounty without doing work"]
+    Cheat --> Fraud["Captures payout<br/>without doing work"]
 ```
 
-Fake rewards create two business problems:
+Fake rewards create two losses:
 
-- **payment fraud:** the operator gets paid for work they did not do
-- **training poisoning:** the buyer may train on false reward signals
+- **payment fraud:** the operator gets paid for work that did not happen
+- **training poisoning:** the buyer trains or optimizes against false evidence
 
-The second one is the larger risk. A fake reward can push the model toward behavior that never actually solved the task. The training loop becomes a system for amplifying bad evidence.
+The second loss is worse. A bad reward can push the model toward behavior that never solved the task.
 
-## Slide 4: Why Containers Are Not Enough
+## Slide 5: Why Containers Are Not Enough
 
 Containers are useful when the lab owns the host.
 
-They are not enough when the host is owned by the operator.
-
-Docker, Sysbox, and normal VM sandboxes can isolate processes, but they do not remove the host owner from the trust boundary. The operator can control the runtime, patch the image, tamper with logs, replay a previous result, or claim a verifier passed when it never ran.
+They are weak evidence when the host is owned by the operator. The operator can control the runtime, patch the image, tamper with logs, replay old results, or claim a verifier passed when it never ran.
 
 ```mermaid
 flowchart TB
@@ -96,44 +114,40 @@ flowchart TB
         Kernel["Host kernel"]
         Runtime["Container runtime"]
         Env["Agent environment"]
-        RewardFile["reward.txt"]
+        Reward["reward.txt"]
         Logs["logs + artifacts"]
     end
 
     Operator["Operator"] --> Kernel
     Operator --> Runtime
     Runtime --> Env
-    Env --> RewardFile
-    Operator --> RewardFile
-    RewardFile --> Claim["Claim payout"]
-    Logs --> Claim
+    Env --> Reward
+    Operator --> Reward
+    Logs --> Claim["Claim payout"]
+    Reward --> Claim
 ```
 
-The issue is not "containers are bad."
+The issue is not that containers are bad. The issue is that host-controlled evidence is not enough for an adversarial reward market.
 
-The issue is that host-controlled evidence is weak evidence.
-
-For RL markets, the reward signal has to survive an adversarial operator.
-
-## Slide 5: What AWS Nitro Gives Us
+## Slide 6: What AWS Nitro Gives Us
 
 AWS Nitro Enclaves are Trusted Execution Environments.
 
-In plain English: Nitro lets an EC2 instance carve out a small isolated VM called an enclave. The parent instance can launch it and send it messages, but the parent cannot SSH into it, mount its disk, read its memory, or inspect its processes.
+In practical terms, Nitro lets an EC2 instance carve out an isolated VM called an enclave. The parent instance can launch it and communicate over VSOCK, but it cannot SSH into it, mount its disk, read its memory, or inspect its processes.
 
-Nitro enclaves are constrained on purpose:
+Nitro enclaves are constrained by design:
 
 - no persistent storage
 - no interactive access
 - no normal external networking
 - no SSH
-- only local VSOCK communication with the parent
+- local VSOCK communication with the parent
 
 ```mermaid
 flowchart LR
     subgraph parent["EC2 parent<br/>operator controlled"]
         Runner["SolRL runner"]
-        Logs["normal logs"]
+        ParentLogs["host logs"]
     end
 
     subgraph enclave["Nitro enclave<br/>TEE boundary"]
@@ -142,34 +156,30 @@ flowchart LR
         NSM["Nitro Security Module"]
     end
 
-    Runner <-->|"VSOCK messages"| Worker
+    Runner <-->|"VSOCK"| Worker
     Worker --> NSM
-    parent -. "cannot read enclave memory or processes" .-> enclave
+    parent -. "cannot inspect enclave memory" .-> enclave
 ```
 
-This gives the reward worker a smaller trust boundary than the operator's machine.
+For RL, this matters because reward computation can run outside the chain without making the host operator the source of truth.
 
-The operator can still refuse to run the job. The operator can still go offline. But the operator should not be able to cheaply forge a valid reward claim for code that never ran inside the measured enclave.
+## Slide 7: What Attestation Adds
 
-That is the property RL reward markets need: the host can provide capacity without becoming the source of truth.
+Isolation helps, but investors should care about proof.
 
-## Slide 6: What Attestation Gives Us
-
-Isolation alone is not enough. The buyer also needs proof.
-
-Inside a Nitro enclave, the worker can ask the Nitro Security Module for a signed attestation document. That document is rooted in AWS Nitro Attestation PKI and includes measurements called PCRs.
+Inside the enclave, the worker asks the Nitro Security Module for a signed attestation document. That document is rooted in AWS Nitro Attestation PKI and includes measurements called PCRs.
 
 For SolRL, the important fields are:
 
-- **PCR0, PCR1, PCR2:** measurements for the enclave image, kernel/bootstrap, and application
-- **PCR16:** a custom SolRL measurement for job and claim context
-- **user_data:** the reward or output hash we want to bind to the attestation
+- **PCR0, PCR1, PCR2:** measurements of the enclave image, kernel/bootstrap, and application environment
+- **PCR16:** SolRL's custom measurement for job and claim context
+- **user_data:** the reward or output hash bound into the attestation
 - **public_key:** the worker key used to bind the response channel
-- **nonce:** replay-resistant protocol input
+- **nonce:** replay-resistant input
 
 ```mermaid
 flowchart TB
-    Rollout["Reward worker runs rollout-like compute"] --> Output["Output hash"]
+    Work["Reward computation"] --> Output["Output hash"]
     Context["Job + operator + payout + nonce + policy"] --> PCR16Input["pcr16_user_data"]
     PCR16Input --> PCR16["PCR16"]
     Output --> UserData["attestation user_data"]
@@ -177,57 +187,57 @@ flowchart TB
     PCR012 --> Attestation["AWS Nitro attestation"]
     PCR16 --> Attestation
     UserData --> Attestation
-    Attestation --> Verify["Verify COSE signature<br/>AWS root<br/>PCRs<br/>user_data"]
+    Attestation --> Verify["Verify AWS root, COSE signature,<br/>PCRs, nonce, user_data"]
 ```
 
-This changes the quality of the evidence. The reward is no longer just a file from an operator-controlled host. It is bound to a hardware-rooted statement about the code and context that produced it.
+The reward is no longer just a file from an operator-controlled host. It is tied to a hardware-rooted statement about the code and context that produced it.
 
-## Slide 7: What SolRL Adds
+That is the core primitive.
 
-Nitro proves a measured enclave produced a signed statement.
+## Slide 8: What SolRL Adds
 
-SolRL turns that statement into a protocol action.
+Nitro gives a measured execution statement. SolRL turns it into a market action.
 
 ```mermaid
 flowchart TD
-    Bounty["RL reward bounty<br/>funded in Token-2022 escrow"] --> Lease["Operator accepts lease<br/>with stake locked"]
+    Bounty["RL reward bounty<br/>Token-2022 escrow"] --> Lease["Operator accepts lease<br/>with stake locked"]
     Lease --> Nitro["Run reward worker in Nitro"]
     Nitro --> Attest["NSM attestation<br/>PCRs + output hash"]
     Attest --> Claim["ClaimV1<br/>job + operator + payout + reward/output + attestation hash + PCR16"]
     Claim --> Registry["Solana registry validates claim"]
     Registry --> Pay["Token-2022 payout"]
-    Registry --> Slash["Slash bad claims"]
+    Registry --> Slash["Slash invalid claim"]
 ```
 
 SolRL adds:
 
-- a canonical ClaimV1 schema shared by Rust and Python
+- canonical ClaimV1 serialization shared by Rust and Python
 - PCR16 binding between Nitro context and registry state
 - verifier policy checks
 - replay protection with claim and nonce receipts
 - Token-2022 escrow payout
 - Token-2022 stake slashing
-- proof bundles that let a reviewer inspect the run
+- proof bundles with raw AWS traces and claim artifacts
 
 The result is a reward claim that can drive payment and training decisions without relying on the operator's word.
 
-## Slide 8: Why The Token Exists
+## Slide 9: Why The Token Exists
 
 The token is the market control rail.
 
-SolRL needs one asset that can move through all four states of the rollout market:
+SolRL needs one asset that can move through the rollout market:
 
-1. **Escrow:** the requester funds reward generation before work starts.
-2. **Stake:** the operator locks collateral before accepting leases.
-3. **Settlement:** a valid ClaimV1 releases escrow to the operator.
-4. **Slashing:** a valid SlashClaimV1 moves stake to treasury.
+1. **Escrow:** requesters fund reward generation before work starts.
+2. **Stake:** operators lock collateral before accepting leases.
+3. **Settlement:** valid ClaimV1 releases escrow to the operator.
+4. **Slashing:** valid SlashClaimV1 moves stake to treasury.
 
 ```mermaid
 sequenceDiagram
     participant Lab as AI lab
     participant Registry
     participant Operator
-    participant Nitro as Nitro reward worker
+    participant Nitro as Nitro worker
     participant Token as Token-2022
     participant Treasury
 
@@ -245,30 +255,50 @@ sequenceDiagram
     Token-->>Treasury: slashed stake
 ```
 
-This is not a tokenomics claim. The token matters because it makes reward generation economically enforceable: honest work gets paid, invalid claims can be rejected or slashed, and requesters do not need bilateral trust with every operator.
+This is not a trading thesis. It is a work-token design: the asset enforces who can take jobs, how they get paid, and what can be taken when they submit invalid work.
 
-## Slide 9: Why Token-2022
+Future token design may add fees, routing, reputation, delegation, or burn logic. Those are not V1 claims.
 
-SolRL uses Solana Token-2022 because the settlement rail needs standard token movement and room for protocol controls.
+## Slide 10: Why Solana And Token-2022
+
+Solana is the settlement layer because it is fast, cheap, and built for high-throughput state updates.
+
+SolRL does not ask Solana to run RL. It asks Solana to decide whether a verified claim can move escrow.
 
 Today, V1 uses Token-2022 `transfer_checked` CPI from the registry:
 
 - `settle_claim` moves job escrow to operator payout
 - `slash_operator` moves operator stake to treasury
 - `withdraw_stake` lets idle operators exit through the same checked transfer path
-- a local-validator test proves real Token-2022 balances move, not just mock state
+- a local-validator test proves real Token-2022 balances move
 
 The V1 boundary is explicit: V1 does not use the transfer hook as the full claim verifier. Program-initiated settlement uses registry PDA authority because same-program `registry -> Token-2022 -> registry hook` reentry is rejected by Solana.
 
 The settlement primitive is still real Token-2022 account movement, proven by the local-validator balance test.
 
-## Slide 10: What Works Today
+## Slide 11: Competitive Context
 
-SolRL V1 proves three connected pieces of the system.
+The closest architectural precedent is Marlin Oyster: a TEE-based coprocessor model that shows how enclave execution can be connected to on-chain verification and operator incentives.
+
+SolRL's divergence is focus. It is not trying to become a marketplace for arbitrary backends first. It targets reward rollouts for AI agents and RL workflows, where the buyer has a specific job to be done: produce reward evidence that can be trusted enough to pay for and train against.
+
+| Network | Main wedge | Verification model | SolRL view |
+|---|---|---|---|
+| Marlin Oyster | General TEE coprocessor workloads | Hardware attestation plus operator incentives | Closest architectural precedent |
+| Phala | TEE-backed cloud and privacy-preserving compute | TEE attestation | Broader compute market |
+| Akash | Decentralized cloud hosting | Market and validator assurances, not hardware-rooted execution proof by default | Useful supply precedent, weaker reward evidence |
+| Bittensor | Incentivized model output markets | Peer evaluation and subnet incentives | Strong AI-network precedent, different trust model |
+| SolRL | Verifiable RL reward rollouts | Nitro attestation, ClaimV1, Token-2022 escrow and slashing | Narrower wedge, clearer buyer problem |
+
+The strategic bet is vertical focus. General compute markets are hard to cold start. Reward integrity for outsourced RL is narrower, but much easier to explain, test, and sell.
+
+## Slide 12: Current Proof
+
+SolRL V1 proves three connected pieces.
 
 ```mermaid
 flowchart TB
-    subgraph local["Local RL-shaped protocol proof"]
+    subgraph local["Local protocol proof"]
         LM["python -m solrl_core.cli local-mock"]
         Paid["paid once"]
         Replay["replay rejected"]
@@ -286,7 +316,7 @@ flowchart TB
         SPL --> Balance
     end
 
-    subgraph nitro["AWS Nitro reward proof"]
+    subgraph nitro["AWS Nitro proof"]
         GHA["Real AWS Nitro Smoke"]
         EIF["GHCR EIF by commit SHA"]
         EC2["tagged EC2 parent"]
@@ -318,7 +348,7 @@ Current boundary: the real AWS proof bundle is not yet submitted to public devne
 
 Production Harbor-over-Nitro execution is also future work. The current Nitro worker proves the reward-attestation bridge with generic reward-like compute, not full Harbor tasks.
 
-## Slide 11: How To Evaluate It
+## Slide 13: How To Evaluate It
 
 The cleanest evaluation path is GitHub Actions because it starts from a clean checkout and leaves run history attached to the repository.
 
@@ -374,27 +404,29 @@ The main checks are mechanical:
 - resource tags include `Project=SolRL`, `SolRLRunId=<run-id>`, and `ManagedBy=SolRL`
 - post-audit shows zero SolRL instances, security groups, and volumes left behind
 
-## Slide 12: Who Uses This
+## Slide 14: First Users
 
 The first users are teams that need trusted reward generation at scale:
 
 - AI labs training agents with RLVR
-- agent teams running Terminal-Bench, SWE-Bench, or custom Harbor datasets
+- agent teams running Terminal-Bench, SWE-Bench, or custom executable datasets
 - benchmark maintainers who need trusted third-party runs
-- model teams optimizing prompts or scaffolds against executable rewards
-- decentralized compute operators selling verified rollout capacity
+- model teams optimizing prompts, scaffolds, or tool policies against executable rewards
+- DeFi teams simulating fee curves, liquidations, routing, or risk parameters before making on-chain updates
+- game teams training autonomous agents whose behavior affects player-owned state
+- compute operators selling verified rollout capacity
 
 The product is verified reward rollouts for teams whose training loops depend on reward integrity.
 
-## Slide 13: Why This Can Become A Market
+## Slide 15: Why This Can Become A Market
 
-Agent evals and RL rollouts are repeat workloads.
+RL rollouts are repeat workloads.
 
-Every model checkpoint, prompt change, scaffold change, tool policy, or agent release can create another batch of rollouts. If the workload is trusted only inside a lab's own cluster, the market is limited to centralized infra. If the reward can be verified, operators can compete to supply rollout capacity.
+Every model checkpoint, prompt change, scaffold change, tool policy, dataset update, and agent release can create another batch of rollouts. If those runs are trusted only inside a lab's own cluster, the market is limited to centralized infrastructure. If the reward can be verified, operators can compete to supply rollout capacity.
 
 ```mermaid
 flowchart LR
-    Models["More agents"] --> Evals["More evals"]
+    Models["More agents"] --> Evals["More executable evals"]
     Evals --> Rollouts["More rollouts"]
     Rollouts --> Rewards["More reward data"]
     Rewards --> Training["More RL updates"]
@@ -403,50 +435,36 @@ flowchart LR
 
 SolRL's wedge is reward integrity for outsourced RL. Container speed matters, but it does not answer the trust question by itself.
 
-## Slide 14: Current Boundaries And Next Milestones
+## Slide 16: Risks
 
-Several pieces sit outside V1:
+The risks are real. They should be named clearly.
 
-- production Harbor-over-Nitro execution
-- a Harbor-bearing EIF that runs arbitrary evaluation tasks
-- a persistent verifier enclave network
-- public devnet settlement from the latest real AWS proof bundle
-- hook-side claim verification
-- requester/operator UI
-- production token mint governance, emissions, and reputation routing
-- threshold verifier signatures
-- open-internet workload policy
-- dispute workflow beyond the current slash/reject taxonomy
+| Risk | Why it matters | Mitigation path |
+|---|---|---|
+| AWS concentration | V1 depends on Nitro's trust model and AWS availability | Abstract verifier policy for multiple TEE backends over time |
+| Production workload gap | Current Nitro worker proves reward-like compute, not full Harbor/RL jobs | Build Harbor-over-Nitro worker RPC and workload EIF |
+| Public settlement gap | Current real AWS proof is not yet submitted to public devnet settlement | Feed Nitro ClaimV1 receipt into devnet `settle_claim` and publish tx evidence |
+| Operator cold start | Supply needs real demand to stay online | Start with narrow high-value reward rollouts, not broad compute |
+| Verification cost | Raw AWS attestation verification is too heavy for naive on-chain execution | Keep delegated verification and compact ClaimV1 settlement path |
+| Token design | Fees, burns, reputation, and routing are not V1 | Treat them as future protocol design, not current claims |
 
-V1 establishes the minimum proof chain: a reward-like computation can be hardware-attested, converted into ClaimV1 evidence, and matched to a Token-2022 settlement path.
+The key technical roadmap is straightforward: connect the real AWS proof bundle to public settlement, then replace the generic worker with production RL workload execution.
 
-## Slide 15: Why This Architecture Solves The RL Problem
+## Slide 17: The Investment Case
 
-The original problem was reward integrity.
+AI teams need more reward data. RL makes that demand repetitive. Agent environments make it expensive. Outsourcing makes it hard to trust.
 
-SolRL changes the trust model:
+SolRL's thesis is that reward integrity becomes a market.
 
-```mermaid
-flowchart TB
-    Before["Before SolRL<br/>operator returns reward file"] --> Weak["Buyer trusts host logs"]
-    Weak --> Poison["Fake reward can poison training"]
+The architecture is deliberately narrow:
 
-    After["With SolRL<br/>operator submits attested ClaimV1"] --> Strong["Verifier checks AWS root, PCRs, user_data, ClaimV1"]
-    Strong --> Pay["Registry releases escrow once"]
-    Strong --> Slash["Bad claim can slash stake"]
-```
-
-The buyer no longer treats the operator's reward file as truth. The buyer checks a hardware-rooted statement, a canonical claim, and a deterministic settlement rule.
-
-That is the architecture:
-
-- Harbor-style tasks define the RL workload.
-- Nitro protects the reward computation from the host operator.
+- Solana settles escrow, stake, payout, and slashing.
+- Nitro protects reward computation from the host operator.
 - Attestation makes the protected computation externally verifiable.
-- ClaimV1 binds the reward to the job and payout context.
-- Solana settles escrow and slashes stake.
+- ClaimV1 binds the output to job, policy, operator, payout, and PCR16 context.
+- Token-2022 moves value when the claim is valid.
 
-That is the investment case: RL needs more trusted reward data, operators need a way to get paid for producing it, and the settlement layer needs proof stronger than host logs.
+That is the business case: a network for producing reward signals that buyers can pay for and models can train against without trusting the machine operator.
 
 ## Research Basis
 
@@ -458,6 +476,7 @@ That is the investment case: RL needs more trusted reward data, operators need a
 - [AWS Nitro Enclaves docs](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html) describe enclaves as isolated, hardened VMs with no persistent storage, no interactive access, and no external networking.
 - [AWS Nitro attestation docs](https://docs.aws.amazon.com/enclaves/latest/user/set-up-attestation.html) describe signed attestation documents and PCR measurements.
 - [AWS Nitro root verification docs](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html) describe CBOR/COSE attestation documents signed by AWS Nitro Attestation PKI, including `public_key`, `user_data`, and `nonce`.
+- [Marlin Oyster repository](https://github.com/marlinprotocol/oyster-monorepo) is the closest open-source architectural precedent for TEE-backed coprocessor infrastructure.
 - [Solana Token-2022 docs](https://www.solana-program.com/docs/token-2022) describe Token-2022 as Solana's extensible token program.
 - [Solana token transfer docs](https://solana.com/docs/tokens/basics/transfer-tokens) describe `TransferChecked`, the checked transfer primitive SolRL uses through CPI.
 
