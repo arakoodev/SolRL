@@ -117,375 +117,7 @@ Fake rewards create two losses:
 
 The second loss is worse. A bad reward can push the model toward behavior that never solved the task.
 
-## Slide 5: Why Containers Are Not Enough
-
-Containers are useful when the lab owns the host.
-
-They are weak evidence when the host is owned by the operator. The operator can control the runtime, patch the image, tamper with logs, replay old results, or claim a verifier passed when it never ran.
-
-```mermaid
-flowchart TB
-    subgraph host["Operator-controlled host"]
-        Kernel["Host kernel"]
-        Runtime["Container runtime"]
-        Env["Agent environment"]
-        Reward["reward.txt"]
-        Logs["logs + artifacts"]
-    end
-
-    Operator["Operator"] --> Kernel
-    Operator --> Runtime
-    Runtime --> Env
-    Env --> Reward
-    Operator --> Reward
-    Logs --> Claim["Claim payout"]
-    Reward --> Claim
-```
-
-The issue is not that containers are bad. The issue is that host-controlled evidence is not enough for an adversarial reward market.
-
-## Slide 6: Why Nitro Enters The Architecture
-
-AWS Nitro Enclaves are Trusted Execution Environments.
-
-In practical terms, Nitro lets an EC2 instance carve out an isolated VM called an enclave. The parent instance can launch it and communicate over VSOCK, but it cannot SSH into it, mount its disk, read its memory, or inspect its processes.
-
-Nitro enclaves are constrained by design:
-
-- no persistent storage
-- no interactive access
-- no normal external networking
-- no SSH
-- local VSOCK communication with the parent
-
-```mermaid
-flowchart LR
-    subgraph parent["EC2 parent<br/>operator controlled"]
-        Runner["SolRL runner"]
-        ParentLogs["host logs"]
-    end
-
-    subgraph enclave["Nitro enclave<br/>TEE boundary"]
-        Worker["reward worker"]
-        Memory["isolated CPU + memory"]
-        NSM["Nitro Security Module"]
-    end
-
-    Runner <-->|"VSOCK"| Worker
-    Worker --> NSM
-    parent -. "cannot inspect enclave memory" .-> enclave
-```
-
-For SolRL, Nitro enters because the operator cannot be the source of truth. The enclave gives the reward worker a boundary the parent host cannot inspect from the outside or rewrite after launch without changing measurements.
-
-What this means in the current SolRL run:
-
-```mermaid
-flowchart TB
-    GHA["GitHub Actions<br/>build commit-pinned EIF"] --> GHCR["GHCR OCI artifact<br/>raw EIF + sha384"]
-    GHCR --> Parent["Tagged EC2 parent<br/>operator-controlled"]
-    Parent --> Pull["ORAS pull EIF<br/>sha384 verification"]
-    Pull --> Allocator["Nitro allocator<br/>vCPU + memory carveout"]
-    Allocator --> Hypervisor["Nitro Hypervisor"]
-    Hypervisor --> Enclave["Enclave VM<br/>no network, no shell, no disk"]
-    Parent <-->|"VSOCK only"| Enclave
-    Enclave --> Worker["SolRL reward worker"]
-    Worker --> NSM["Nitro Security Module"]
-    NSM --> Attestation["COSE_Sign1 attestation<br/>PCRs + user_data + nonce"]
-    Attestation --> Verify["Parent verifies AWS root<br/>then emits ClaimV1 receipt"]
-```
-
-The parent EC2 instance is treated as the untrusted transport layer. It can fetch the EIF, start the enclave, pass inputs over VSOCK, and submit the final claim. It should not be trusted for the reward itself.
-
-The enclave is the measured execution layer. It runs the reward worker with no normal network path, no SSH, and no persistent disk. If the worker, kernel, bootstrap, or image changes, the PCRs change.
-
-The Nitro Security Module is the evidence layer. It signs an attestation document that includes measurements and caller-provided fields. SolRL verifies the AWS Nitro Attestation PKI, the COSE signature, PCR values, nonce, and output binding before turning the result into a ClaimV1 receipt.
-
-| Part | What it does | SolRL trust assumption |
-|---|---|---|
-| Parent EC2 | Downloads EIF, starts enclave, relays VSOCK, submits claim | Untrusted operator surface |
-| EIF | Immutable enclave image built from the commit-pinned worker | If bytes change, PCRs change |
-| Nitro Hypervisor | Partitions vCPU and memory away from parent instance | AWS Nitro isolation boundary |
-| VSOCK | Only local parent-enclave communication channel | Transport, not source of truth |
-| NSM | Produces signed attestation document | Hardware-rooted evidence source |
-| PCR0 | Enclave image measurement | Proves which EIF booted |
-| PCR1 | Kernel and bootstrap measurement | Proves boot layer did not drift |
-| PCR2 | Application measurement | Proves reward worker layer did not drift |
-| PCR16 | SolRL job and claim context measurement | Binds run to job, operator, payout, policy, nonce |
-| `user_data` | Output hash bound into attestation | Binds reward result to evidence |
-| `nonce` | Freshness input | Blocks stale attestation replay |
-
-This does not remove trust in AWS. It moves the trust boundary from "trust this third-party operator's host" to "verify an AWS-signed hardware attestation, then use Solana to pay or reject the claim." That is a much smaller and cleaner assumption.
-
-## Slide 7: What Attestation Adds
-
-Isolation helps, but the settlement layer needs proof.
-
-Inside the enclave, the worker asks the Nitro Security Module for a signed attestation document. That document is rooted in AWS Nitro Attestation PKI and includes measurements called PCRs.
-
-For SolRL, the important fields are:
-
-- **PCR0, PCR1, PCR2:** measurements of the enclave image, kernel/bootstrap, and application environment
-- **PCR16:** SolRL's custom measurement for job and claim context
-- **user_data:** the reward or output hash bound into the attestation
-- **public_key:** the worker key used to bind the response channel
-- **nonce:** replay-resistant input
-
-```mermaid
-flowchart TB
-    Work["Reward computation"] --> Output["Output hash"]
-    Context["Job + operator + payout + nonce + policy"] --> PCR16Input["pcr16_user_data"]
-    PCR16Input --> PCR16["PCR16"]
-    Output --> UserData["attestation user_data"]
-    Image["EIF + kernel + app measurements"] --> PCR012["PCR0/1/2"]
-    PCR012 --> Attestation["AWS Nitro attestation"]
-    PCR16 --> Attestation
-    UserData --> Attestation
-    Attestation --> Verify["Verify AWS root, COSE signature,<br/>PCRs, nonce, user_data"]
-```
-
-The reward is no longer just a file from an operator-controlled host. It is tied to a hardware-rooted statement about the code and context that produced it.
-
-That is the core primitive.
-
-## Slide 8: What SolRL Adds
-
-Nitro gives a measured execution statement. SolRL turns it into a market action.
-
-```mermaid
-flowchart TD
-    Bounty["RL reward bounty<br/>Token-2022 escrow"] --> Lease["Operator accepts lease<br/>with stake locked"]
-    Lease --> Nitro["Run reward worker in Nitro"]
-    Nitro --> Attest["NSM attestation<br/>PCRs + output hash"]
-    Attest --> Claim["ClaimV1<br/>job + operator + payout + reward/output + attestation hash + PCR16"]
-    Claim --> Registry["Solana registry validates claim"]
-    Registry --> Pay["Token-2022 payout"]
-    Registry --> Slash["Slash invalid claim"]
-```
-
-SolRL adds:
-
-- canonical ClaimV1 serialization shared by Rust and Python
-- PCR16 binding between Nitro context and registry state
-- verifier policy checks
-- replay protection with claim and nonce receipts
-- Token-2022 escrow payout
-- Token-2022 stake slashing
-- proof bundles with raw AWS traces and claim artifacts
-
-The result is a reward claim that can drive payment and training decisions without relying on the operator's word.
-
-This is the correct layering:
-
-```mermaid
-flowchart LR
-    Buyer["Requester"] --> Escrow["Solana escrow"]
-    Operator["Operator stake"] --> Lease["Lease"]
-    Escrow --> Lease
-    Lease --> NitroRun["Nitro reward run"]
-    NitroRun --> Evidence["Attestation evidence"]
-    Evidence --> ClaimV1["ClaimV1"]
-    ClaimV1 --> Registry["Solana registry"]
-    Registry --> Pay["Pay"]
-    Registry --> Slash["Reject or slash"]
-```
-
-## Slide 9: Why The Token Exists
-
-The token is the market control rail.
-
-SolRL needs one asset that can move through the rollout market:
-
-1. **Escrow:** requesters fund reward generation before work starts.
-2. **Stake:** operators lock collateral before accepting leases.
-3. **Settlement:** valid ClaimV1 releases escrow to the operator.
-4. **Slashing:** valid SlashClaimV1 moves stake to treasury.
-
-```mermaid
-sequenceDiagram
-    participant Lab as AI lab
-    participant Registry
-    participant Operator
-    participant Nitro as Nitro worker
-    participant Token as Token-2022
-    participant Treasury
-
-    Lab->>Registry: fund rollout bounty
-    Operator->>Registry: lock stake and accept lease
-    Operator->>Nitro: run reward computation
-    Nitro-->>Operator: attested output and PCRs
-    Operator->>Registry: submit ClaimV1
-    Registry->>Registry: verify signature, PCR16, nonce, policy
-    Registry->>Token: transfer_checked escrow to payout
-    Token-->>Operator: payout
-
-    Registry->>Registry: verify SlashClaimV1
-    Registry->>Token: transfer_checked stake to treasury
-    Token-->>Treasury: slashed stake
-```
-
-This is not a trading thesis. It is a work-token design: the asset enforces who can take jobs, how they get paid, and what can be taken when they submit invalid work.
-
-Future token design may add fees, routing, reputation, delegation, or burn logic. Those are not V1 claims.
-
-## Slide 10: Why Solana Exists In This Architecture
-
-A reward market needs a neutral place to hold escrow, track stake, reject replay, release payout, and slash bad work. Solana is the incentive and settlement layer for the operators who produce reward data.
-
-Today, V1 uses Token-2022 `transfer_checked` CPI from the registry:
-
-- `settle_claim` moves job escrow to operator payout
-- `slash_operator` moves operator stake to treasury
-- `withdraw_stake` lets idle operators exit through the same checked transfer path
-- a local-validator test proves real Token-2022 balances move
-
-The V1 boundary is explicit: V1 does not use the transfer hook as the full claim verifier. Program-initiated settlement uses registry PDA authority because same-program `registry -> Token-2022 -> registry hook` reentry is rejected by Solana.
-
-The settlement primitive is real Token-2022 account movement, proven by the local-validator balance test.
-
-## Slide 11: Competitive Context
-
-The closest architectural precedent is Marlin Oyster: a TEE-based coprocessor model that shows how enclave execution can be connected to on-chain verification and operator incentives.
-
-SolRL's divergence is focus. It is not trying to become a marketplace for arbitrary backends first. It targets reward rollouts for AI agents and RL workflows, where the buyer has a specific job to be done: produce reward evidence that can be trusted enough to pay for and train against.
-
-| Network | Main wedge | Verification model | SolRL view |
-|---|---|---|---|
-| Marlin Oyster | General TEE coprocessor workloads | Hardware attestation plus operator incentives | Closest architectural precedent |
-| Phala | TEE-backed cloud and privacy-preserving compute | TEE attestation | Broader compute market |
-| Akash | Decentralized cloud hosting | Market and validator assurances, not hardware-rooted execution proof by default | Useful supply precedent, weaker reward evidence |
-| Bittensor | Incentivized model output markets | Peer evaluation and subnet incentives | Strong AI-network precedent, different trust model |
-| SolRL | Verifiable RL reward rollouts | Nitro attestation, ClaimV1, Token-2022 escrow and slashing | Narrower wedge, clearer buyer problem |
-
-The strategic bet is vertical focus. General compute markets are hard to cold start. Reward integrity for third-party RL is narrower, but much easier to explain, test, and sell.
-
-## Slide 12: Current Proof
-
-SolRL V1 proves three connected pieces.
-
-```mermaid
-flowchart TB
-    subgraph local["Local protocol proof"]
-        LM["python -m solrl_core.cli local-mock"]
-        Paid["paid once"]
-        Replay["replay rejected"]
-        LM --> Paid
-        LM --> Replay
-    end
-
-    subgraph chain["Solana token proof"]
-        Test["./scripts/test-anchor.sh"]
-        Registry["solrl-registry"]
-        SPL["spl_token_2022 processor"]
-        Balance["escrow=0<br/>payout=claim.amount"]
-        Test --> Registry
-        Registry --> SPL
-        SPL --> Balance
-    end
-
-    subgraph nitro["AWS Nitro proof"]
-        GHA["Real AWS Nitro Smoke"]
-        EIF["GHCR EIF by commit SHA"]
-        EC2["tagged EC2 parent"]
-        NSMProof["real NSM attestation"]
-        Receipt["nitro-claim-receipt.json"]
-        GHA --> EIF
-        EIF --> EC2
-        EC2 --> NSMProof
-        NSMProof --> Receipt
-    end
-
-    Receipt -. "same ClaimV1 schema" .-> Registry
-```
-
-Current shipped evidence:
-
-- real AWS Nitro boot
-- commit-pinned GHCR EIF
-- COSE/AWS root attestation verification
-- non-zero PCR0, PCR1, PCR2, and PCR16 checks
-- `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`
-- reward-like output hash bound to attestation `user_data`
-- ClaimV1 receipt with attestation hash and output hash
-- Token-2022 local-validator balance movement
-- exact-tag AWS cleanup and post-audit
-- self-contained proof bundle
-
-Current boundary: the real AWS proof bundle is not yet submitted to public devnet settlement. V1 proves the hardware reward rail and the token settlement rail, using the same ClaimV1 shape between them. The next integration step is feeding the real AWS ClaimV1 receipt into a public devnet `settle_claim` transaction.
-
-Production Harbor-over-Nitro execution is also future work. The current Nitro worker proves the reward-attestation bridge with generic reward-like compute, not full Harbor tasks.
-
-## Slide 13: How To Evaluate It
-
-The cleanest evaluation path is GitHub Actions because it starts from a clean checkout and leaves run history attached to the repository.
-
-```mermaid
-flowchart TD
-    A["Push commit"] --> B["Build Nitro EIF workflow"]
-    B --> C["Publish GHCR EIF tagged by commit SHA"]
-    C --> D["Manual Real AWS Nitro Smoke workflow"]
-    D --> E["Create tagged EC2 parent"]
-    E --> F["Boot Nitro enclave"]
-    F --> G["Verify attestation and ClaimV1 bridge"]
-    G --> H["Upload submission-proof-bundle.tar.gz"]
-    H --> I["Inspect submission-proof.json and evidence/*"]
-```
-
-Repository setup:
-
-1. Create a GitHub environment named `aws-gl`.
-2. Add an environment secret named `ENV` with AWS credentials in `.env` format.
-3. Run `Build Nitro EIF`.
-4. Run `Real AWS Nitro Smoke`.
-5. Download the uploaded AWS Nitro artifacts.
-6. Open `submission-proof-bundle.tar.gz`.
-
-The bundle contains:
-
-```mermaid
-flowchart TB
-    Bundle["submission-proof-bundle.tar.gz"]
-    Bundle --> Proof["submission-proof.json"]
-    Bundle --> Manifest["MANIFEST.sha256"]
-    Bundle --> Readme["README.txt"]
-    Bundle --> Evidence["evidence/"]
-    Evidence --> Launch["run-instances.json"]
-    Evidence --> Markers["remote-markers.json"]
-    Evidence --> Compute["generic-compute.json"]
-    Evidence --> Receipt["nitro-claim-receipt.json"]
-    Evidence --> Console["console-output.txt"]
-    Evidence --> Audits["preflight and postaudit JSON"]
-    Evidence --> UserData["user-data.sh"]
-```
-
-The main checks are mechanical:
-
-- `submission-proof.json.status == "passed"`
-- `submission-proof.json.checks.all == true`
-- `SOLRL_STATUS == "OK"`
-- `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`
-- `SOLRL_COMPUTE_OUTPUT_HASH == ClaimV1.trajectory_hash`
-- `SOLRL_ATTESTATION_DOCUMENT_HASH == ClaimV1.attestation_document_hash`
-- `run-instances.json` shows Nitro enclaves enabled
-- `run-instances.json` shows IMDSv2 required
-- resource tags include `Project=SolRL`, `SolRLRunId=<run-id>`, and `ManagedBy=SolRL`
-- post-audit shows zero SolRL instances, security groups, and volumes left behind
-
-## Slide 14: First Users
-
-The first users are teams that need trusted reward generation at scale:
-
-- AI labs training agents with RLVR
-- agent teams running Terminal-Bench, SWE-Bench, or custom executable datasets
-- benchmark maintainers who need trusted third-party runs
-- model teams optimizing prompts, scaffolds, or tool policies against executable rewards
-- DeFi teams simulating fee curves, liquidations, routing, or risk parameters before making on-chain updates
-- game teams training autonomous agents whose behavior affects player-owned state
-- compute operators selling verified rollout capacity
-
-The product is verified reward rollouts for teams whose training loops depend on reward integrity.
-
-## Slide 15: Why This Can Become A Market
+## Slide 5: Why This Can Become A Market
 
 RL rollouts are repeat workloads.
 
@@ -502,7 +134,7 @@ flowchart LR
 
 SolRL's wedge is reward integrity for third-party RL. Container speed matters, but it does not answer the incentive or trust question by itself.
 
-## Slide 16: Market Size
+## Slide 6: Market Size
 
 The market is still early, so the honest move is to size it in layers.
 
@@ -583,9 +215,377 @@ At an illustrative **$0.02-$0.20 per verified rollout**, that is **$3,000-$30,00
 
 That is why the first market is not "all AI compute." It is teams whose model quality depends on reward data they can trust.
 
-## Slide 17: Risks
+## Slide 7: Why Containers Are Not Enough
 
-The risks are real. They should be named clearly.
+Containers are useful when the lab owns the host.
+
+They are weak evidence when the host is owned by the operator. The operator can control the runtime, patch the image, tamper with logs, replay old results, or claim a verifier passed when it never ran.
+
+```mermaid
+flowchart TB
+    subgraph host["Operator-controlled host"]
+        Kernel["Host kernel"]
+        Runtime["Container runtime"]
+        Env["Agent environment"]
+        Reward["reward.txt"]
+        Logs["logs + artifacts"]
+    end
+
+    Operator["Operator"] --> Kernel
+    Operator --> Runtime
+    Runtime --> Env
+    Env --> Reward
+    Operator --> Reward
+    Logs --> Claim["Claim payout"]
+    Reward --> Claim
+```
+
+The issue is not that containers are bad. The issue is that host-controlled evidence is not enough for an adversarial reward market.
+
+## Slide 8: Why Nitro Enters The Architecture
+
+AWS Nitro Enclaves are Trusted Execution Environments.
+
+In practical terms, Nitro lets an EC2 instance carve out an isolated VM called an enclave. The parent instance can launch it and communicate over VSOCK, but it cannot SSH into it, mount its disk, read its memory, or inspect its processes.
+
+Nitro enclaves are constrained by design:
+
+- no persistent storage
+- no interactive access
+- no normal external networking
+- no SSH
+- local VSOCK communication with the parent
+
+```mermaid
+flowchart LR
+    subgraph parent["EC2 parent<br/>operator controlled"]
+        Runner["SolRL runner"]
+        ParentLogs["host logs"]
+    end
+
+    subgraph enclave["Nitro enclave<br/>TEE boundary"]
+        Worker["reward worker"]
+        Memory["isolated CPU + memory"]
+        NSM["Nitro Security Module"]
+    end
+
+    Runner <-->|"VSOCK"| Worker
+    Worker --> NSM
+    parent -. "cannot inspect enclave memory" .-> enclave
+```
+
+For SolRL, Nitro enters because the operator cannot be the source of truth. The enclave gives the reward worker a boundary the parent host cannot inspect from the outside or rewrite after launch without changing measurements.
+
+What this means in the current SolRL run:
+
+```mermaid
+flowchart TB
+    GHA["GitHub Actions<br/>build commit-pinned EIF"] --> GHCR["GHCR OCI artifact<br/>raw EIF + sha384"]
+    GHCR --> Parent["Tagged EC2 parent<br/>operator-controlled"]
+    Parent --> Pull["ORAS pull EIF<br/>sha384 verification"]
+    Pull --> Allocator["Nitro allocator<br/>vCPU + memory carveout"]
+    Allocator --> Hypervisor["Nitro Hypervisor"]
+    Hypervisor --> Enclave["Enclave VM<br/>no network, no shell, no disk"]
+    Parent <-->|"VSOCK only"| Enclave
+    Enclave --> Worker["SolRL reward worker"]
+    Worker --> NSM["Nitro Security Module"]
+    NSM --> Attestation["COSE_Sign1 attestation<br/>PCRs + user_data + nonce"]
+    Attestation --> Verify["Parent verifies AWS root<br/>then emits ClaimV1 receipt"]
+```
+
+The parent EC2 instance is treated as the untrusted transport layer. It can fetch the EIF, start the enclave, pass inputs over VSOCK, and submit the final claim. It should not be trusted for the reward itself.
+
+The enclave is the measured execution layer. It runs the reward worker with no normal network path, no SSH, and no persistent disk. If the worker, kernel, bootstrap, or image changes, the PCRs change.
+
+The Nitro Security Module is the evidence layer. It signs an attestation document that includes measurements and caller-provided fields. SolRL verifies the AWS Nitro Attestation PKI, the COSE signature, PCR values, nonce, and output binding before turning the result into a ClaimV1 receipt.
+
+| Part | What it does | SolRL trust assumption |
+|---|---|---|
+| Parent EC2 | Downloads EIF, starts enclave, relays VSOCK, submits claim | Untrusted operator surface |
+| EIF | Immutable enclave image built from the commit-pinned worker | If bytes change, PCRs change |
+| Nitro Hypervisor | Partitions vCPU and memory away from parent instance | AWS Nitro isolation boundary |
+| VSOCK | Only local parent-enclave communication channel | Transport, not source of truth |
+| NSM | Produces signed attestation document | Hardware-rooted evidence source |
+| PCR0 | Enclave image measurement | Proves which EIF booted |
+| PCR1 | Kernel and bootstrap measurement | Proves boot layer did not drift |
+| PCR2 | Application measurement | Proves reward worker layer did not drift |
+| PCR16 | SolRL job and claim context measurement | Binds run to job, operator, payout, policy, nonce |
+| `user_data` | Output hash bound into attestation | Binds reward result to evidence |
+| `nonce` | Freshness input | Blocks stale attestation replay |
+
+This does not remove trust in AWS. It moves the trust boundary from "trust this third-party operator's host" to "verify an AWS-signed hardware attestation, then use Solana to pay or reject the claim." That is a much smaller and cleaner assumption.
+
+## Slide 9: What Attestation Adds
+
+Isolation helps, but the settlement layer needs proof.
+
+Inside the enclave, the worker asks the Nitro Security Module for a signed attestation document. That document is rooted in AWS Nitro Attestation PKI and includes measurements called PCRs.
+
+For SolRL, the important fields are:
+
+- **PCR0, PCR1, PCR2:** measurements of the enclave image, kernel/bootstrap, and application environment
+- **PCR16:** SolRL's custom measurement for job and claim context
+- **user_data:** the reward or output hash bound into the attestation
+- **public_key:** the worker key used to bind the response channel
+- **nonce:** replay-resistant input
+
+```mermaid
+flowchart TB
+    Work["Reward computation"] --> Output["Output hash"]
+    Context["Job + operator + payout + nonce + policy"] --> PCR16Input["pcr16_user_data"]
+    PCR16Input --> PCR16["PCR16"]
+    Output --> UserData["attestation user_data"]
+    Image["EIF + kernel + app measurements"] --> PCR012["PCR0/1/2"]
+    PCR012 --> Attestation["AWS Nitro attestation"]
+    PCR16 --> Attestation
+    UserData --> Attestation
+    Attestation --> Verify["Verify AWS root, COSE signature,<br/>PCRs, nonce, user_data"]
+```
+
+The reward is no longer just a file from an operator-controlled host. It is tied to a hardware-rooted statement about the code and context that produced it.
+
+That is the core primitive.
+
+## Slide 10: What SolRL Adds
+
+Nitro gives a measured execution statement. SolRL turns it into a market action.
+
+```mermaid
+flowchart TD
+    Bounty["RL reward bounty<br/>Token-2022 escrow"] --> Lease["Operator accepts lease<br/>with stake locked"]
+    Lease --> Nitro["Run reward worker in Nitro"]
+    Nitro --> Attest["NSM attestation<br/>PCRs + output hash"]
+    Attest --> Claim["ClaimV1<br/>job + operator + payout + reward/output + attestation hash + PCR16"]
+    Claim --> Registry["Solana registry validates claim"]
+    Registry --> Pay["Token-2022 payout"]
+    Registry --> Slash["Slash invalid claim"]
+```
+
+SolRL adds:
+
+- canonical ClaimV1 serialization shared by Rust and Python
+- PCR16 binding between Nitro context and registry state
+- verifier policy checks
+- replay protection with claim and nonce receipts
+- Token-2022 escrow payout
+- Token-2022 stake slashing
+- proof bundles with raw AWS traces and claim artifacts
+
+The result is a reward claim that can drive payment and training decisions without relying on the operator's word.
+
+This is the correct layering:
+
+```mermaid
+flowchart LR
+    Buyer["Requester"] --> Escrow["Solana escrow"]
+    Operator["Operator stake"] --> Lease["Lease"]
+    Escrow --> Lease
+    Lease --> NitroRun["Nitro reward run"]
+    NitroRun --> Evidence["Attestation evidence"]
+    Evidence --> ClaimV1["ClaimV1"]
+    ClaimV1 --> Registry["Solana registry"]
+    Registry --> Pay["Pay"]
+    Registry --> Slash["Reject or slash"]
+```
+
+## Slide 11: Why The Token Exists
+
+The token is the market control rail.
+
+SolRL needs one asset that can move through the rollout market:
+
+1. **Escrow:** requesters fund reward generation before work starts.
+2. **Stake:** operators lock collateral before accepting leases.
+3. **Settlement:** valid ClaimV1 releases escrow to the operator.
+4. **Slashing:** valid SlashClaimV1 moves stake to treasury.
+
+```mermaid
+sequenceDiagram
+    participant Lab as AI lab
+    participant Registry
+    participant Operator
+    participant Nitro as Nitro worker
+    participant Token as Token-2022
+    participant Treasury
+
+    Lab->>Registry: fund rollout bounty
+    Operator->>Registry: lock stake and accept lease
+    Operator->>Nitro: run reward computation
+    Nitro-->>Operator: attested output and PCRs
+    Operator->>Registry: submit ClaimV1
+    Registry->>Registry: verify signature, PCR16, nonce, policy
+    Registry->>Token: transfer_checked escrow to payout
+    Token-->>Operator: payout
+
+    Registry->>Registry: verify SlashClaimV1
+    Registry->>Token: transfer_checked stake to treasury
+    Token-->>Treasury: slashed stake
+```
+
+This is not a trading thesis. It is a work-token design: the asset enforces who can take jobs, how they get paid, and what can be taken when they submit invalid work.
+
+Future token design may add fees, routing, reputation, delegation, or burn logic. Those are not V1 claims.
+
+## Slide 12: Why Solana Exists In This Architecture
+
+A reward market needs a neutral place to hold escrow, track stake, reject replay, release payout, and slash bad work. Solana is the incentive and settlement layer for the operators who produce reward data.
+
+Today, V1 uses Token-2022 `transfer_checked` CPI from the registry:
+
+- `settle_claim` moves job escrow to operator payout
+- `slash_operator` moves operator stake to treasury
+- `withdraw_stake` lets idle operators exit through the same checked transfer path
+- a local-validator test proves real Token-2022 balances move
+
+The V1 boundary is explicit: V1 does not use the transfer hook as the full claim verifier. Program-initiated settlement uses registry PDA authority because same-program `registry -> Token-2022 -> registry hook` reentry is rejected by Solana.
+
+The settlement primitive is real Token-2022 account movement, proven by the local-validator balance test.
+
+## Slide 13: Competitive Context
+
+The closest architectural precedent is Marlin Oyster: a TEE-based coprocessor model that shows how enclave execution can be connected to on-chain verification and operator incentives.
+
+SolRL's divergence is focus. It is not trying to become a marketplace for arbitrary backends first. It targets reward rollouts for AI agents and RL workflows, where the buyer has a specific job to be done: produce reward evidence that can be trusted enough to pay for and train against.
+
+| Network | Main wedge | Verification model | SolRL view |
+|---|---|---|---|
+| Marlin Oyster | General TEE coprocessor workloads | Hardware attestation plus operator incentives | Closest architectural precedent |
+| Phala | TEE-backed cloud and privacy-preserving compute | TEE attestation | Broader compute market |
+| Akash | Decentralized cloud hosting | Market and validator assurances, not hardware-rooted execution proof by default | Useful supply precedent, weaker reward evidence |
+| Bittensor | Incentivized model output markets | Peer evaluation and subnet incentives | Strong AI-network precedent, different trust model |
+| SolRL | Verifiable RL reward rollouts | Nitro attestation, ClaimV1, Token-2022 escrow and slashing | Narrower wedge, clearer buyer problem |
+
+The strategic bet is vertical focus. General compute markets are hard to cold start. Reward integrity for third-party RL is narrower, but much easier to explain, test, and sell.
+
+## Slide 14: Current Proof
+
+SolRL V1 proves three connected pieces.
+
+```mermaid
+flowchart TB
+    subgraph local["Local protocol proof"]
+        LM["python -m solrl_core.cli local-mock"]
+        Paid["paid once"]
+        Replay["replay rejected"]
+        LM --> Paid
+        LM --> Replay
+    end
+
+    subgraph chain["Solana token proof"]
+        Test["./scripts/test-anchor.sh"]
+        Registry["solrl-registry"]
+        SPL["spl_token_2022 processor"]
+        Balance["escrow=0<br/>payout=claim.amount"]
+        Test --> Registry
+        Registry --> SPL
+        SPL --> Balance
+    end
+
+    subgraph nitro["AWS Nitro proof"]
+        GHA["Real AWS Nitro Smoke"]
+        EIF["GHCR EIF by commit SHA"]
+        EC2["tagged EC2 parent"]
+        NSMProof["real NSM attestation"]
+        Receipt["nitro-claim-receipt.json"]
+        GHA --> EIF
+        EIF --> EC2
+        EC2 --> NSMProof
+        NSMProof --> Receipt
+    end
+
+    Receipt -. "same ClaimV1 schema" .-> Registry
+```
+
+Current shipped evidence:
+
+- real AWS Nitro boot
+- commit-pinned GHCR EIF
+- COSE/AWS root attestation verification
+- non-zero PCR0, PCR1, PCR2, and PCR16 checks
+- `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`
+- reward-like output hash bound to attestation `user_data`
+- ClaimV1 receipt with attestation hash and output hash
+- Token-2022 local-validator balance movement
+- exact-tag AWS cleanup and post-audit
+- self-contained proof bundle
+
+Current boundary: the real AWS proof bundle is not yet submitted to public devnet settlement. V1 proves the hardware reward rail and the token settlement rail, using the same ClaimV1 shape between them. The next integration step is feeding the real AWS ClaimV1 receipt into a public devnet `settle_claim` transaction.
+
+Production Harbor-over-Nitro execution is also future work. The current Nitro worker proves the reward-attestation bridge with generic reward-like compute, not full Harbor tasks.
+
+## Slide 15: How To Evaluate It
+
+The cleanest evaluation path is GitHub Actions because it starts from a clean checkout and leaves run history attached to the repository.
+
+```mermaid
+flowchart TD
+    A["Push commit"] --> B["Build Nitro EIF workflow"]
+    B --> C["Publish GHCR EIF tagged by commit SHA"]
+    C --> D["Manual Real AWS Nitro Smoke workflow"]
+    D --> E["Create tagged EC2 parent"]
+    E --> F["Boot Nitro enclave"]
+    F --> G["Verify attestation and ClaimV1 bridge"]
+    G --> H["Upload submission-proof-bundle.tar.gz"]
+    H --> I["Inspect submission-proof.json and evidence/*"]
+```
+
+Repository setup:
+
+1. Create a GitHub environment named `aws-gl`.
+2. Add an environment secret named `ENV` with AWS credentials in `.env` format.
+3. Run `Build Nitro EIF`.
+4. Run `Real AWS Nitro Smoke`.
+5. Download the uploaded AWS Nitro artifacts.
+6. Open `submission-proof-bundle.tar.gz`.
+
+The bundle contains:
+
+```mermaid
+flowchart TB
+    Bundle["submission-proof-bundle.tar.gz"]
+    Bundle --> Proof["submission-proof.json"]
+    Bundle --> Manifest["MANIFEST.sha256"]
+    Bundle --> Readme["README.txt"]
+    Bundle --> Evidence["evidence/"]
+    Evidence --> Launch["run-instances.json"]
+    Evidence --> Markers["remote-markers.json"]
+    Evidence --> Compute["generic-compute.json"]
+    Evidence --> Receipt["nitro-claim-receipt.json"]
+    Evidence --> Console["console-output.txt"]
+    Evidence --> Audits["preflight and postaudit JSON"]
+    Evidence --> UserData["user-data.sh"]
+```
+
+The main checks are mechanical:
+
+- `submission-proof.json.status == "passed"`
+- `submission-proof.json.checks.all == true`
+- `SOLRL_STATUS == "OK"`
+- `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`
+- `SOLRL_COMPUTE_OUTPUT_HASH == ClaimV1.trajectory_hash`
+- `SOLRL_ATTESTATION_DOCUMENT_HASH == ClaimV1.attestation_document_hash`
+- `run-instances.json` shows Nitro enclaves enabled
+- `run-instances.json` shows IMDSv2 required
+- resource tags include `Project=SolRL`, `SolRLRunId=<run-id>`, and `ManagedBy=SolRL`
+- post-audit shows zero SolRL instances, security groups, and volumes left behind
+
+## Slide 16: First Users
+
+The first users are teams that need trusted reward generation at scale:
+
+- AI labs training agents with RLVR
+- agent teams running Terminal-Bench, SWE-Bench, or custom executable datasets
+- benchmark maintainers who need trusted third-party runs
+- model teams optimizing prompts, scaffolds, or tool policies against executable rewards
+- DeFi teams simulating fee curves, liquidations, routing, or risk parameters before making on-chain updates
+- game teams training autonomous agents whose behavior affects player-owned state
+- compute operators selling verified rollout capacity
+
+The product is verified reward rollouts for teams whose training loops depend on reward integrity.
+
+## Slide 17: Current Limitations & Future Work
+
+The limitations are real. They should be named clearly.
 
 | Risk | Why it matters | Mitigation path |
 |---|---|---|
