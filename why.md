@@ -532,8 +532,31 @@ A simple way to think about the market:
 |---|---:|---|
 | Reinforcement learning market | ~$12B 2025 reported market size | Broad budget category for training agents from reward |
 | AI agents market | ~$5B-$8B 2024-2025 reported market size | Agent systems create repeated eval and rollout demand |
+| Expert data and RLHF vendors | Multi-billion-dollar valuations and reported billion-dollar revenue | AI labs already pay for better training and reward data |
 | Executable evals | Terminal-Bench, SWE-Bench, Harbor-style datasets | Rewards can be checked by code, not opinion |
 | Verifiable reward production | Small subset today | The category SolRL can define |
+
+The most useful market proof is not another forecast. It is what AI labs are already buying.
+
+| Company | Reported signal | What it proves | What it does not prove |
+|---|---:|---|---|
+| Mercor | TechCrunch reported roughly **$500M ARR**, a **$10B valuation**, and more than **$1.5M/day** paid to contractors | Frontier labs spend real money for expert training data and feedback | Cryptographic reward verification is not solved |
+| Surge AI | Sacra estimates **$1.2B 2024 revenue** and reported fundraising discussions above **$15B valuation** | Expert data and RLHF workflows are already budget-line infrastructure | It is still a managed data vendor, not a trustless reward market |
+| Scale AI | Axios reported Meta paid about **$15B** for a **49% stake**, valuing Scale above **$29B** | Data infrastructure is strategic enough for platform-scale balance sheets | Data labeling scale is not the same as verified execution |
+
+That is the bridge to SolRL. Mercor, Surge, and Scale show that AI labs will pay for data that improves models. SolRL asks the next question: when reward work becomes executable, distributed, and machine-produced, how does the buyer know the reward was actually produced by the agreed environment?
+
+```mermaid
+flowchart LR
+    HumanData["Expert data<br/>Mercor, Surge, Scale"] --> BetterModels["Better models"]
+    BetterModels --> AgentEvals["More agent evals"]
+    AgentEvals --> ExecutableRewards["Executable reward rollouts"]
+    ExecutableRewards --> ThirdPartyRuns["Third-party reward operators"]
+    ThirdPartyRuns --> NeedProof["Need proof, escrow,<br/>replay protection, slashing"]
+    NeedProof --> SolRL["SolRL"]
+```
+
+This is the market transition: from paying humans to produce better training signals, to paying machines to produce verifiable reward signals.
 
 The wedge math is small enough to be believable and still large enough to matter.
 
@@ -602,6 +625,10 @@ That is the business case: a network for producing reward signals that buyers ca
 - [Grand View Research AI agents market report](https://www.grandviewresearch.com/industry-analysis/ai-agents-market-report) estimates the AI agents market at $7.63B in 2025 and $182.97B by 2033.
 - [MarketsandMarkets AI agents forecast](https://www.marketsandmarkets.com/Market-Reports/ai-agents-market-15761548.html) estimates the AI agents market at $7.84B in 2025 and $52.62B by 2030.
 - [MarketsandMarkets 2024 AI agents release](https://www.prnewswire.com/news-releases/ai-agents-market-worth-47-1-billion-by-2030---exclusive-report-by-marketsandmarkets-302246356.html) estimated the AI agents market at $5.1B in 2024 and $47.1B by 2030.
+- [TechCrunch on Mercor](https://techcrunch.com/2025/10/29/how-ai-labs-use-mercor-to-get-the-data-companies-wont-share/) reported roughly $500M ARR, a $10B valuation, and more than $1.5M per day paid to contractors for expert AI training work.
+- [TechCrunch on Mercor's run-rate growth](https://techcrunch.com/2025/09/09/sources-ai-training-startup-mercor-eyes-10b-valuation-on-450m-run-rate/) reported Mercor was eyeing a $10B valuation on more than $450M in annualized run rate.
+- [Sacra on Surge AI](https://sacra.com/c/surge-ai/) estimates Surge AI reached $1.2B revenue in 2024 while serving RLHF and expert-data workflows.
+- [Axios on Meta and Scale AI](https://www.axios.com/2025/06/13/meta-scale-ai-deal) reported Meta's roughly $15B investment for a 49% Scale AI stake, valuing Scale above $29B.
 - [AWS Nitro Enclaves docs](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html) describe enclaves as isolated, hardened VMs with no persistent storage, no interactive access, and no external networking.
 - [AWS Nitro attestation docs](https://docs.aws.amazon.com/enclaves/latest/user/set-up-attestation.html) describe signed attestation documents and PCR measurements.
 - [AWS Nitro root verification docs](https://docs.aws.amazon.com/enclaves/latest/user/verify-root.html) describe CBOR/COSE attestation documents signed by AWS Nitro Attestation PKI, including `public_key`, `user_data`, and `nonce`.
