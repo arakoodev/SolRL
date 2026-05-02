@@ -70,6 +70,10 @@ If someone asks whether the transfer hook fires during settlement, say no. V1 se
 over escrow and stake vaults because Solana rejects same-program `registry -> Token-2022 -> registry hook` reentry. The
 live balance proof is `settle_claim_transfers_token2022_balance_with_registry_pda_authority`.
 
+If a reviewer asks whether the AWS smoke proves production RL execution, say no. The AWS smoke proves the hardware rail:
+commit-pinned EIF boot, deterministic compute output, NSM attestation, AWS root verification, PCR16 bridge, ClaimV1 receipt,
+and cleanup. Production RL workload execution is a roadmap item.
+
 ## AWS Cleanup
 
 Use:

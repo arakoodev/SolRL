@@ -1,4 +1,4 @@
 interface:
   display_name: "SolRL Framework"
-  short_description: "Operate and evaluate SolRL from Docker to Nitro"
-  default_prompt: "Use $solrl-framework to run, modify, or evaluate SolRL without breaking Docker, AWS Nitro, or Token-2022 safety rules."
+  short_description: "Operate SolRL proof flows from Docker to AWS Nitro"
+  default_prompt: "Use $solrl-framework to run, modify, or evaluate SolRL without breaking Docker-only execution, ClaimV1/PCR16 parity, Token-2022 settlement evidence, or AWS Nitro safety rules."

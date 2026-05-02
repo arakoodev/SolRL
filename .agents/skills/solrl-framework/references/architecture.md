@@ -1,9 +1,22 @@
 # SolRL Architecture
 
-## Local Mock Flow
+## Current Execution Rails
+
+SolRL has three separate proof rails. Do not collapse them in explanations:
 
 ```text
-Generic local task
+local token rail      -> local-mock pays once and rejects replay
+registry token rail   -> Token-2022 transfer_checked CPI moves local-validator balances
+hardware proof rail   -> AWS Nitro attestation binds deterministic compute output to ClaimV1
+```
+
+The proof bundle ties the hardware rail to the same ClaimV1 shape, but public devnet settlement of the AWS receipt is still
+roadmap.
+
+## Local Token Proof Flow
+
+```text
+Deterministic local task
     |
     v
 python/solrl_core/mock_worker.py
@@ -21,7 +34,7 @@ python/solrl_core/mock_hook.py
 tests/test_claim_flow.py
 ```
 
-This proves the protocol shape without pretending to be Nitro.
+This proves the local claim, payout, and replay behavior without pretending to be Nitro.
 
 The single command path is:
 
@@ -38,7 +51,7 @@ python -m solrl_core.cli local-mock
     +--> registry instruction tests
 ```
 
-## Harbor Environment Surface
+## Harbor-Compatible Environment Surface
 
 ```text
 Harbor EnvironmentFactory
@@ -51,9 +64,9 @@ python/solrl_harbor/nitro_environment.py
     +--> aws mode: rejected until VSOCK worker RPC is implemented
 ```
 
-Do not fork Harbor first. The import-path class is the integration seam.
+This is optional for the current proof flow. Do not lead with Harbor unless the user is specifically asking about Harbor integration.
 
-## Real Registry Flow
+## Registry Token Rail
 
 ```text
 ClaimV1 bytes
@@ -72,7 +85,7 @@ programs/solrl-registry::settle_claim
 
 Slashing follows the same idea: a signed `SlashClaimV1` moves stake from the operator stake vault to treasury.
 
-## Real AWS Nitro Smoke
+## Real AWS Nitro Hardware Rail
 
 ```text
 local Docker aws-nitro-runner
@@ -91,7 +104,7 @@ cloud-init
     +--> pull public GHCR EIF artifact
     +--> sha384sum -c artifact sidecar
     +--> nitro-cli run-enclave
-    +--> VSOCK request to worker
+    +--> VSOCK request to deterministic worker
     +--> verify COSE / AWS root / PCRs / user_data
     +--> assert SOLRL_PCR16 == SOLRL_CLAIM_PCR16
     +--> emit final result block
@@ -132,14 +145,14 @@ SolRL follows the useful pieces from Marlin Oyster:
 - Treat raw AWS Nitro attestation verification as off-chain work.
 - Keep the on-chain program focused on lightweight signed claims, PCR/policy matching, replay protection, staking, and settlement.
 
-Do not copy Marlin blindly. SolRL is narrower: hardware-attested compute and Token-2022 settlement, not general-purpose TEE hosting.
+Do not copy Marlin blindly. SolRL is narrower: hardware-attested reward evidence and Token-2022 settlement, not general-purpose TEE hosting.
 
 ## Verification Map
 
 Use this map when explaining the project to a reviewer or operator:
 
 ```text
-Generic compute job context
+Reward job context
     |
     +--> local proof path
     |       mock worker -> verifier signature -> hook simulator ledger payout -> replay rejection
@@ -159,13 +172,13 @@ What this proves today:
 
 - The local protocol pays once and rejects replay.
 - The registry compiles the Token-2022 CPI paths and proves real Token-2022 balance movement through a local-validator test.
-- Real AWS Nitro produces the compute output, attestation, PCRs, PCR16 bridge, and ClaimV1 receipt from an immutable commit-tagged EIF.
+- Real AWS Nitro produces the deterministic output, attestation, PCRs, PCR16 bridge, and ClaimV1 receipt from an immutable commit-tagged EIF.
 
 What it does not yet prove:
 
 - Hook-side claim verification. Program-initiated settlement uses registry PDA authorities because same-program
   `registry -> Token-2022 -> registry hook` reentry is rejected.
-- Production Harbor-over-Nitro execution over VSOCK RPC.
+- Production RL workload execution over VSOCK RPC.
 - A persistent verifier enclave that ingests real AWS COSE attestations and signs on-chain claims.
 
 Those are implementation plan items, not claims to make in public verification docs.

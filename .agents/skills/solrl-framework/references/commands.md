@@ -85,13 +85,13 @@ Do not use this as evidence of real Nitro. It signs only after mock attestation 
 
 ## Harbor Import Path
 
-Use this import path when asking Harbor to instantiate SolRL's environment surface:
+Use this import path only when exercising the current Harbor-compatible local environment surface:
 
 ```text
 solrl_harbor.nitro_environment:NitroEnvironment
 ```
 
-Local mode uses a deterministic workspace transport. AWS mode intentionally errors until the production VSOCK worker RPC is wired.
+Local mode uses a deterministic workspace transport. AWS mode intentionally errors until the production VSOCK worker RPC is wired. Harbor is not required for the current AWS Nitro proof path.
 
 ## Real AWS Nitro
 
@@ -187,7 +187,7 @@ docker compose run --rm --no-deps dev-shell \
   settle_claim_transfers_token2022_balance_with_registry_pda_authority -- --nocapture
 ```
 
-Run the real Nitro proof:
+Run the real Nitro proof after the commit is pushed and the `Build Nitro EIF` workflow has published a public GHCR artifact for that exact commit:
 
 ```bash
 docker compose run --rm aws-nitro-runner python3 -m solrl_core.aws_nitro_runner audit --scope project

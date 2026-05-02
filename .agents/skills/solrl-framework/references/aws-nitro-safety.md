@@ -52,8 +52,8 @@ verifies the `.sha384` sidecar before booting it. Do not put GHCR credentials in
 The final result must include `SOLRL_PCR16`, `SOLRL_CLAIM_PCR16`, `SOLRL_CLAIM_CONTEXT_HASH`,
 `SOLRL_ATTESTATION_DOCUMENT_HASH`, and `SOLRL_COMPUTE_OUTPUT_HASH`. `SOLRL_PCR16` and `SOLRL_CLAIM_PCR16` must be equal.
 `SOLRL_COMPUTE_OUTPUT_HASH` must match ClaimV1 `trajectory_hash` in `nitro-claim-receipt.json`. This is the regression
-check that proves the real Nitro smoke is using the same PCR16 model as the registry and the same generic compute output
-that settlement signs.
+check that proves the real Nitro smoke is using the same PCR16 model as the registry and the same deterministic compute
+output that settlement signs.
 
 If asked to make real AWS smoke reliable, propose a scoped return channel instead of adding more tail parsing:
 

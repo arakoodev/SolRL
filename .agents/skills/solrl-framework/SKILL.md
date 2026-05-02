@@ -1,20 +1,21 @@
 ---
 name: solrl-framework
-description: Operate and modify the SolRL repository safely. Use when working on SolRL Docker workflows, generic compute proofs, Harbor mock evals, Anchor/Token-2022 registry code, verification proof runs, ClaimV1 schema parity, PCR16 hashing, LocalStack tests, real AWS Nitro smoke tests, Marlin/Oyster Nix EIF builds, AWS tagging and cleanup, or docs for this framework.
+description: Operate and modify the SolRL repository safely. Use when working on SolRL Docker workflows, verifiable reward proofs, RL thesis docs, local token proofs, Anchor/Token-2022 registry code, ClaimV1 schema parity, PCR16 hashing, LocalStack tests, GitHub Actions EIF builds, real AWS Nitro smoke tests, submission proof bundles, AWS tagging and cleanup, or AI-agent skills for this framework.
 ---
 
 # SolRL Framework
 
-SolRL is a Docker-first Harbor evaluation protocol scaffold with Solana Token-2022 settlement and real AWS Nitro attestation smoke tests.
+SolRL is a Docker-first framework for verifiable reward generation: local token proof, Solana Token-2022 settlement, and real AWS Nitro attestation evidence.
 
-Use this skill to keep another AI from improvising around the sharp edges. The boring path is the product here.
+Use this skill to keep another AI on the proven path. The product is the evidence chain, not a clever workaround.
 
 ## First Read
 
 1. Read `README.md` for the current public workflow.
-2. Read `PLAN.md` when changing architecture, AWS, token settlement, PCR16, or test strategy.
-3. If the user asks for release readiness, verification, or proof that it works, read the README section `Verification`.
-4. Read the focused reference only when needed:
+2. Read `why.md` when changing thesis, market sizing, investor-facing language, Nitro positioning, or token narrative.
+3. Read `PLAN.md` when changing architecture, AWS, token settlement, PCR16, or test strategy.
+4. If the user asks for release readiness, verification, or proof that it works, read the README section `Verification`.
+5. Read the focused reference only when needed:
    - `references/commands.md` for exact Docker commands.
    - `references/architecture.md` for the end-to-end data flow.
    - `references/aws-nitro-safety.md` for real AWS rules.
@@ -35,10 +36,13 @@ Use this skill to keep another AI from improvising around the sharp edges. The b
 - Do not let Nitro `user_data` drift from registry PCR16 semantics. `pcr16_user_data` is the NSM ExtendPCR input;
   `pcr16_digest` is the locked PCR16 ClaimV1 signs and the registry recomputes.
 - Do not remove `.github/dependabot.yml` or let root Cargo Dependabot manage indirect dependencies. Solana's lockfile has duplicate transitive crates and unconfigured Dependabot creates noisy failed update runs.
+- Do not call the Nitro smoke token settlement proof. Nitro proves the hardware attestation rail and emits a ClaimV1 receipt. Token evidence comes from local MVP artifacts plus registry/Token-2022 tests.
+- Do not claim production RL/Harbor-over-Nitro execution is complete. The current Nitro worker proves deterministic compute and attestation binding; production RL workload execution is roadmap.
+- Do not put event-specific or evaluator-specific framing in public docs. The public repository must read as an open-source project.
 
 ## Standard Workflow
 
-Use this flow for normal repo work:
+Use this local validation flow for normal repo work:
 
 ```bash
 docker compose build dev-shell harbor-runner aws-test-runner
@@ -48,6 +52,13 @@ docker compose run --rm --no-deps harbor-runner pytest -q
 docker compose run --rm --no-deps dev-shell ./scripts/e2e-local-mock.sh
 docker compose run --rm harbor-runner ./scripts/test-localstack.sh
 docker compose run --rm aws-test-runner
+```
+
+Use this direct local proof path when validating the user-facing command surface:
+
+```bash
+docker compose run --rm --no-deps harbor-runner \
+  python -m solrl_core.cli local-mock --config solrl.toml --work-dir artifacts/mock
 ```
 
 Use this for Anchor/Solana code:
@@ -75,6 +86,10 @@ Use this for GitHub Actions EIF workflow checks through `act`:
 act pull_request -W .github/workflows/build-nitro-eif.yml -j build-nitro-eif
 ```
 
+The hosted `Build Nitro EIF` workflow is the canonical EIF build path. It builds staged Nix targets, publishes
+`ghcr.io/<owner>/solrl-nitro-worker-eif:<commit-sha>`, and uploads the `.eif` plus `.sha384` artifacts. The real AWS
+smoke expects that immutable commit-SHA artifact to exist and be public.
+
 Use this for real AWS only after local gates pass:
 
 ```bash
@@ -85,8 +100,16 @@ docker compose run --rm aws-nitro-runner
 Use `.github/workflows/aws-nitro-smoke.yml` for the manual GitHub-hosted version of the same run. It must use repository
 environment `aws-gl` and environment secret `ENV`, which contains the same key/value lines as local `.env`.
 
-The real AWS runner refuses the default path from a dirty worktree. Commit and push first so the EC2 source checkout and
-the GHCR EIF artifact are the same commit.
+The real AWS runner refuses the default path from a dirty worktree. Commit, push, and wait for the EIF workflow before
+running AWS so the EC2 source checkout and GHCR EIF artifact are the same commit.
+
+Use this for public thesis/doc work:
+
+```bash
+docker compose run --rm lint
+```
+
+The lint gate includes `scripts/check-public-doc-language.py`, which rejects stale event-specific phrasing.
 
 ## Verification Workflow
 
@@ -95,7 +118,7 @@ When the user asks to verify the system, do not only run the smoke. Produce evid
 ```text
 1. Token settlement semantics: local-mock paid once and rejected replay.
 2. On-chain token implementation: lint + Anchor tests prove Token-2022 CPI wiring, registry checks, and local-validator balance movement.
-3. Real Nitro attestation: AWS smoke proves generic compute output, NSM attestation, AWS root verification, PCR16 bridge, ClaimV1 receipt, and cleanup.
+3. Real Nitro attestation: AWS smoke proves deterministic compute output, NSM attestation, AWS root verification, PCR16 bridge, ClaimV1 receipt, and cleanup.
 ```
 
 Use:
@@ -119,7 +142,7 @@ Report these exact artifacts:
 - `artifacts/aws-nitro/<run-id>/remote-markers.json`: `SOLRL_STATUS=OK`, `SOLRL_PCR16 == SOLRL_CLAIM_PCR16`,
   `SOLRL_COMPUTE_OUTPUT_HASH`, and `SOLRL_ATTESTATION_DOCUMENT_HASH`.
 - `artifacts/aws-nitro/<run-id>/nitro-claim-receipt.json`: ClaimV1 signed over the verified Nitro attestation document hash,
-  generic compute output hash as `trajectory_hash`, and the locked PCR16.
+  deterministic compute output hash as `trajectory_hash`, and the locked PCR16.
 - `artifacts/aws-nitro/<run-id>/run-instances.json`: enclave enabled, IMDSv2 required, exact SolRL tags.
 - `artifacts/aws-nitro/<run-id>/postaudit-project.json`: zero SolRL instances, security groups, and volumes.
 - `artifacts/aws-nitro/<run-id>/submission-proof-bundle.tar.gz`: self-contained reviewer artifact containing
@@ -157,6 +180,13 @@ When touching the MVP command surface, verifier API, or Harbor import path:
 3. Keep the Harbor import path `solrl_harbor.nitro_environment:NitroEnvironment` documented.
 4. Update `scripts/check-mvp-entrypoints.py` if the shape intentionally changes.
 5. Run `docker compose run --rm --no-deps harbor-runner pytest -q tests/test_cli.py tests/test_verifier_service.py tests/test_harbor_nitro_environment.py`.
+
+When touching `why.md` or public positioning docs:
+
+1. Keep the thesis order: RL reward demand -> market size -> third-party trust failure -> Nitro evidence -> Solana incentives -> Token-2022 settlement.
+2. Use Mercor, Surge AI, and Scale AI as demand proof, not as direct competitors or verifiability examples.
+3. Keep caveats as execution scope and roadmap, not defensive disclaimers.
+4. Run `docker compose run --rm lint`.
 
 When touching Docker:
 
