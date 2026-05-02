@@ -60,7 +60,7 @@ flowchart TB
     Question --> NoProof["No proof<br/>host logs and reward files"]
     Question --> WithProof["With proof<br/>attestation + ClaimV1"]
 
-    NoProof --> Risk["Payment fraud + poisoned training data"]
+    NoProof --> Damage["Payment fraud + poisoned training data"]
     WithProof --> Settlement["Escrow payout or rejection"]
 ```
 
@@ -577,17 +577,17 @@ The first users are teams that need trusted reward generation at scale:
 - agent teams running Terminal-Bench, SWE-Bench, or custom executable datasets
 - benchmark maintainers who need trusted third-party runs
 - model teams optimizing prompts, scaffolds, or tool policies against executable rewards
-- DeFi teams simulating fee curves, liquidations, routing, or risk parameters before making on-chain updates
+- DeFi teams simulating fee curves, liquidations, routing, or protocol parameters before making on-chain updates
 - game teams training autonomous agents whose behavior affects player-owned state
 - compute operators selling verified rollout capacity
 
 The product is verified reward rollouts for teams whose training loops depend on reward integrity.
 
-## Slide 17: Execution Risks And Roadmap
+## Slide 17: Current Limitations And Roadmap
 
-The roadmap is defined by the remaining execution risks.
+The roadmap is defined by current implementation limitations.
 
-| Risk | Why it matters | Mitigation path |
+| Current limitation | Why it matters | Mitigation path |
 |---|---|---|
 | AWS concentration | The current implementation depends on Nitro's trust model and AWS availability | Abstract verifier policy for multiple TEE backends over time |
 | Production workload gap | The current Nitro worker proves deterministic compute, not full RL jobs | Build a production RL worker RPC and workload EIF |
